@@ -65,7 +65,7 @@ jobs:
       - name: Install vcpkg dependencies
         if: steps.cache-vcpkg.outputs.cache-hit != 'true'
         run: |
-          ./vcpkg/vcpkg install abseil openssl
+          ./vcpkg/vcpkg install abseil openssl geos
 
       - name: Use stable Rust
         id: rust
@@ -77,7 +77,6 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgeos-dev
           sudo apt install apt-transport-https ca-certificates gnupg software-properties-common wget
           wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc | sudo apt-key add -
           # Add the repository for your specific Ubuntu version (e.g., jammy for 22.04)
@@ -95,6 +94,9 @@ jobs:
           prefix-key: "python-v3"
 
       - name: Install
+        env:
+          # NVIDIA A10 uses compute capability 8.6 (sm_86).
+          CMAKE_CUDA_ARCHITECTURES: "86"
         run: |
           # Keep this export in sync with the export in dev/release/verify-release-candidate.sh
           export MATURIN_PEP517_ARGS="--features s2geography,gpu"
@@ -117,7 +119,7 @@ jobs:
           SEDONADB_PYTHON_NO_SKIP_TESTS: "true"
         run: |
           cd python
-          python -m pytest -vv
+          python -m pytest -vv sedonadb/tests/test_sjoin_gpu.py
 
       - name: Shutdown docker compose services
         if: always()
