@@ -44,6 +44,7 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
           CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg/installed/x64-linux/lib/pkgconfig
         run: |
           cd vcpkg
           ./bootstrap-vcpkg.sh
