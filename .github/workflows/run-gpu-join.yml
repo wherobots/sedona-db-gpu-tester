@@ -53,6 +53,7 @@ jobs:
           echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
           echo "PATH=$VCPKG_ROOT:$PATH" >> $GITHUB_ENV
           echo "CMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> $GITHUB_ENV
           echo "/usr/local/cuda/bin" >> $GITHUB_PATH
 
       - name: Cache vcpkg binaries
