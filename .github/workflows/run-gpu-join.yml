@@ -1,0 +1,461 @@
+name: python GPU tests
+
+on:
+  # Run every other week on Monday at 6:00 UTC
+  schedule:
+    - cron: '0 6 1-7,15-21 * 1'
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}-rust
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -l -eo pipefail {0}
+
+env:
+  # At s2geometry updated to 0.13.0
+  VCPKG_REF: 580d480f750618f8affeb77abbb956e6eeaee0ce
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: libgpuspatial
+            run_libgpuspatial: true
+            run_python_gpu: false
+          - variant: python_gpu
+            run_libgpuspatial: false
+            run_python_gpu: true
+    name: "GPU workflow (${{ matrix.variant }})"
+    runs-on: depot-ubuntu-22.04-16-gpu
+    env:
+      CARGO_INCREMENTAL: 0
+      # NVIDIA A10 uses compute capability 8.6 (sm_86).
+      CMAKE_CUDA_ARCHITECTURES: "86"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: 'true'
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Clone vcpkg
+        uses: actions/checkout@v6
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_REF }}
+          path: vcpkg
+
+      - name: Set up environment variables and bootstrap vcpkg
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+          CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg/installed/x64-linux/lib/pkgconfig
+          GPUSPATIAL_TEST_DIR: ${{ github.workspace }}/c/sedona-libgpuspatial/libgpuspatial/test/data
+        run: |
+          cd vcpkg
+          ./bootstrap-vcpkg.sh
+          cd ..
+
+          echo "VCPKG_ROOT=$VCPKG_ROOT" >> $GITHUB_ENV
+          echo "PATH=$VCPKG_ROOT:$PATH" >> $GITHUB_ENV
+          echo "CMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> $GITHUB_ENV
+          echo "GPUSPATIAL_TEST_DIR=$GPUSPATIAL_TEST_DIR" >> $GITHUB_ENV
+          echo "/usr/local/cuda/bin" >> $GITHUB_PATH
+
+      - name: Cache vcpkg binaries
+        id: cache-vcpkg
+        uses: actions/cache@v5
+        with:
+          path: vcpkg/packages
+          # Bump the number at the end of this line to force a new dependency build
+          key: vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-3
+
+      - name: Install vcpkg dependencies
+        run: |
+          ./vcpkg/vcpkg install abseil openssl geos
+
+      - name: Use stable Rust
+        id: rust
+        if: matrix.run_python_gpu
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt install apt-transport-https ca-certificates gnupg software-properties-common wget
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://apt.kitware.com/keys/kitware-archive-latest.asc | sudo gpg --dearmor -o /etc/apt/keyrings/kitware-archive-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ jammy main" | sudo tee /etc/apt/sources.list.d/kitware.list >/dev/null
+          sudo apt update
+          sudo apt install cmake flex bison -y
+          # Downgrade CUDA to 12.4 because the driver is 550.163.01 and does not support CUDA 13
+          sudo apt purge cuda-toolkit* -y
+          sudo apt-get install -y cuda-toolkit-12-4
+          #sudo update-alternatives --set cuda /usr/local/cuda-12.4
+
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.run_python_gpu
+        with:
+          # Update this key to force a new cache (sync with packaging.yml)
+          prefix-key: "python-v3"
+
+      - name: Cache libgpuspatial manifest installs
+        if: matrix.run_libgpuspatial
+        uses: actions/cache@v5
+        with:
+          path: c/sedona-libgpuspatial/libgpuspatial/build/vcpkg_installed
+          key: libgpuspatial-vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-${{ hashFiles('c/sedona-libgpuspatial/libgpuspatial/vcpkg.json', 'c/sedona-libgpuspatial/libgpuspatial/CMakeLists.txt', 'c/sedona-libgpuspatial/libgpuspatial/CMakePresets.json') }}
+
+      - name: Build libgpuspatial Tests
+        if: matrix.run_libgpuspatial
+        run: |
+          echo "=== Building libgpuspatial tests ==="
+          cd c/sedona-libgpuspatial/libgpuspatial
+          mkdir -p build
+          cmake --preset=default-with-tests -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86
+          cmake --build build --target all
+
+      - name: Run libgpuspatial tests
+        if: matrix.run_libgpuspatial
+        run: |
+          echo "=== Running libgpuspatial tests ==="
+          cd c/sedona-libgpuspatial/libgpuspatial/build
+          shopt -s nullglob
+          for test_exec in test/*; do
+            if [[ -f "$test_exec" && -x "$test_exec" ]]; then
+              echo "--- Running ${test_exec} ---"
+              GPUSPATIAL_TEST_DIR=$GPUSPATIAL_TEST_DIR "$test_exec"
+            fi
+          done
+
+      - name: Install
+        if: matrix.run_python_gpu
+        run: |
+          # Keep this export in sync with the export in dev/release/verify-release-candidate.sh
+          export MATURIN_PEP517_ARGS="--features s2geography,gpu"
+          pip install -e "python/sedonadb/[test]" -vv
+
+      - name: Download minimal geoarrow-data assets
+        if: matrix.run_python_gpu
+        run: |
+          python submodules/download-assets.py "*water-junc*" "*water-point*"
+
+      - name: Start PostGIS
+        if: matrix.run_python_gpu
+        run: |
+          docker compose up --wait --detach postgis
+
+      - name: Print GPU status
+        if: matrix.run_python_gpu
+        run: nvidia-smi
+
+      - name: Run tests
+        if: matrix.run_python_gpu
+        env:
+          # Ensure that we don't skip tests that we didn't intend to
+          SEDONADB_PYTHON_NO_SKIP_TESTS: "true"
+        run: |
+          cd python
+          python -m pytest -vv sedonadb/tests/test_sjoin_gpu.py
+
+      - name: Shutdown docker compose services
+        if: ${{ always() && matrix.run_python_gpu }}
+        run: |
+          docker compose down
+
+      - name: Benchmark GPU joins
+        if: matrix.run_python_gpu
+        run: |
+         cat << 'EOF' > benchmark.py
+         from huggingface_hub import snapshot_download
+         import os
+         import time
+         import json
+         from tqdm import tqdm
+         import sedonadb
+         
+         # 1. Download Dataset for sf1 and sf10
+         print("Downloading datasets...")
+         snapshot_download(
+             repo_id='apache-sedona/spatialbench',
+             repo_type='dataset',
+             local_dir='hf-data',
+             allow_patterns=[
+                 "v0.1.0/sf1/zone/*",
+                 "v0.1.0/sf1/trip/*",
+                 "v0.1.0/sf1/building/*",
+                 "v0.1.0/sf10/zone/*",
+                 "v0.1.0/sf10/trip/*",
+                 "v0.1.0/sf10/building/*"
+             ],
+         )
+         
+         # 2. Setup Sedona Context
+         ctx = sedonadb.connect()
+         ctx.options.memory_limit = "unlimited"
+         
+         # 3. Define Queries
+         queries = {
+             "Q2": """
+                 -- Q2: Count trips starting within Coconino County (Arizona) zone
+                 SELECT COUNT(*) AS trip_count_in_coconino_county
+                 FROM trip t
+                 WHERE ST_Intersects(ST_GeomFromWKB(t.t_pickuploc), (SELECT ST_GeomFromWKB(z.z_boundary)
+                                                                     FROM zone z
+                                                                     WHERE z.z_name = 'Coconino County' LIMIT 1))
+             """,
+             "Q4": """
+                 -- Q4: Zone distribution of top 1000 trips by tip amount
+                 SELECT z.z_zonekey, z.z_name, COUNT(*) AS trip_count
+                 FROM zone z
+                          JOIN (SELECT t.t_pickuploc
+                                FROM trip t
+                                ORDER BY t.t_tip DESC, t.t_tripkey
+                                         ASC LIMIT 1000
+                 ) top_trips ON ST_Within(ST_GeomFromWKB(top_trips.t_pickuploc), ST_GeomFromWKB(z.z_boundary))
+                 GROUP BY z.z_zonekey, z.z_name
+                 ORDER BY trip_count DESC, z.z_zonekey ASC
+             """,
+             "Q6": """
+                 -- Q6: Zone statistics for trips intersecting a bounding box
+                 SELECT z.z_zonekey,
+                        z.z_name,
+                        COUNT(t.t_tripkey)                     AS total_pickups,
+                        AVG(t.t_totalamount)                   AS avg_distance,
+                        AVG(t.t_dropofftime - t.t_pickuptime) AS avg_duration
+                 FROM trip t,
+                      zone z
+                 WHERE ST_Intersects(
+                         ST_GeomFromText('POLYGON((-112.2110 34.4197, -111.3110 34.4197, -111.3110 35.3197, -112.2110 35.3197, -112.2110 34.4197))'),
+                         ST_GeomFromWKB(z.z_boundary))
+                   AND ST_Within(ST_GeomFromWKB(t.t_pickuploc), ST_GeomFromWKB(z.z_boundary))
+                 GROUP BY z.z_zonekey, z.z_name
+                 ORDER BY total_pickups DESC, z.z_zonekey ASC
+             """,
+             "Q9": """
+                 -- Q9: Building Conflation (duplicate/overlap detection via IoU)
+                 WITH b1 AS (SELECT b_buildingkey AS id, ST_GeomFromWKB(b_boundary) AS geom
+                             FROM building),
+                      b2 AS (SELECT b_buildingkey AS id, ST_GeomFromWKB(b_boundary) AS geom
+                             FROM building),
+                      pairs AS (SELECT b1.id                                      AS building_1,
+                                       b2.id                                      AS building_2,
+                                       ST_Area(b1.geom)                           AS area1,
+                                       ST_Area(b2.geom)                           AS area2,
+                                       ST_Area(ST_Intersection(b1.geom, b2.geom)) AS overlap_area
+                                FROM b1
+                                         JOIN b2
+                                              ON b1.id < b2.id
+                                                  AND ST_Intersects(b1.geom, b2.geom))
+                 SELECT building_1,
+                        building_2,
+                        area1,
+                        area2,
+                        overlap_area,
+                        CASE
+                            WHEN overlap_area = 0 THEN 0.0
+                            WHEN (area1 + area2 - overlap_area) = 0 THEN 1.0
+                            ELSE overlap_area / (area1 + area2 - overlap_area)
+                            END AS iou
+                 FROM pairs
+                 ORDER BY iou DESC, building_1 ASC, building_2 ASC
+             """,
+             "Q10": """
+                 -- Q10: Zone statistics for trips starting within each zone
+                 SELECT z.z_zonekey,
+                        z.z_name                               AS pickup_zone,
+                        AVG(t.t_dropofftime - t.t_pickuptime) AS avg_duration,
+                        AVG(t.t_distance)                      AS avg_distance,
+                        COUNT(t.t_tripkey)                     AS num_trips
+                 FROM zone z
+                          LEFT JOIN trip t ON ST_Within(ST_GeomFromWKB(t.t_pickuploc), ST_GeomFromWKB(z.z_boundary))
+                 GROUP BY z.z_zonekey, z.z_name
+                 ORDER BY avg_duration DESC NULLS LAST, z.z_zonekey ASC
+             """,
+             "Q11": """
+                 -- Q11: Count trips that cross between different zones
+                 SELECT COUNT(*) AS cross_zone_trip_count
+                 FROM trip t
+                          JOIN zone pickup_zone
+                               ON ST_Within(ST_GeomFromWKB(t.t_pickuploc), ST_GeomFromWKB(pickup_zone.z_boundary))
+                          JOIN zone dropoff_zone
+                               ON ST_Within(ST_GeomFromWKB(t.t_dropoffloc), ST_GeomFromWKB(dropoff_zone.z_boundary))
+                 WHERE pickup_zone.z_zonekey != dropoff_zone.z_zonekey
+             """
+         }
+         
+         # 4. GPU Batch Size Configuration
+         gpu_batch_sizes = {
+             "Q2": 100000,
+             "Q4": 100000,
+             "Q6": 100000,
+             "Q9": 100000,
+             "Q10": 2000000,
+             "Q11": 2000000
+         }
+         
+         def run_benchmark(ctx, runs=6):
+             scales = ["sf1", "sf10"]
+             modes = [("CPU", "false"), ("GPU", "true")]
+         
+             # Dictionary to store results for both scales
+             all_benchmark_results = {scale: [] for scale in scales}
+         
+             for scale in scales:
+                 print(f"\n" + "#"*60)
+                 print(f"#" + f" INITIALIZING TABLES FOR {scale.upper()} ".center(58) + "#")
+                 print("#"*60)
+         
+                 # Drop existing tables and recreate them pointing to the correct scale directory
+                 ctx.sql("DROP TABLE IF EXISTS zone")
+                 ctx.sql("DROP TABLE IF EXISTS trip")
+                 ctx.sql("DROP TABLE IF EXISTS building")
+         
+                 ctx.sql(f"CREATE EXTERNAL TABLE zone STORED AS PARQUET LOCATION 'hf-data/v0.1.0/{scale}/zone/'")
+                 ctx.sql(f"CREATE EXTERNAL TABLE trip STORED AS PARQUET LOCATION 'hf-data/v0.1.0/{scale}/trip/'")
+                 ctx.sql(f"CREATE EXTERNAL TABLE building STORED AS PARQUET LOCATION 'hf-data/v0.1.0/{scale}/building/'")
+         
+                 for q_name, query in queries.items():
+                     print(f"\n" + "="*40)
+                     print(f"🚀 Benchmarking {q_name} on {scale.upper()}")
+                     print("="*40)
+         
+                     q_averages = {}
+                     for mode_name, gpu_flag in modes:
+                         ctx.sql(f"SET gpu.enable = {gpu_flag}")
+         
+                         if gpu_flag == "true":
+                             batch_size = gpu_batch_sizes[q_name]
+                             ctx.sql(f"SET datafusion.execution.batch_size = {batch_size}")
+                         else:
+                             ctx.sql("SET datafusion.execution.batch_size = 8192")
+         
+                         execution_times = []
+                         for i in tqdm(range(runs), desc=f"  {mode_name} Executions"):
+                             start_time = time.time()
+                             result = ctx.sql(query)
+                             result.show() 
+                             elapsed = time.time() - start_time
+         
+                             if i > 0: # Skip the first run (warmup)
+                                 execution_times.append(elapsed)
+         
+                         q_averages[mode_name] = sum(execution_times) / len(execution_times)
+         
+                     # Record statistics
+                     cpu_avg = q_averages["CPU"]
+                     gpu_avg = q_averages["GPU"]
+                     speedup = cpu_avg / gpu_avg if gpu_avg > 0 else 0
+         
+                     all_benchmark_results[scale].append({
+                         "Query": q_name,
+                         "GPU_Batch": gpu_batch_sizes[q_name],
+                         "CPU": cpu_avg,
+                         "GPU": gpu_avg,
+                         "Speedup": speedup
+                     })
+         
+             # 5. Final Summary Output for both scales
+             for scale in scales:
+                 print("\n" + "="*75)
+                 print(f"{f'📊 BENCHMARK RESULTS - {scale.upper()} (Avg over {runs-1} runs)':^75}")
+                 print("="*75)
+                 print(f"{'Query':<8} | {'GPU Batch':<10} | {'CPU Avg (s)':<12} | {'GPU Avg (s)':<12} | {'Speedup':<8}")
+                 print("-" * 75)
+                 for res in all_benchmark_results[scale]:
+                     b_size = res['GPU_Batch']
+                     b_str = f"{b_size//1000000}M" if b_size >= 1000000 else f"{b_size//1000}K"
+         
+                     print(f"{res['Query']:<8} | {b_str:<10} | {res['CPU']:<12.4f} | {res['GPU']:<12.4f} | {res['Speedup']:.2f}x")
+                 print("="*75)
+             
+             # 6. Save results to JSON for CI summary
+             with open('gpu_benchmark_results_sf1.json', 'w') as f:
+                 json.dump({"sf1": all_benchmark_results["sf1"]}, f, indent=2)
+             
+             with open('gpu_benchmark_results_sf10.json', 'w') as f:
+                 json.dump({"sf10": all_benchmark_results["sf10"]}, f, indent=2)
+         
+         if __name__ == "__main__":
+             run_benchmark(ctx)
+         EOF
+         
+         pip install huggingface_hub tqdm
+         python benchmark.py
+
+      - name: Upload GPU benchmark results (SF1)
+        if: matrix.run_python_gpu && always()
+        uses: actions/upload-artifact@v4
+        with:
+         name: gpu-benchmark-results-sf1-${{ matrix.variant }}
+         path: gpu_benchmark_results_sf1.json
+         retention-days: 30
+
+      - name: Upload GPU benchmark results (SF10)
+        if: matrix.run_python_gpu && always()
+        uses: actions/upload-artifact@v4
+        with:
+         name: gpu-benchmark-results-sf10-${{ matrix.variant }}
+         path: gpu_benchmark_results_sf10.json
+         retention-days: 30
+
+      - name: Generate benchmark summary
+        if: matrix.run_python_gpu && always()
+        run: |
+         cat << 'EOF' > summarize_gpu_results.py
+         import json
+         import os
+         
+         # Generate markdown summary
+         summary = []
+         summary.append("## 🚀 GPU Join Benchmark Results\n")
+         summary.append(f"**Variant:** python_gpu\n")
+         
+         for sf in ['sf1', 'sf10']:
+             filename = f'gpu_benchmark_results_{sf}.json'
+             if os.path.exists(filename):
+                 with open(filename, 'r') as f:
+                     data = json.load(f)
+                 
+                 summary.append(f"\n### {sf.upper()} Scale\n")
+                 summary.append("| Query | GPU Batch | CPU Avg (s) | GPU Avg (s) | Speedup |\n")
+                 summary.append("|-------|-----------|------------|------------|----------|\n")
+                 
+                 for res in data[sf]:
+                     q_name = res['Query']
+                     batch = res['GPU_Batch']
+                     cpu_avg = res['CPU']
+                     gpu_avg = res['GPU']
+                     speedup = res['Speedup']
+                     
+                     batch_str = f"{batch//1000000}M" if batch >= 1000000 else f"{batch//1000}K"
+                     summary.append(f"| {q_name} | {batch_str} | {cpu_avg:.4f} | {gpu_avg:.4f} | {speedup:.2f}x |\n")
+         
+         # Write to GitHub Step Summary
+         summary_text = "".join(summary)
+         if 'GITHUB_STEP_SUMMARY' in os.environ:
+             with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                 f.write(summary_text)
+         
+         print(summary_text)
+         EOF
+         
+         python summarize_gpu_results.py
+
