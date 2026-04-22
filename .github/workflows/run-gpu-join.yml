@@ -23,6 +23,8 @@ jobs:
     runs-on: depot-ubuntu-22.04-16-gpu
     env:
       CARGO_INCREMENTAL: 0
+      # NVIDIA A10 uses compute capability 8.6 (sm_86).
+      CMAKE_CUDA_ARCHITECTURES: "86"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -45,6 +47,7 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
           CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg/installed/x64-linux/lib/pkgconfig
+          GPUSPATIAL_TEST_DIR: ${{ github.workspace }}/c/sedona-libgpuspatial/libgpuspatial/test/data
         run: |
           cd vcpkg
           ./bootstrap-vcpkg.sh
@@ -54,6 +57,7 @@ jobs:
           echo "PATH=$VCPKG_ROOT:$PATH" >> $GITHUB_ENV
           echo "CMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> $GITHUB_ENV
+          echo "GPUSPATIAL_TEST_DIR=$GPUSPATIAL_TEST_DIR" >> $GITHUB_ENV
           echo "/usr/local/cuda/bin" >> $GITHUB_PATH
 
       - name: Cache vcpkg binaries
@@ -95,10 +99,27 @@ jobs:
           # Update this key to force a new cache (sync with packaging.yml)
           prefix-key: "python-v3"
 
+      - name: Build libgpuspatial Tests
+        run: |
+          echo "=== Building libgpuspatial tests ==="
+          cd c/sedona-libgpuspatial/libgpuspatial
+          mkdir build
+          cmake --preset=default-with-tests -S . -B build
+          cmake --build build --target all
+
+      - name: Run libgpuspatial tests
+        run: |
+          echo "=== Running libgpuspatial tests ==="
+          cd c/sedona-libgpuspatial/libgpuspatial/build
+          shopt -s nullglob
+          for test_exec in test/*; do
+            if [[ -f "$test_exec" && -x "$test_exec" ]]; then
+              echo "--- Running ${test_exec} ---"
+              "$test_exec"
+            fi
+          done
+
       - name: Install
-        env:
-          # NVIDIA A10 uses compute capability 8.6 (sm_86).
-          CMAKE_CUDA_ARCHITECTURES: "86"
         run: |
           # Keep this export in sync with the export in dev/release/verify-release-candidate.sh
           export MATURIN_PEP517_ARGS="--features s2geography,gpu"
