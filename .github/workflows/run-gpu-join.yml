@@ -1,22 +1,44 @@
-name: C++ CI
+name: python GPU tests
 
 on: [ push, pull_request ]
 
+concurrency:
+  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}-rust
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -l -eo pipefail {0}
+
+env:
+  # At s2geometry updated to 0.13.0
+  VCPKG_REF: 580d480f750618f8affeb77abbb956e6eeaee0ce
+
 jobs:
-  build:
+  test:
+    name: "python with GPU ${{ matrix.os }}"
     runs-on: depot-ubuntu-22.04-16-gpu
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
         with:
-          submodules: true
+          submodules: 'true'
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: 'pip'
 
       - name: Clone vcpkg
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: microsoft/vcpkg
-          ref: "2025.06.13"
+          ref: ${{ env.VCPKG_REF }}
           path: vcpkg
-          fetch-depth: 0
 
       - name: Set up environment variables and bootstrap vcpkg
         env:
@@ -32,10 +54,30 @@ jobs:
           echo "CMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE" >> $GITHUB_ENV
           echo "/usr/local/cuda/bin" >> $GITHUB_PATH
 
+      - name: Cache vcpkg binaries
+        id: cache-vcpkg
+        uses: actions/cache@v5
+        with:
+          path: vcpkg/packages
+          # Bump the number at the end of this line to force a new dependency build
+          key: vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-3
+
+      - name: Install vcpkg dependencies
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        run: |
+          ./vcpkg/vcpkg install abseil openssl
+
+      - name: Use stable Rust
+        id: rust
+        run: |
+          rustup toolchain install stable --no-self-update
+          rustup default stable
+
       - name: Install dependencies
         shell: bash
         run: |
           sudo apt-get update
+          sudo apt-get install -y libgeos-dev
           sudo apt install apt-transport-https ca-certificates gnupg software-properties-common wget
           wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc | sudo apt-key add -
           # Add the repository for your specific Ubuntu version (e.g., jammy for 22.04)
@@ -47,26 +89,37 @@ jobs:
           sudo apt-get install -y cuda-toolkit-12-4
           #sudo update-alternatives --set cuda /usr/local/cuda-12.4
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Update this key to force a new cache (sync with packaging.yml)
+          prefix-key: "python-v3"
+
+      - name: Install
+        run: |
+          # Keep this export in sync with the export in dev/release/verify-release-candidate.sh
+          export MATURIN_PEP517_ARGS="--features s2geography,gpu"
+          pip install -e "python/sedonadb/[test]" -vv
+
+      - name: Download minimal geoarrow-data assets
+        run: |
+          python submodules/download-assets.py "*water-junc*" "*water-point*"
+
+      - name: Start PostGIS
+        run: |
+          docker compose up --wait --detach postgis
+
       - name: Print GPU status
         run: nvidia-smi
 
-      - name: Cache vcpkg binaries
-        id: cache-vcpkg
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          # Bump the number at the end of this line to force a new dependency build
-          key: vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-7
-
-      - name: Install vcpkg dependencies
-        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+      - name: Run tests
+        env:
+          # Ensure that we don't skip tests that we didn't intend to
+          SEDONADB_PYTHON_NO_SKIP_TESTS: "true"
         run: |
-          ./vcpkg/vcpkg install
+          cd python
+          python -m pytest -vv
 
-      - name: Build libgpuspatial Tests
+      - name: Shutdown docker compose services
+        if: always()
         run: |
-          echo "=== Building libgpuspatial tests ==="
-          cd c/sedona-libgpuspatial/libgpuspatial
-          mkdir build
-          cmake --preset=default-with-tests -S . -B build -DCMAKE_CUDA_ARCHITECTURES=75
-          cmake --build build --target all
+          docker compose down
