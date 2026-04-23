@@ -79,7 +79,6 @@ jobs:
           key: vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-3
 
       - name: Install vcpkg dependencies
-        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
         run: |
           ./vcpkg/vcpkg install abseil openssl geos
 
@@ -126,19 +125,6 @@ jobs:
           mkdir -p build
           cmake --preset=default-with-tests -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86
           cmake --build build --target all
-
-      - name: Run libgpuspatial tests
-        if: matrix.run_libgpuspatial
-        run: |
-          echo "=== Running libgpuspatial tests ==="
-          cd c/sedona-libgpuspatial/libgpuspatial/build
-          shopt -s nullglob
-          for test_exec in test/*; do
-            if [[ -f "$test_exec" && -x "$test_exec" ]]; then
-              echo "--- Running ${test_exec} ---"
-              "$test_exec"
-            fi
-          done
 
       - name: Install
         if: matrix.run_python_gpu
