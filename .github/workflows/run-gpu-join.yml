@@ -160,3 +160,88 @@ jobs:
         if: ${{ always() && matrix.run_python_gpu }}
         run: |
           docker compose down
+
+      - name: Benchmark GPU tests
+        if: matrix.run_python_gpu
+        run: |
+            cat << 'EOF' > benchmark.py
+            from huggingface_hub import snapshot_download
+            import os
+            import time
+            from tqdm import tqdm
+            import sedonadb
+            
+            # 1. Download Dataset
+            print("Downloading dataset...")
+            snapshot_download(
+                repo_id='apache-sedona/spatialbench',
+                repo_type='dataset',
+                local_dir='hf-data',
+                allow_patterns=[
+                    "v0.1.0/sf1/zone/*",
+                    "v0.1.0/sf1/trip/*"],
+            )
+            
+            # 2. Setup Sedona Context
+            ctx = sedonadb.connect()
+            ctx.options.memory_limit = "unlimited"
+            
+            ctx.sql("CREATE EXTERNAL TABLE zone STORED AS PARQUET LOCATION 'hf-data/v0.1.0/sf1/zone/'")
+            ctx.sql("CREATE EXTERNAL TABLE trip STORED AS PARQUET LOCATION 'hf-data/v0.1.0/sf1/trip/'")
+            
+            def run_benchmark(ctx, runs=6):
+                query = """
+                SELECT COUNT(*) AS cross_zone_trip_count
+                FROM trip t
+                    JOIN zone pickup_zone
+                        ON ST_Within(ST_GeomFromWKB(t.t_pickuploc), ST_GeomFromWKB(pickup_zone.z_boundary))
+                    JOIN zone dropoff_zone
+                        ON ST_Within(ST_GeomFromWKB(t.t_dropoffloc), ST_GeomFromWKB(dropoff_zone.z_boundary))
+                WHERE pickup_zone.z_zonekey != dropoff_zone.z_zonekey
+                """
+            
+                modes = [("CPU", "false"), ("GPU", "true")]
+                averages = {}
+            
+                for mode_name, gpu_flag in modes:
+                    print(f"\n🚀 Running {mode_name} Benchmark...")
+                    ctx.sql(f"SET gpu.enable = {gpu_flag}")
+                    if gpu_flag == "true":
+                        ctx.sql("SET datafusion.execution.batch_size = 2000000")
+                    else:
+                        ctx.sql("SET datafusion.execution.batch_size = 8192")
+            
+                    execution_times = []
+                    for i in tqdm(range(runs), desc=f"{mode_name} Progress"):
+                        start_time = time.time()
+                        result = ctx.sql(query)
+                        result.show() # Forces execution
+                        elapsed = time.time() - start_time
+            
+                        if i > 0: # Skip warmup
+                            execution_times.append(elapsed)
+                            print(f"Run {i}: {elapsed:.4f}s")
+            
+                    averages[mode_name] = sum(execution_times) / len(execution_times)
+            
+                # Final Summary Output
+                print("\n" + "="*30)
+                print("📊 BENCHMARK RESULTS")
+                print("="*30)
+                cpu_avg = averages["CPU"]
+                gpu_avg = averages["GPU"]
+                speedup = cpu_avg / gpu_avg if gpu_avg > 0 else 0
+                print(f"CPU Average: {cpu_avg:.4f}s")
+                print(f"GPU Average: {gpu_avg:.4f}s")
+                print(f"Speedup:     {speedup:.2x}x")
+                print("="*30)
+            
+            if __name__ == "__main__":
+                run_benchmark(ctx)
+            EOF
+            
+            # Install additional dependencies required by the benchmark script
+            pip install huggingface_hub tqdm
+            
+            # Execute the script
+            python benchmark.py
