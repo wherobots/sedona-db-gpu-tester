@@ -19,7 +19,17 @@ env:
 
 jobs:
   test:
-    name: "python with GPU ${{ matrix.os }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: libgpuspatial
+            run_libgpuspatial: true
+            run_python_gpu: false
+          - variant: python_gpu
+            run_libgpuspatial: false
+            run_python_gpu: true
+    name: "GPU workflow (${{ matrix.variant }})"
     runs-on: depot-ubuntu-22.04-16-gpu
     env:
       CARGO_INCREMENTAL: 0
@@ -75,6 +85,7 @@ jobs:
 
       - name: Use stable Rust
         id: rust
+        if: matrix.run_python_gpu
         run: |
           rustup toolchain install stable --no-self-update
           rustup default stable
@@ -95,19 +106,29 @@ jobs:
           #sudo update-alternatives --set cuda /usr/local/cuda-12.4
 
       - uses: Swatinem/rust-cache@v2
+        if: matrix.run_python_gpu
         with:
           # Update this key to force a new cache (sync with packaging.yml)
           prefix-key: "python-v3"
 
+      - name: Cache libgpuspatial manifest installs
+        if: matrix.run_libgpuspatial
+        uses: actions/cache@v5
+        with:
+          path: c/sedona-libgpuspatial/libgpuspatial/build/vcpkg_installed
+          key: libgpuspatial-vcpkg-installed-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-${{ hashFiles('c/sedona-libgpuspatial/libgpuspatial/vcpkg.json', 'c/sedona-libgpuspatial/libgpuspatial/CMakeLists.txt', 'c/sedona-libgpuspatial/libgpuspatial/CMakePresets.json') }}
+
       - name: Build libgpuspatial Tests
+        if: matrix.run_libgpuspatial
         run: |
           echo "=== Building libgpuspatial tests ==="
           cd c/sedona-libgpuspatial/libgpuspatial
-          mkdir build
-          cmake --preset=default-with-tests -S . -B build
+          mkdir -p build
+          cmake --preset=default-with-tests -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86
           cmake --build build --target all
 
       - name: Run libgpuspatial tests
+        if: matrix.run_libgpuspatial
         run: |
           echo "=== Running libgpuspatial tests ==="
           cd c/sedona-libgpuspatial/libgpuspatial/build
@@ -120,23 +141,28 @@ jobs:
           done
 
       - name: Install
+        if: matrix.run_python_gpu
         run: |
           # Keep this export in sync with the export in dev/release/verify-release-candidate.sh
           export MATURIN_PEP517_ARGS="--features s2geography,gpu"
           pip install -e "python/sedonadb/[test]" -vv
 
       - name: Download minimal geoarrow-data assets
+        if: matrix.run_python_gpu
         run: |
           python submodules/download-assets.py "*water-junc*" "*water-point*"
 
       - name: Start PostGIS
+        if: matrix.run_python_gpu
         run: |
           docker compose up --wait --detach postgis
 
       - name: Print GPU status
+        if: matrix.run_python_gpu
         run: nvidia-smi
 
       - name: Run tests
+        if: matrix.run_python_gpu
         env:
           # Ensure that we don't skip tests that we didn't intend to
           SEDONADB_PYTHON_NO_SKIP_TESTS: "true"
@@ -145,6 +171,6 @@ jobs:
           python -m pytest -vv sedonadb/tests/test_sjoin_gpu.py
 
       - name: Shutdown docker compose services
-        if: always()
+        if: ${{ always() && matrix.run_python_gpu }}
         run: |
           docker compose down
