@@ -82,6 +82,9 @@ jobs:
         run: |
           rustup toolchain install stable-x86_64-pc-windows-gnu --no-self-update
           rustup default stable-x86_64-pc-windows-gnu
+          # Enable Long Paths support on Windows to avoid issues with long paths in the Rust target directory
+          git config --system core.longpaths true
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
 
       - name: Install dependencies (Linux)
         if: matrix.config.os == 'ubuntu-latest'
