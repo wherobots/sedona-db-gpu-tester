@@ -24,10 +24,10 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_expr::item_crs::make_item_crs;
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
+use sedona_geometry::types::Edges;
 use sedona_geometry::wkb_factory::write_wkb_polygon;
 use sedona_raster::affine_transformation::to_world_coordinate;
 use sedona_raster::traits::RasterRef;
-use sedona_schema::datatypes::Edges;
 use sedona_schema::{datatypes::SedonaType, matchers::ArgMatcher};
 
 /// RS_Envelope() scalar UDF documentation
@@ -105,8 +105,8 @@ impl SedonaScalarKernel for RsEnvelope {
 /// derives the min/max X and Y to produce an axis-aligned bounding box.
 /// For skewed/rotated rasters, this differs from the convex hull.
 fn write_envelope_wkb(raster: &dyn RasterRef, out: &mut impl std::io::Write) -> Result<()> {
-    let width = raster.metadata().width() as i64;
-    let height = raster.metadata().height() as i64;
+    let width = raster.metadata().width();
+    let height = raster.metadata().height();
 
     // Compute the four corners in world coordinates
     let (ulx, uly) = to_world_coordinate(raster, 0, 0);

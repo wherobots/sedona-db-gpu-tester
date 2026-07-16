@@ -37,7 +37,7 @@
 //! `SedonaDBExprFactory::column` / `::literal`.
 
 use datafusion_common::Column;
-use datafusion_expr::{expr::InList, BinaryExpr, Cast, Expr, Operator};
+use datafusion_expr::{expr::InList, BinaryExpr, Cast, Expr, Operator, SortExpr};
 use pyo3::prelude::*;
 
 use crate::error::PySedonaError;
@@ -55,7 +55,7 @@ use crate::import_from::{import_arrow_field, import_arrow_scalar};
 /// The `inner` field is intentionally `pub` so that other PyO3 modules in
 /// this crate (e.g. `dataframe.rs`) can take `Vec<PyExpr>` arguments and
 /// move the inner `Expr` out without going through accessor methods.
-#[pyclass(name = "InternalExpr")]
+#[pyclass(name = "InternalExpr", from_py_object)]
 #[derive(Clone)]
 pub struct PyExpr {
     pub inner: Expr,
@@ -86,6 +86,13 @@ impl PyExpr {
     /// that tests can assert on without depending on Display formatting.
     fn variant_name(&self) -> String {
         self.inner.variant_name().to_string()
+    }
+
+    /// The output column name this expression would produce (its alias if
+    /// aliased, the column name if a bare column, etc.). Used to match
+    /// positional `mutate()` expressions against existing columns.
+    fn output_name(&self) -> String {
+        self.inner.schema_name().to_string()
     }
 
     /// Wrap this expression in `Expr::Alias { name }`.
@@ -164,6 +171,55 @@ impl PyExpr {
         Self {
             inner: Expr::Negative(Box::new(self.inner.clone())),
         }
+    }
+
+    /// Wrap this expression as an ascending `SortExpr` sort key.
+    ///
+    /// `nulls_first` controls where null values land in the sorted output.
+    /// The Python wrapper defaults this to `false` (nulls last), matching
+    /// the default we ship for both directions; users wanting SQL-style
+    /// "nulls last on asc, nulls first on desc" can pass an explicit
+    /// argument or use `sort_expr()` for full control.
+    #[pyo3(signature = (nulls_first=false))]
+    fn asc(&self, nulls_first: bool) -> PySortExpr {
+        PySortExpr {
+            inner: SortExpr::new(self.inner.clone(), /* asc */ true, nulls_first),
+        }
+    }
+
+    /// Wrap this expression as a descending `SortExpr` sort key. See
+    /// `asc` for the meaning of `nulls_first`.
+    #[pyo3(signature = (nulls_first=false))]
+    fn desc(&self, nulls_first: bool) -> PySortExpr {
+        PySortExpr {
+            inner: SortExpr::new(self.inner.clone(), /* asc */ false, nulls_first),
+        }
+    }
+}
+
+/// PyO3 wrapper around `datafusion_expr::SortExpr` (a `(expr, asc,
+/// nulls_first)` triple). Exposed to Python as `_lib.InternalSortExpr`.
+///
+/// `SortExpr` values are produced either via `Expr.asc()` / `Expr.desc()`
+/// (the common case, with `nulls_first` defaulting to false), or via
+/// `sedonadb.expr.sort_expr(expr, asc=..., nulls_first=...)` for full
+/// control. They are consumed by `DataFrame.sort(*keys)`.
+#[pyclass(name = "InternalSortExpr", from_py_object)]
+#[derive(Clone)]
+pub struct PySortExpr {
+    pub inner: SortExpr,
+}
+
+impl PySortExpr {
+    pub fn new(inner: SortExpr) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl PySortExpr {
+    fn __repr__(&self) -> String {
+        format!("{}", self.inner)
     }
 }
 
@@ -256,5 +312,17 @@ pub fn expr_binary(op: &str, lhs: &PyExpr, rhs: &PyExpr) -> Result<PyExpr, PySed
 pub fn expr_not(expr: &PyExpr) -> PyExpr {
     PyExpr {
         inner: Expr::Not(Box::new(expr.inner.clone())),
+    }
+}
+
+/// Construct a `SortExpr` with explicit direction and null-placement
+/// arguments. Lower-level than `Expr.asc()` / `Expr.desc()` — used when
+/// the caller wants to set both knobs deliberately, e.g. `nulls_first=true`
+/// on an ascending sort.
+#[pyfunction]
+#[pyo3(signature = (expr, asc=true, nulls_first=false))]
+pub fn expr_sort_expr(expr: &PyExpr, asc: bool, nulls_first: bool) -> PySortExpr {
+    PySortExpr {
+        inner: SortExpr::new(expr.inner.clone(), asc, nulls_first),
     }
 }

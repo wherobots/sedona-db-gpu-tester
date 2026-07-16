@@ -16,6 +16,7 @@
 # under the License.
 
 import sys
+import threading
 from typing import Any, Mapping
 
 from sedonadb._lib import PyExternalFormat, PyProjectedRecordBatchReader
@@ -49,6 +50,20 @@ class ExternalFormatSpec:
         If this concept is not important for this format, returns an empty string.
         """
         return ""
+
+    @property
+    def list_single_object(self) -> bool:
+        """Whether each URI should be treated as a single opaque object
+
+        Default ``False``: the URI is fed through DataFusion's listing layer,
+        which enumerates files matching :attr:`extension` at the prefix.
+
+        Override to ``True`` for directory-shaped formats (e.g. a Zarr group is
+        a directory, not a file) where the listing layer would return zero
+        matching files. The URI is then passed straight to
+        :meth:`open_reader` as one object.
+        """
+        return False
 
     def with_options(self, options: Mapping[str, Any]):
         """Clone this instance and return a new instance with options applied
@@ -105,7 +120,7 @@ class ExternalFormatSpec:
         """
         raise NotImplementedError()
 
-    def __sedona_external_format__(self):
+    def __sedonadb_external_format__(self):
         return PyExternalFormat(self)
 
 
@@ -188,13 +203,26 @@ class PyogrioReaderShelter:
     is no longer required).
     """
 
+    # Serializes dataset open/close. pyogrio releases the GIL around the
+    # GDAL open, so a multi-file scan otherwise opens datasets from several
+    # threads at once, which can crash the process (SIGABRT) depending on
+    # the GDAL build and driver. Reentrant because a garbage-collected
+    # shelter's __del__ may run on a thread that is already holding the
+    # lock in __init__.
+    _open_close_lock = threading.RLock()
+
     def __init__(self, inner, output_names=None):
         self._inner = inner
         self._output_names = output_names
-        self._meta, self._reader = self._inner.__enter__()
+        self._entered = False
+        with PyogrioReaderShelter._open_close_lock:
+            self._meta, self._reader = self._inner.__enter__()
+            self._entered = True
 
     def __del__(self):
-        self._inner.__exit__(None, None, None)
+        if self._entered:
+            with PyogrioReaderShelter._open_close_lock:
+                self._inner.__exit__(None, None, None)
 
     def __arrow_c_stream__(self, requested_schema=None):
         if self._output_names is None:

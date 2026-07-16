@@ -33,16 +33,48 @@ result_large_err = "allow"
 [dependencies]
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
 datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
 lru = { workspace = true }
 sedona-common = { workspace = true }
+sedona-expr = { workspace = true }
+sedona-functions = { workspace = true }
 sedona-gdal = { workspace = true }
 sedona-raster = { workspace = true }
+sedona-raster-functions = { workspace = true }
 sedona-schema = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+# Enable bindgen for GDAL versions without pre-built bindings (e.g., GDAL 3.13+).
+bindgen = ["sedona-gdal/bindgen"]
 
 [dev-dependencies]
 criterion = { workspace = true }
 sedona-gdal = { workspace = true, features = ["gdal-sys"] }
 sedona-testing = { workspace = true }
+sedona-proj = { workspace = true, features = ["proj-sys"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+harness = false
+name = "rs_frompath"
+path = "benches/rs_frompath.rs"
+
+[[bench]]
+harness = false
+name = "rs_metadata"
+path = "benches/rs_metadata.rs"
+
+[[bench]]
+harness = false
+name = "rs_polygonize"
+path = "benches/rs_polygonize.rs"
+
+[[bench]]
+harness = false
+name = "rs_as_raster"
+path = "benches/rs_as_raster.rs"

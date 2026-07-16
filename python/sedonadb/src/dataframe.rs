@@ -15,7 +15,6 @@ use std::collections::{HashMap, HashSet};
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::ffi::CString;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -25,11 +24,9 @@ use arrow_schema::{Schema, SchemaRef};
 use datafusion::catalog::MemTable;
 use datafusion::config::ConfigField;
 use datafusion::logical_expr::SortExpr;
-use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::prelude::DataFrame;
 use datafusion_common::{Column, DataFusionError, ParamValues};
-use datafusion_execution::TaskContextProvider;
-use datafusion_expr::{ExplainFormat, ExplainOption, Expr};
-use datafusion_ffi::table_provider::FFI_TableProvider;
+use datafusion_expr::{ExplainFormat, ExplainOption, Expr, JoinType, LogicalPlanBuilder};
 use futures::lock::Mutex;
 use futures::TryStreamExt;
 use pyo3::prelude::*;
@@ -43,13 +40,14 @@ use tokio::runtime::Runtime;
 
 use crate::context::InternalContext;
 use crate::error::PySedonaError;
+use crate::expr::{PyExpr, PySortExpr};
 use crate::import_from::{import_arrow_scalar, import_arrow_schema};
-use crate::reader::PySedonaStreamReader;
+use crate::reader::new_py_streaming_reader;
 use crate::runtime::wait_for_future;
 use crate::schema::PySedonaSchema;
 
 #[pyclass]
-#[derive(Clone)]
+
 pub struct InternalDataFrame {
     pub inner: DataFrame,
     pub runtime: Arc<Runtime>,
@@ -97,12 +95,285 @@ impl InternalDataFrame {
         Ok(names)
     }
 
+    fn qualified_column_expr(&self, py: Python<'_>, key: Py<PyAny>) -> Result<PyExpr, PyErr> {
+        let num_fields = self.inner.schema().fields().len();
+        let all_names = || self.inner.schema().field_names();
+
+        let index = if let Ok(i) = key.extract::<isize>(py) {
+            // Handle negative indices (Python-style)
+            let resolved = if i < 0 { (num_fields as isize) + i } else { i };
+            if resolved < 0 || resolved >= num_fields as isize {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "Column index out of range (schema has {num_fields} columns)"
+                )));
+            }
+            resolved as usize
+        } else if let Ok(name) = key.extract::<String>(py) {
+            self.inner
+                .schema()
+                .fields()
+                .iter()
+                .position(|f| f.name() == &name)
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err(format!(
+                        "Column '{}' not found. Available columns: {:?}",
+                        name,
+                        all_names()
+                    ))
+                })?
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Column key must be an integer index or string name",
+            ));
+        };
+
+        let (relation, field) = self.inner.schema().qualified_field(index);
+        let expr = Expr::Column(Column {
+            relation: relation.cloned(),
+            name: field.name().to_string(),
+            spans: Default::default(),
+        });
+        Ok(PyExpr::new(expr))
+    }
+
+    fn alias(&self, alias: &str) -> Result<InternalDataFrame, PySedonaError> {
+        let inner = self.inner.clone().alias(alias)?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
     fn limit(
         &self,
         limit: Option<usize>,
         offset: usize,
     ) -> Result<InternalDataFrame, PySedonaError> {
         let inner = self.inner.clone().limit(offset, limit)?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    /// Project a set of expressions, producing a new lazy `DataFrame`.
+    ///
+    /// The Python side accepts a mix of column-name strings and `Expr`
+    /// objects; strings are converted to column references before being
+    /// handed across the boundary, so this function only sees a
+    /// `Vec<PyExpr>`. Each element is unwrapped into its inner
+    /// `datafusion_expr::Expr` and passed to DataFusion's `DataFrame::select`
+    /// directly — no schema validation here, since DataFusion's plan-build
+    /// step already produces a clear error if a referenced column does not
+    /// exist on the input.
+    fn select(&self, exprs: Vec<PyExpr>) -> Result<InternalDataFrame, PySedonaError> {
+        let exprs: Vec<Expr> = exprs.into_iter().map(|e| e.inner).collect();
+        let inner = self.inner.clone().select(exprs)?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    /// Filter rows by one or more boolean expressions, producing a new
+    /// lazy `DataFrame`.
+    ///
+    /// The Python side guarantees `exprs` is non-empty and that every
+    /// element is an `Expr` (no strings, no Literals — those rejections
+    /// happen at the Python boundary so the error message can point at
+    /// the right alternative). Multiple predicates are combined into a
+    /// single composed `Expr` using DataFusion's `conjunction` helper,
+    /// which yields one conjunction node for the optimizer to reason
+    /// about rather than stacked filter nodes. Column-validity errors
+    /// surface at plan-build time from DataFusion, matching the
+    /// behavior of `select`.
+    fn filter(&self, exprs: Vec<PyExpr>) -> Result<InternalDataFrame, PySedonaError> {
+        // `conjunction` returns None only for an empty iterator; the
+        // `else` arm doubles as defense-in-depth against an empty
+        // predicate list slipping past the Python-side guard.
+        if let Some(combined) =
+            datafusion_expr::utils::conjunction(exprs.into_iter().map(|e| e.inner))
+        {
+            let inner = self.inner.clone().filter(combined)?;
+            Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+        } else {
+            Err(PySedonaError::SedonaPython(
+                "filter() requires at least one predicate".to_string(),
+            ))
+        }
+    }
+
+    /// Sort rows by the given `SortExpr` keys.
+    ///
+    /// Each key in `sort_exprs` carries its own direction and null
+    /// placement, constructed Python-side via `Expr.asc()`, `Expr.desc()`,
+    /// or `sedonadb.expr.sort_expr(...)`. The Python wrapper auto-promotes
+    /// bare column-name strings and plain `Expr` values to ascending
+    /// `SortExpr` with `nulls_first=false` before they reach this method,
+    /// so we just need to unwrap and pass through.
+    fn sort(&self, sort_exprs: Vec<PySortExpr>) -> Result<InternalDataFrame, PySedonaError> {
+        if sort_exprs.is_empty() {
+            return Err(PySedonaError::SedonaPython(
+                "sort() requires at least one sort key".to_string(),
+            ));
+        }
+        let sort_exprs: Vec<SortExpr> = sort_exprs.into_iter().map(|s| s.inner).collect();
+        let inner = self.inner.clone().sort(sort_exprs)?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    /// Drop the named columns, producing a new lazy `DataFrame`.
+    ///
+    /// The Python side guarantees `cols` is non-empty and that every
+    /// element is a string. DataFusion's `drop_columns` accepts `&[&str]`,
+    /// so we materialize a slice of borrowed string references and hand
+    /// it off; the plan-build step raises a `SchemaError` if any name
+    /// doesn't resolve to a column, and that error already includes the
+    /// list of valid field names for the user.
+    fn drop_columns(&self, cols: Vec<String>) -> Result<InternalDataFrame, PySedonaError> {
+        if cols.is_empty() {
+            return Err(PySedonaError::SedonaPython(
+                "drop() requires at least one column name".to_string(),
+            ));
+        }
+        let borrowed: Vec<&str> = cols.iter().map(String::as_str).collect();
+        let inner = self.inner.clone().drop_columns(&borrowed)?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    fn unnest(&self, columns: Vec<String>) -> Result<InternalDataFrame, PySedonaError> {
+        if columns.is_empty() {
+            return Err(PySedonaError::SedonaPython(
+                "unnest() requires at least one column name".to_string(),
+            ));
+        }
+        let borrowed: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let inner = self.inner.clone().unnest_columns(&borrowed)?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    /// Aggregate the rows of the DataFrame, optionally partitioned by
+    /// `group_exprs`. Both inputs are `Vec<PyExpr>` so the same Rust
+    /// method serves global aggregation (`group_exprs` empty, called
+    /// from `DataFrame.agg`) and grouped aggregation.
+    ///
+    /// The Python side guarantees `agg_exprs` is non-empty and that
+    /// every entry is an `Expr` (vs. a string or other type). It does
+    /// not verify that each entry is an aggregate-shaped expression —
+    /// e.g. `col("x")` would pass the Python `isinstance` check but is
+    /// not a valid aggregate. DataFusion's plan-build catches that case
+    /// with a clear error, so we don't reimplement the check here.
+    fn aggregate(
+        &self,
+        group_exprs: Vec<PyExpr>,
+        agg_exprs: Vec<PyExpr>,
+    ) -> Result<InternalDataFrame, PySedonaError> {
+        let group_exprs: Vec<Expr> = group_exprs.into_iter().map(|e| e.inner).collect();
+        let agg_exprs: Vec<Expr> = agg_exprs.into_iter().map(|e| e.inner).collect();
+        let inner = self.inner.clone().aggregate(group_exprs, agg_exprs)?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    fn cross_join(&self, right: &InternalDataFrame) -> Result<InternalDataFrame, PySedonaError> {
+        let (state, plan) = self.inner.clone().into_parts();
+        let right_plan = right.inner.logical_plan().clone();
+        let new_plan = LogicalPlanBuilder::from(plan)
+            .cross_join(right_plan)?
+            .build()?;
+        let inner = DataFrame::new(state, new_plan);
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    fn join_on(
+        &self,
+        right: &InternalDataFrame,
+        predicates: Vec<PyExpr>,
+        how: &str,
+    ) -> Result<InternalDataFrame, PySedonaError> {
+        let join_type = match how {
+            "inner" => JoinType::Inner,
+            "left" => JoinType::Left,
+            "right" => JoinType::Right,
+            "outer" => JoinType::Full,
+            "left_semi" => JoinType::LeftSemi,
+            "left_anti" => JoinType::LeftAnti,
+            "right_semi" => JoinType::RightSemi,
+            "right_anti" => JoinType::RightAnti,
+            other => {
+                return Err(PySedonaError::SedonaPython(format!(
+                    "Unsupported join type '{other}'"
+                )))
+            }
+        };
+        let on_exprs: Vec<Expr> = predicates.into_iter().map(|p| p.inner).collect();
+        let inner = self
+            .inner
+            .clone()
+            .join_on(right.inner.clone(), join_type, on_exprs)?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    fn distinct(&self) -> Result<InternalDataFrame, PySedonaError> {
+        let inner = self.inner.clone().distinct()?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    /// `DISTINCT ON (on_exprs)` keeping all columns. With no sort expression
+    /// DataFusion keeps an arbitrary row per distinct key (SQL `DISTINCT ON`
+    /// without `ORDER BY`).
+    fn distinct_on(&self, on_exprs: Vec<PyExpr>) -> Result<InternalDataFrame, PySedonaError> {
+        let on: Vec<Expr> = on_exprs.into_iter().map(|e| e.inner).collect();
+
+        // Output all columns: build qualified column refs for the full schema
+        // (mirrors `qualified_column_expr`).
+        let schema = self.inner.schema();
+        let select: Vec<Expr> = (0..schema.fields().len())
+            .map(|i| {
+                let (relation, field) = schema.qualified_field(i);
+                Expr::Column(Column {
+                    relation: relation.cloned(),
+                    name: field.name().to_string(),
+                    spans: Default::default(),
+                })
+            })
+            .collect();
+
+        let inner = self.inner.clone().distinct_on(on, select, None)?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    /// `UNION ALL` — concatenate two DataFrames, preserving duplicate rows.
+    /// The two inputs must have the same schema (matched by position);
+    /// DataFusion errors at plan-build time otherwise.
+    fn union(&self, other: &InternalDataFrame) -> Result<InternalDataFrame, PySedonaError> {
+        let inner = self.inner.clone().union(other.inner.clone())?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    /// `UNION` — concatenate two DataFrames and drop duplicate rows.
+    fn union_distinct(
+        &self,
+        other: &InternalDataFrame,
+    ) -> Result<InternalDataFrame, PySedonaError> {
+        let inner = self.inner.clone().union_distinct(other.inner.clone())?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    /// `INTERSECT ALL` — rows present in both DataFrames, preserving
+    /// multiplicity.
+    fn intersect(&self, other: &InternalDataFrame) -> Result<InternalDataFrame, PySedonaError> {
+        let inner = self.inner.clone().intersect(other.inner.clone())?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    /// `INTERSECT` — rows present in both DataFrames, de-duplicated.
+    fn intersect_distinct(
+        &self,
+        other: &InternalDataFrame,
+    ) -> Result<InternalDataFrame, PySedonaError> {
+        let inner = self.inner.clone().intersect_distinct(other.inner.clone())?;
+        Ok(InternalDataFrame::new(inner, self.runtime.clone()))
+    }
+
+    /// `EXCEPT` (distinct) — the distinct rows in this DataFrame that are
+    /// not in the other. Multiplicity-preserving `EXCEPT ALL` is not
+    /// currently supported by the engine, hence only the distinct variant.
+    fn except_distinct(
+        &self,
+        other: &InternalDataFrame,
+    ) -> Result<InternalDataFrame, PySedonaError> {
+        let inner = self.inner.clone().except_distinct(other.inner.clone())?;
         Ok(InternalDataFrame::new(inner, self.runtime.clone()))
     }
 
@@ -151,12 +422,13 @@ impl InternalDataFrame {
         let schema = self.inner.schema();
         let partitions =
             wait_for_future(py, &self.runtime, self.inner.clone().collect_partitioned())??;
-        let provider = MemTable::try_new(schema.as_arrow().clone().into(), partitions)?;
+        let provider = Arc::new(MemTable::try_new(
+            schema.as_arrow().clone().into(),
+            partitions,
+        )?);
+        let df = ctx.inner.ctx.read_table(provider)?;
 
-        Ok(Self::new(
-            ctx.inner.ctx.read_table(Arc::new(provider))?,
-            self.runtime.clone(),
-        ))
+        Ok(Self::new(df, self.runtime.clone()))
     }
 
     fn to_batches<'py>(
@@ -188,7 +460,7 @@ impl InternalDataFrame {
         simplify: Option<bool>,
     ) -> Result<StreamingResult, PySedonaError> {
         let stream = wait_for_future(py, &self.runtime, self.inner.clone().execute_stream())??;
-        let reader = PySedonaStreamReader::new(self.runtime.clone(), stream);
+        let reader = new_py_streaming_reader(stream, self.runtime.clone());
         let mut reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
 
         if simplify.unwrap_or(false) {
@@ -226,36 +498,54 @@ impl InternalDataFrame {
         #[cfg(not(feature = "s2geography"))]
         let has_geography = false;
 
-        let sort_by_expr = sort_by
-            .into_iter()
-            .map(|name| {
-                let column = Expr::Column(Column::new_unqualified(name.clone()));
-                if geometry_column_names.contains(name.as_str()) {
-                    // Create the call sd_order(column). If we're ordering by geometry but don't have
-                    // the required feature for high quality sort output, give an error. This is mostly
-                    // an issue when using maturin develop because geography is not a default feature.
-                    if has_geography {
-                        let state = ctx.inner.ctx.state();
-                        let order_udf_opt = state.scalar_functions().get("sd_order");
-                        if let Some(order_udf) = order_udf_opt {
-                            Ok(SortExpr::new(order_udf.call(vec![column]), true, false))
-                        } else {
-                            Err(PySedonaError::SedonaPython(
-                                "Can't order by geometry field when sd_order() is not available"
-                                    .to_string(),
-                            ))
-                        }
-                    } else {
-                        Err(PySedonaError::SedonaPython(
-                                "Use maturin develop --features 's2geography,pyo3/extension-module' for dev geography support"
-                                    .to_string(),
-                            ))
-                    }
+        let mut sort_by_expr = Vec::with_capacity(sort_by.len());
+        let mut needs_sd_order = false;
+        for name in sort_by {
+            let column = Expr::Column(Column::new_unqualified(name.clone()));
+            if geometry_column_names.contains(name.as_str()) {
+                if has_geography {
+                    needs_sd_order = true;
+                    sort_by_expr.push((Some(name), column));
                 } else {
-                    Ok(SortExpr::new(column, true, false))
+                    return Err(PySedonaError::SedonaPython(
+                        "Use maturin develop --features 's2geography,pyo3/extension-module' for dev geography support"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                sort_by_expr.push((None, column));
+            }
+        }
+
+        let order_udf = if needs_sd_order {
+            Some(
+                ctx.inner
+                    .ctx
+                    .state()
+                    .scalar_functions()
+                    .get("sd_order")
+                    .cloned()
+                    .ok_or_else(|| {
+                        PySedonaError::SedonaPython(
+                            "Can't order by geometry field when sd_order() is not available"
+                                .to_string(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        let sort_by_expr = sort_by_expr
+            .into_iter()
+            .map(|(geometry_name, column)| {
+                if geometry_name.is_some() {
+                    SortExpr::new(order_udf.as_ref().unwrap().call(vec![column]), true, false)
+                } else {
+                    SortExpr::new(column, true, false)
                 }
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Vec<_>>();
 
         let write_options = SedonaWriteOptions::new()
             .with_partition_by(partition_by)
@@ -385,21 +675,26 @@ impl InternalDataFrame {
         Ok(InternalDataFrame::new(df, self.runtime.clone()))
     }
 
-    fn __datafusion_table_provider__<'py>(
+    fn __sedonadb_table_provider__<'py>(
         &self,
         py: Python<'py>,
+        ctx: &InternalContext,
     ) -> Result<Bound<'py, PyCapsule>, PySedonaError> {
-        let name = cr"datafusion_table_provider".into();
         let provider = self.inner.clone().into_view();
-        let ctx = Arc::new(SessionContext::new()) as Arc<dyn TaskContextProvider>;
-        let ffi_provider = FFI_TableProvider::new(
+        // Use the actual session state so that object stores, UDFs, and other
+        // registrations are available when the consumer scans the provider.
+        let session = Arc::new(ctx.inner.ctx.state());
+        let exported = sedona_extension::table_provider::ExportedTableProvider::new(
             provider,
-            true,
-            Some(self.runtime.handle().clone()),
-            &ctx,
-            None,
+            session,
+            self.runtime.clone(),
         );
-        Ok(PyCapsule::new(py, ffi_provider, Some(name))?)
+        let ffi_provider: sedona_extension::extension::SedonaCTableProvider = exported.into();
+        Ok(PyCapsule::new_with_value(
+            py,
+            ffi_provider,
+            c"sedonadb_table_provider",
+        )?)
     }
 }
 
@@ -426,8 +721,11 @@ impl Batches {
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
 
         let ffi_stream = FFI_ArrowArrayStream::new(reader);
-        let stream_capsule_name = CString::new("arrow_array_stream").unwrap();
-        Ok(PyCapsule::new(py, ffi_stream, Some(stream_capsule_name))?)
+        Ok(PyCapsule::new_with_value(
+            py,
+            ffi_stream,
+            c"arrow_array_stream",
+        )?)
     }
 }
 
@@ -454,8 +752,11 @@ impl StreamingResult {
         if let Some(reader) = reader_opt.take() {
             check_py_requested_schema(requested_schema, &reader.schema())?;
             let ffi_stream = FFI_ArrowArrayStream::new(reader);
-            let stream_capsule_name = CString::new("arrow_array_stream").unwrap();
-            Ok(PyCapsule::new(py, ffi_stream, Some(stream_capsule_name))?)
+            Ok(PyCapsule::new_with_value(
+                py,
+                ffi_stream,
+                c"arrow_array_stream",
+            )?)
         } else {
             Err(PySedonaError::SedonaPython(
                 "SedonaDB DataFrame streaming result may only be consumed once".to_string(),

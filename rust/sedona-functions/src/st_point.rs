@@ -24,7 +24,7 @@ use datafusion_common::scalar::ScalarValue;
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_schema::{
-    datatypes::{SedonaType, WKB_GEOGRAPHY, WKB_GEOMETRY},
+    datatypes::{SedonaType, WKB_GEOGRAPHY, WKB_GEOGRAPHY_WGS84, WKB_GEOMETRY},
     matchers::ArgMatcher,
 };
 
@@ -52,14 +52,20 @@ pub fn st_point_udf() -> SedonaScalarUDF {
 /// Native implementation to create geometries from coordinates.
 /// See [`st_geogpoint_udf`] for the corresponding geography constructor.
 pub fn st_geogpoint_udf() -> SedonaScalarUDF {
-    let kernel = Arc::new(STGeoFromPoint {
+    // Inner kernel for SRIDified has no CRS - the SRID argument sets it
+    let inner_kernel = Arc::new(STGeoFromPoint {
         out_type: WKB_GEOGRAPHY,
     });
-    let sridified_kernel = Arc::new(SRIDifiedKernel::new(kernel.clone()));
+    let sridified_kernel = Arc::new(SRIDifiedKernel::new(inner_kernel));
+
+    // Standalone kernel returns WGS84 CRS by default
+    let standalone_kernel = Arc::new(STGeoFromPoint {
+        out_type: WKB_GEOGRAPHY_WGS84.clone(),
+    });
 
     SedonaScalarUDF::new(
         "st_geogpoint",
-        vec![sridified_kernel, kernel],
+        vec![sridified_kernel, standalone_kernel],
         Volatility::Immutable,
     )
 }
@@ -147,8 +153,8 @@ mod tests {
     use datafusion_expr::Literal;
     use datafusion_expr::ScalarUDF;
     use rstest::rstest;
+    use sedona_geometry::types::Edges;
     use sedona_schema::crs::lnglat;
-    use sedona_schema::datatypes::Edges;
     use sedona_testing::compare::assert_array_equal;
     use sedona_testing::create::create_array_item_crs;
     use sedona_testing::{create::create_array, testers::ScalarUdfTester};
@@ -312,7 +318,7 @@ mod tests {
                     None
                 ],
                 [
-                    Some("OGC:CRS84"),
+                    Some("EPSG:4326"),
                     Some("EPSG:3857"),
                     Some("EPSG:3857"),
                     None,
@@ -357,7 +363,7 @@ mod tests {
             ],
         );
 
-        tester.assert_return_type(WKB_GEOGRAPHY);
+        tester.assert_return_type(WKB_GEOGRAPHY_WGS84.clone());
         let result = tester.invoke_scalar_scalar(1.0, 2.0).unwrap();
         tester.assert_scalar_result_equals(result, "POINT (1 2)");
     }

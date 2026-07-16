@@ -26,12 +26,38 @@ use parquet::{
     },
     schema::types::ColumnDescPtr,
 };
+use sedona_common::SedonaRuntime;
+use sedona_geometry::{
+    bounds::{WkbBounder2D, WkbBounder2DFactory},
+    types::Edges,
+};
 
-pub struct SedonaGeoStatsAccumulatorFactory;
+/// Factory for Parquet [GeoStatsAccumulator]s that can handle Geography
+pub struct SedonaGeoStatsAccumulatorFactory {
+    bounder_factory: WkbBounder2DFactory,
+}
 
 impl SedonaGeoStatsAccumulatorFactory {
-    pub fn try_init() -> Result<()> {
-        init_geo_stats_accumulator_factory(Arc::new(Self))?;
+    /// Initialize the global geo-statistics accumulator factory from the given runtime.
+    ///
+    /// # First-Session-Wins Semantics
+    ///
+    /// This function snapshots the runtime's `bounder_factory` into arrow-rs's process-wide
+    /// `OnceLock`. Subsequent calls with different runtimes will fail with a `ParquetError`
+    /// (typically swallowed by the caller). This means:
+    ///
+    /// - The first `SedonaContext` created in a process determines the bounders used for
+    ///   writing Parquet geography statistics for the lifetime of that process.
+    /// - Bounders registered via `SedonaRuntime::with_bounder` *after* context creation,
+    ///   or in a second context with a different runtime, will **not** affect Parquet writes.
+    /// - The read path (`GeoParquetFormat`) re-reads live options per plan, so pruning uses
+    ///   fresh bounders while writes use the snapshotted ones.
+    ///
+    /// This asymmetry is forced by arrow-rs's global API and cannot be worked around without
+    /// upstream changes.
+    pub fn try_init(runtime: &SedonaRuntime) -> Result<()> {
+        let bounder_factory = runtime.bounder_factory().clone();
+        init_geo_stats_accumulator_factory(Arc::new(Self { bounder_factory }))?;
         Ok(())
     }
 }
@@ -42,51 +68,38 @@ impl GeoStatsAccumulatorFactory for SedonaGeoStatsAccumulatorFactory {
             return Box::new(ParquetGeoStatsAccumulator::default());
         }
 
-        #[cfg(feature = "s2geography")]
+        // Handle Geography with either no algorithm specified (defaults to spherical)
+        // or explicit SPHERICAL algorithm
         if let Some(LogicalType::Geography {
             crs: _,
-            algorithm: None,
+            algorithm: None | Some(parquet::basic::EdgeInterpolationAlgorithm::SPHERICAL),
         }) = descr.logical_type_ref()
         {
-            return Box::new(GeographyGeoStatsAccumulator::default());
-        }
-
-        #[cfg(feature = "s2geography")]
-        if let Some(LogicalType::Geography {
-            crs: _,
-            algorithm: Some(parquet::basic::EdgeInterpolationAlgorithm::SPHERICAL),
-        }) = descr.logical_type_ref()
-        {
-            return Box::new(GeographyGeoStatsAccumulator::default());
+            if let Some(bounder) = self.bounder_factory.bounder_for_edge_type(Edges::Spherical) {
+                return Box::new(GeographyGeoStatsAccumulator::new(bounder));
+            }
         }
 
         Box::new(VoidGeoStatsAccumulator::default())
     }
 }
 
-#[cfg(feature = "s2geography")]
 #[derive(Debug)]
 struct GeographyGeoStatsAccumulator {
     invalid: bool,
-    geog_bounder: sedona_s2geography::rect_bounder::RectBounder,
+    geog_bounder: Box<dyn WkbBounder2D>,
     bounder: parquet_geospatial::bounding::GeometryBounder,
-    geography_factory: sedona_s2geography::geography::GeographyFactory,
 }
 
-#[cfg(feature = "s2geography")]
-impl Default for GeographyGeoStatsAccumulator {
-    fn default() -> Self {
+impl GeographyGeoStatsAccumulator {
+    fn new(geog_bounder: Box<dyn WkbBounder2D>) -> Self {
         Self {
             invalid: false,
-            geog_bounder: Default::default(),
+            geog_bounder,
             bounder: parquet_geospatial::bounding::GeometryBounder::empty(),
-            geography_factory: Default::default(),
         }
     }
-}
 
-#[cfg(feature = "s2geography")]
-impl GeographyGeoStatsAccumulator {
     fn clear(&mut self) {
         self.invalid = false;
         self.bounder = parquet_geospatial::bounding::GeometryBounder::empty();
@@ -94,7 +107,6 @@ impl GeographyGeoStatsAccumulator {
     }
 }
 
-#[cfg(feature = "s2geography")]
 impl GeoStatsAccumulator for GeographyGeoStatsAccumulator {
     fn is_valid(&self) -> bool {
         !self.invalid
@@ -111,20 +123,15 @@ impl GeoStatsAccumulator for GeographyGeoStatsAccumulator {
             return;
         }
 
-        let Ok(geog) = self.geography_factory.from_wkb(wkb) else {
-            self.invalid = true;
-            return;
-        };
-
-        if self.geog_bounder.bound(&geog).is_err() {
+        if self.geog_bounder.update_wkb_bytes(wkb).is_err() {
             self.invalid = true;
         }
     }
 
     fn finish(&mut self) -> Option<Box<parquet::geospatial::statistics::GeospatialStatistics>> {
-        use parquet_geospatial::interval::IntervalTrait;
-
         use parquet::geospatial::bounding_box::BoundingBox;
+        use parquet_geospatial::interval::IntervalTrait as ParquetIntervalTrait;
+        use sedona_geometry::interval::IntervalTrait;
 
         if self.invalid {
             self.clear();
@@ -139,16 +146,18 @@ impl GeoStatsAccumulator for GeographyGeoStatsAccumulator {
         };
 
         // If we have completely empty bounds, we can still communicate the visited geometry types
-        let Ok(Some(geog_box)) = self.geog_bounder.finish() else {
+        let (x, y) = self.geog_bounder.finish();
+
+        if x.is_empty() || y.is_empty() {
             self.clear();
             return Some(Box::new(
                 parquet::geospatial::statistics::GeospatialStatistics::new(None, geometry_types),
             ));
         };
 
-        // s2geography's rect bounder outputs xmin, ymin, xmax, ymax; BoundingBox::new()
+        // The WkbBounder2D's rect bounder outputs (x, y) intervals; BoundingBox::new()
         // accepts xmin, xmax, ymin, ymax.
-        let mut bbox = BoundingBox::new(geog_box.0, geog_box.2, geog_box.1, geog_box.3);
+        let mut bbox = BoundingBox::new(x.lo(), x.hi(), y.lo(), y.hi());
 
         // Use the Z, M, and geometry type bounds from the Parquet implementation
         if !self.bounder.z().is_empty() {
@@ -165,5 +174,157 @@ impl GeoStatsAccumulator for GeographyGeoStatsAccumulator {
         Some(Box::new(
             parquet::geospatial::statistics::GeospatialStatistics::new(Some(bbox), geometry_types),
         ))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[cfg(feature = "s2geography_tests")]
+    use parquet::geospatial::bounding_box::BoundingBox;
+
+    #[cfg(feature = "s2geography_tests")]
+    fn assert_bbox_contains(actual: &BoundingBox, expected: &BoundingBox, epsilon: f64) {
+        // actual.xmin should be <= expected.xmin (can be slightly smaller)
+        assert!(
+            expected.get_xmin() - actual.get_xmin() >= 0.0
+                && expected.get_xmin() - actual.get_xmin() < epsilon,
+            "x_min mismatch: actual {} should be <= expected {} (within {})",
+            actual.get_xmin(),
+            expected.get_xmin(),
+            epsilon
+        );
+        // actual.xmax should be >= expected.xmax (can be slightly larger)
+        assert!(
+            actual.get_xmax() - expected.get_xmax() >= 0.0
+                && actual.get_xmax() - expected.get_xmax() < epsilon,
+            "x_max mismatch: actual {} should be >= expected {} (within {})",
+            actual.get_xmax(),
+            expected.get_xmax(),
+            epsilon
+        );
+        // actual.ymin should be <= expected.ymin (can be slightly smaller)
+        assert!(
+            expected.get_ymin() - actual.get_ymin() >= 0.0
+                && expected.get_ymin() - actual.get_ymin() < epsilon,
+            "y_min mismatch: actual {} should be <= expected {} (within {})",
+            actual.get_ymin(),
+            expected.get_ymin(),
+            epsilon
+        );
+        // actual.ymax should be >= expected.ymax (can be slightly larger)
+        assert!(
+            actual.get_ymax() - expected.get_ymax() >= 0.0
+                && actual.get_ymax() - expected.get_ymax() < epsilon,
+            "y_max mismatch: actual {} should be >= expected {} (within {})",
+            actual.get_ymax(),
+            expected.get_ymax(),
+            epsilon
+        );
+
+        assert_eq!(actual.get_zmin(), expected.get_zmin(), "z_min mismatch");
+        assert_eq!(actual.get_zmax(), expected.get_zmax(), "z_max mismatch");
+        assert_eq!(actual.get_mmin(), expected.get_mmin(), "m_min mismatch");
+        assert_eq!(actual.get_mmax(), expected.get_mmax(), "m_max mismatch");
+    }
+
+    #[cfg(feature = "s2geography_tests")]
+    #[test]
+    fn test_geography_accumulator() {
+        use parquet_geospatial::testing::{wkb_point_xy, wkb_point_xyzm};
+        use sedona_s2geography::rect_bounder::WkbGeographyBounder;
+
+        // The geography bounder produces slightly expanded bounds compared to the
+        // geometry bounder due to spherical interpolation along geodesics.
+        const EPSILON: f64 = 1e-10;
+        let mut accumulator =
+            GeographyGeoStatsAccumulator::new(Box::new(WkbGeographyBounder::default()));
+
+        // A fresh instance should be able to bound input
+        assert!(accumulator.is_valid());
+        accumulator.update_wkb(&wkb_point_xy(1.0, 2.0));
+        accumulator.update_wkb(&wkb_point_xy(11.0, 12.0));
+        let stats = accumulator.finish().unwrap();
+        assert_eq!(stats.geospatial_types().unwrap(), &vec![1]);
+        assert_bbox_contains(
+            stats.bounding_box().unwrap(),
+            &BoundingBox::new(1.0, 11.0, 2.0, 12.0),
+            EPSILON,
+        );
+
+        // finish() should have reset the bounder such that the first values
+        // aren't when computing the next bound of statistics.
+        assert!(accumulator.is_valid());
+        accumulator.update_wkb(&wkb_point_xy(21.0, 22.0));
+        accumulator.update_wkb(&wkb_point_xy(31.0, 32.0));
+        let stats = accumulator.finish().unwrap();
+        assert_eq!(stats.geospatial_types().unwrap(), &vec![1]);
+        assert_bbox_contains(
+            stats.bounding_box().unwrap(),
+            &BoundingBox::new(21.0, 31.0, 22.0, 32.0),
+            EPSILON,
+        );
+
+        // When an accumulator encounters invalid input, it reports is_valid() false
+        // and does not compute subsequent statistics
+        assert!(accumulator.is_valid());
+        accumulator.update_wkb(&wkb_point_xy(41.0, 42.0));
+        accumulator.update_wkb("these bytes are not WKB".as_bytes());
+        assert!(!accumulator.is_valid());
+        assert!(accumulator.finish().is_none());
+
+        // Subsequent rounds of accumulation should work as expected
+        assert!(accumulator.is_valid());
+        accumulator.update_wkb(&wkb_point_xy(41.0, 42.0));
+        accumulator.update_wkb(&wkb_point_xy(51.0, 52.0));
+        let stats = accumulator.finish().unwrap();
+        assert_eq!(stats.geospatial_types().unwrap(), &vec![1]);
+        assert_bbox_contains(
+            stats.bounding_box().unwrap(),
+            &BoundingBox::new(41.0, 51.0, 42.0, 52.0),
+            EPSILON,
+        );
+
+        // Antimeridian-crossing input should result in a wraparound box
+        assert!(accumulator.is_valid());
+        accumulator.update_wkb(&wkb_point_xy(-179.0, 42.0));
+        accumulator.update_wkb(&wkb_point_xy(179.0, 52.0));
+        let stats = accumulator.finish().unwrap();
+        assert!(
+            stats.bounding_box().unwrap().get_xmin() > stats.bounding_box().unwrap().get_xmax()
+        );
+
+        // When there was no input at all (occurs in the all null case), both geometry
+        // types and bounding box will be None. This is because Parquet Thrift statistics
+        // have no mechanism to communicate "empty". (The all null situation may be determined
+        // from the null count in this case).
+        assert!(accumulator.is_valid());
+        let stats = accumulator.finish().unwrap();
+        assert!(stats.geospatial_types().is_none());
+        assert!(stats.bounding_box().is_none());
+
+        // When there was 100% "empty" input (i.e., non-null geometries without
+        // coordinates), there should be statistics with geometry types but no
+        // bounding box.
+        assert!(accumulator.is_valid());
+        accumulator.update_wkb(&wkb_point_xy(f64::NAN, f64::NAN));
+        let stats = accumulator.finish().unwrap();
+        assert_eq!(stats.geospatial_types().unwrap(), &vec![1]);
+        assert!(stats.bounding_box().is_none());
+
+        // If Z and/or M are present, they should be reported in the bounding box
+        assert!(accumulator.is_valid());
+        accumulator.update_wkb(&wkb_point_xyzm(1.0, 2.0, 3.0, 4.0));
+        accumulator.update_wkb(&wkb_point_xyzm(5.0, 6.0, 7.0, 8.0));
+        let stats = accumulator.finish().unwrap();
+        assert_eq!(stats.geospatial_types().unwrap(), &vec![3001]);
+        assert_bbox_contains(
+            stats.bounding_box().unwrap(),
+            &BoundingBox::new(1.0, 5.0, 2.0, 6.0)
+                .with_zrange(3.0, 7.0)
+                .with_mrange(4.0, 8.0),
+            EPSILON,
+        );
     }
 }

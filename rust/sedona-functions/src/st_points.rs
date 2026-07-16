@@ -35,7 +35,7 @@ use sedona_geometry::{
     },
 };
 use sedona_schema::{
-    datatypes::{SedonaType, WKB_GEOMETRY},
+    datatypes::{SedonaType, WKB_GEOGRAPHY, WKB_GEOMETRY},
     matchers::ArgMatcher,
 };
 use std::{io::Write, sync::Arc};
@@ -48,19 +48,26 @@ use crate::executor::WkbExecutor;
 pub fn st_points_udf() -> SedonaScalarUDF {
     SedonaScalarUDF::new(
         "st_points",
-        ItemCrsKernel::wrap_impl(vec![Arc::new(STPoints)]),
+        ItemCrsKernel::wrap_impl(vec![
+            Arc::new(STPoints {
+                matcher: ArgMatcher::new(vec![ArgMatcher::is_geometry()], WKB_GEOMETRY),
+            }),
+            Arc::new(STPoints {
+                matcher: ArgMatcher::new(vec![ArgMatcher::is_geography()], WKB_GEOGRAPHY),
+            }),
+        ]),
         Volatility::Immutable,
     )
 }
 
 #[derive(Debug)]
-struct STPoints;
+struct STPoints {
+    matcher: ArgMatcher,
+}
 
 impl SedonaScalarKernel for STPoints {
     fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
-        let matcher = ArgMatcher::new(vec![ArgMatcher::is_geometry()], WKB_GEOMETRY);
-
-        matcher.match_args(args)
+        self.matcher.match_args(args)
     }
 
     fn invoke_batch(
@@ -77,13 +84,13 @@ impl SedonaScalarKernel for STPoints {
         executor.execute_wkb_void(|maybe_wkb| {
             if let Some(wkb) = maybe_wkb {
                 // We need to know the number of points before actually writing the points.
-                let n_points = count_wkb_points_recursively(&wkb);
+                let n_points = count_wkb_points_recursively(wkb);
 
                 if write_wkb_multipoint_header(&mut builder, wkb.dim(), n_points).is_err() {
                     return sedona_internal_err!("Failed to write WKB point header");
                 };
 
-                if write_wkb_points_recursively(&mut builder, &wkb).is_err() {
+                if write_wkb_points_recursively(&mut builder, wkb).is_err() {
                     return sedona_internal_err!("Failed to write WKB point header");
                 };
 
@@ -108,6 +115,7 @@ pub fn st_npoints_udf() -> SedonaScalarUDF {
         ItemCrsKernel::wrap_impl(vec![Arc::new(STNPoints)]),
         Volatility::Immutable,
     )
+    .with_aliases(vec!["st_numpoints".to_string()])
 }
 
 #[derive(Debug)]
@@ -116,7 +124,7 @@ struct STNPoints;
 impl SedonaScalarKernel for STNPoints {
     fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
         let matcher = ArgMatcher::new(
-            vec![ArgMatcher::is_geometry()],
+            vec![ArgMatcher::is_geometry_or_geography()],
             SedonaType::Arrow(DataType::UInt64),
         );
 
@@ -133,7 +141,7 @@ impl SedonaScalarKernel for STNPoints {
 
         executor.execute_wkb_void(|maybe_wkb| {
             if let Some(wkb) = maybe_wkb {
-                builder.append_value(count_wkb_points_recursively(&wkb) as u64);
+                builder.append_value(count_wkb_points_recursively(wkb) as u64);
             } else {
                 builder.append_null();
             }
@@ -271,7 +279,7 @@ mod tests {
 
     use datafusion_expr::ScalarUDF;
     use rstest::rstest;
-    use sedona_schema::datatypes::{WKB_GEOMETRY_ITEM_CRS, WKB_VIEW_GEOMETRY};
+    use sedona_schema::datatypes::{WKB_GEOGRAPHY_ITEM_CRS, WKB_GEOMETRY_ITEM_CRS};
     use sedona_testing::{
         compare::assert_array_equal, create::create_array, testers::ScalarUdfTester,
     };
@@ -289,8 +297,14 @@ mod tests {
         assert!(st_npoints_udf.documentation().is_none());
     }
 
+    #[test]
+    fn npoints_aliases() {
+        let udf: ScalarUDF = st_npoints_udf().into();
+        assert!(udf.aliases().contains(&"st_numpoints".to_string()));
+    }
+
     #[rstest]
-    fn udf(#[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY)] sedona_type: SedonaType) {
+    fn udf(#[values(WKB_GEOMETRY, WKB_GEOGRAPHY)] sedona_type: SedonaType) {
         use arrow_array::UInt64Array;
 
         let tester_points = ScalarUdfTester::new(st_points_udf().into(), vec![sedona_type.clone()]);
@@ -351,7 +365,7 @@ mod tests {
                 // null
                 None,
             ],
-            &WKB_GEOMETRY,
+            &sedona_type.clone(),
         );
 
         let result_points = tester_points.invoke_array(input.clone()).unwrap();
@@ -387,7 +401,10 @@ mod tests {
     }
 
     #[rstest]
-    fn udf_invoke_item_crs(#[values(WKB_GEOMETRY_ITEM_CRS.clone())] sedona_type: SedonaType) {
+    fn udf_invoke_item_crs(
+        #[values(WKB_GEOMETRY_ITEM_CRS.clone(), WKB_GEOGRAPHY_ITEM_CRS.clone())]
+        sedona_type: SedonaType,
+    ) {
         let tester = ScalarUdfTester::new(st_points_udf().into(), vec![sedona_type.clone()]);
         tester.assert_return_type(sedona_type);
 

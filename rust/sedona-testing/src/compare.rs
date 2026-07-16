@@ -16,16 +16,19 @@
 // under the License.
 use std::iter::zip;
 
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, StructArray};
 use arrow_schema::DataType;
 use datafusion_common::{
     cast::{as_binary_array, as_binary_view_array},
     ScalarValue,
 };
 use datafusion_expr::ColumnarValue;
-use sedona_schema::datatypes::{SedonaType, WKB_GEOMETRY};
+use sedona_geometry::{bounds::wkb_bounds_xy, interval::IntervalTrait};
+use sedona_raster::array::RasterStructArray;
+use sedona_schema::datatypes::{SedonaType, RASTER, WKB_GEOMETRY};
 
 use crate::create::create_scalar;
+use crate::rasters::assert_raster_arrays_equal;
 
 /// Assert two [`ColumnarValue`]s are equal
 ///
@@ -78,7 +81,17 @@ pub fn assert_array_equal(actual: &ArrayRef, expected: &ArrayRef) {
 
     match (&actual_sedona, &expected_sedona) {
         (SedonaType::Arrow(_), SedonaType::Arrow(_)) => {
-            assert_eq!(actual, expected)
+            if actual.data_type() == RASTER.storage_type() {
+                // Raster-aware comparison: null rows may differ physically
+                // (cast-from-Null vs builder append_null), and raster
+                // mismatches deserve better messages than a struct dump.
+                assert_raster_structs_equal(
+                    actual.as_any().downcast_ref::<StructArray>().unwrap(),
+                    expected.as_any().downcast_ref::<StructArray>().unwrap(),
+                );
+            } else {
+                assert_eq!(actual, expected)
+            }
         }
 
         (SedonaType::Wkb(_, _), SedonaType::Wkb(_, _)) => {
@@ -97,6 +110,60 @@ pub fn assert_array_equal(actual: &ArrayRef, expected: &ArrayRef) {
             unreachable!()
         }
     }
+}
+
+/// Helper to assert the bounds of some [ScalarValue] are approximately equal
+///
+/// This is useful for testing Geography, where there is frequently rounding and expansion.
+/// Supports both plain WKB scalars and ITEM_CRS struct scalars.
+pub fn assert_scalar_wkb_bounds_approx_equal(
+    actual: &ScalarValue,
+    expected_xmin: f64,
+    expected_ymin: f64,
+    expected_xmax: f64,
+    expected_ymax: f64,
+    epsilon: f64,
+) {
+    let wkb_bytes = match actual {
+        ScalarValue::Binary(Some(bytes)) | ScalarValue::BinaryView(Some(bytes)) => bytes.clone(),
+        ScalarValue::Struct(struct_array) => {
+            // Handle ITEM_CRS struct: extract the "item" field
+            let item_col = struct_array
+                .column_by_name("item")
+                .expect("Expected 'item' field in struct");
+            match ScalarValue::try_from_array(item_col, 0)
+                .expect("Failed to extract scalar from struct")
+            {
+                ScalarValue::Binary(Some(bytes)) | ScalarValue::BinaryView(Some(bytes)) => bytes,
+                other => panic!("Expected binary in struct 'item' field, got {other:?}"),
+            }
+        }
+        _ => panic!("Expected binary or struct, got {actual:?}"),
+    };
+
+    let actual_bounds = wkb_bounds_xy(&wkb_bytes).expect("Failed to get bounds");
+
+    let actual_xmin = actual_bounds.x().lo();
+    let actual_ymin = actual_bounds.y().lo();
+    let actual_xmax = actual_bounds.x().hi();
+    let actual_ymax = actual_bounds.y().hi();
+
+    assert!(
+        (actual_xmin - expected_xmin).abs() < epsilon,
+        "xmin: expected {expected_xmin}, got {actual_xmin}"
+    );
+    assert!(
+        (actual_ymin - expected_ymin).abs() < epsilon,
+        "ymin: expected {expected_ymin}, got {actual_ymin}"
+    );
+    assert!(
+        (actual_xmax - expected_xmax).abs() < epsilon,
+        "xmax: expected {expected_xmax}, got {actual_xmax}"
+    );
+    assert!(
+        (actual_ymax - expected_ymax).abs() < epsilon,
+        "ymax: expected {expected_ymax}, got {actual_ymax}"
+    );
 }
 
 /// Assert a [`ScalarValue`] is a WKB_GEOMETRY scalar corresponding to the given WKT
@@ -138,13 +205,35 @@ pub fn assert_scalar_equal(actual: &ScalarValue, expected: &ScalarValue) {
     );
 
     match (&actual_sedona, &expected_sedona) {
-        (SedonaType::Arrow(_), SedonaType::Arrow(_)) => assert_arrow_scalar_equal(actual, expected),
+        (SedonaType::Arrow(_), SedonaType::Arrow(_)) => {
+            if let (
+                true,
+                ScalarValue::Struct(actual_struct),
+                ScalarValue::Struct(expected_struct),
+            ) = (
+                &actual.data_type() == RASTER.storage_type(),
+                actual,
+                expected,
+            ) {
+                // Raster-aware comparison; see assert_array_equal.
+                assert_raster_structs_equal(actual_struct, expected_struct);
+            } else {
+                assert_arrow_scalar_equal(actual, expected)
+            }
+        }
         (SedonaType::Wkb(_, _), SedonaType::Wkb(_, _))
         | (SedonaType::WkbView(_, _), SedonaType::WkbView(_, _)) => {
             assert_wkb_scalar_equal(actual, expected, false);
         }
         (_, _) => unreachable!(),
     }
+}
+
+fn assert_raster_structs_equal(actual: &StructArray, expected: &StructArray) {
+    assert_raster_arrays_equal(
+        &RasterStructArray::try_new(actual).unwrap(),
+        &RasterStructArray::try_new(expected).unwrap(),
+    );
 }
 
 fn assert_type_equal(

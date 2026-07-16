@@ -23,10 +23,11 @@
 # replacement check on `_impl.variant_name()` so the structural meaning is
 # still locked.
 
+import pandas as pd
 import pyarrow as pa
 import pytest
 
-from sedonadb.expr import Expr, col
+from sedonadb.expr import Expr, SortExpr, col, sort_expr
 
 
 def test_col_returns_expr():
@@ -124,6 +125,59 @@ def test_expr_init_rejects_wrong_type():
         Expr("not an internal expr")
     with pytest.raises(TypeError, match="InternalExpr"):
         Expr(42)
+
+
+# --- Sort expressions --------------------------------------------------------
+
+
+def test_expr_asc_default_returns_sort_expr():
+    s = col("x").asc()
+    assert isinstance(s, SortExpr)
+    assert repr(s) == "SortExpr(x ASC NULLS LAST)"
+
+
+def test_expr_desc_default_returns_sort_expr():
+    s = col("x").desc()
+    assert isinstance(s, SortExpr)
+    assert repr(s) == "SortExpr(x DESC NULLS LAST)"
+
+
+def test_expr_asc_nulls_first():
+    s = col("x").asc(nulls_first=True)
+    assert repr(s) == "SortExpr(x ASC NULLS FIRST)"
+
+
+def test_expr_desc_nulls_first():
+    s = col("x").desc(nulls_first=True)
+    assert repr(s) == "SortExpr(x DESC NULLS FIRST)"
+
+
+def test_sort_expr_factory_default():
+    s = sort_expr(col("x"))
+    assert isinstance(s, SortExpr)
+    assert repr(s) == "SortExpr(x ASC NULLS LAST)"
+
+
+def test_sort_expr_factory_explicit_options():
+    s = sort_expr(col("x"), asc=False, nulls_first=True)
+    assert repr(s) == "SortExpr(x DESC NULLS FIRST)"
+
+
+def test_sort_expr_factory_rejects_non_expr():
+    with pytest.raises(TypeError, match="Expr"):
+        sort_expr("x")
+
+
+def test_sort_expr_init_rejects_wrong_type():
+    with pytest.raises(TypeError, match="InternalSortExpr"):
+        SortExpr("not a sort expr")
+
+
+def test_sort_expr_over_compound_expression():
+    # `.asc()` / `.desc()` on a composed Expr should propagate the
+    # rendered Display all the way through.
+    s = (col("x") + col("y")).desc()
+    assert repr(s) == "SortExpr(x + y DESC NULLS LAST)"
 
 
 # --- Binary operators --------------------------------------------------------
@@ -228,3 +282,95 @@ def test_bool_raises_for_not():
 def test_len_raises():
     with pytest.raises(TypeError, match="Expr has no length"):
         len(col("x"))
+
+
+def test_expr_funcs(con):
+    e = con.col("foofy").funcs.sqrt()
+    assert isinstance(e, Expr)
+    assert repr(e) == "Expr(sqrt(foofy))"
+
+
+def test_contextless_expr():
+    e = col("foofy")
+
+    with pytest.raises(ValueError, match="Can't pipe Expr"):
+        e.funcs
+
+
+def test_ctx_propagation(con):
+    e = con.col("foofy")
+    assert e._ctx is con
+
+    assert e.alias("bar")._ctx is con
+    assert e.cast(pa.int32())._ctx is con
+    assert e.is_null()._ctx is con
+    assert e.is_not_null()._ctx is con
+    assert e.isin([1, 2])._ctx is con
+    assert e.negate()._ctx is con
+
+    assert (e + 1)._ctx is con
+    assert (e - 1)._ctx is con
+    assert (e * 2)._ctx is con
+    assert (e / 2)._ctx is con
+    assert (-e)._ctx is con
+
+    assert (1 + e)._ctx is con
+    assert (1 - e)._ctx is con
+    assert (2 * e)._ctx is con
+    assert (2 / e)._ctx is con
+
+    assert (e == 0)._ctx is con
+    assert (e != 0)._ctx is con
+    assert (e < 0)._ctx is con
+    assert (e <= 0)._ctx is con
+    assert (e > 0)._ctx is con
+    assert (e >= 0)._ctx is con
+
+    assert (e & e)._ctx is con
+    assert (e | e)._ctx is con
+    assert (~e)._ctx is con
+
+    assert con.col("geom").funcs.st_area()._ctx is con
+    assert ((e + 1) * 2).is_null().alias("check")._ctx is con
+
+    bare_expr = col("y")
+    assert bare_expr._ctx is None
+    assert (e + bare_expr)._ctx is con
+    assert (bare_expr + e)._ctx is con
+
+
+def test_nested_expression_exec(con):
+    table = pa.table(
+        {
+            "array_col": [[1, 2, 3], [4, 5, 6]],
+            "struct_col": [{"a": 1, "b": 2}, {"a": 3, "b": 4}],
+            "map_col": [
+                [{"key": "foofy", "value": "foggy"}],
+                [{"key": "foofy", "value": "groggy"}],
+            ],
+        },
+        schema=pa.schema(
+            {
+                "array_col": pa.list_(pa.int64()),
+                "struct_col": pa.struct(
+                    [pa.field("a", pa.int64()), pa.field("b", pa.int64())]
+                ),
+                "map_col": pa.map_(pa.string(), pa.string()),
+            }
+        ),
+    )
+
+    t = con.create_data_frame(table)
+    pd.testing.assert_frame_equal(
+        t.select(array0=t.array_col[0]).to_pandas(), pd.DataFrame({"array0": [1, 4]})
+    )
+
+    pd.testing.assert_frame_equal(
+        t.select(a=t.struct_col["a"]).to_pandas(), pd.DataFrame({"a": [1, 3]})
+    )
+
+    pd.testing.assert_frame_equal(
+        t.select(foofy=t.map_col["foofy"]).to_pandas(),
+        pd.DataFrame({"foofy": ["foggy", "groggy"]}),
+        check_dtype=False,
+    )

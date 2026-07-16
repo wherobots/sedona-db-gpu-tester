@@ -34,9 +34,13 @@ result_large_err = "allow"
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
+async-trait = { workspace = true }
+datafusion-common = { workspace = true }
 sedona-common = { workspace = true }
 sedona-schema = { workspace = true }
 
 [dev-dependencies]
 sedona-testing = { workspace = true }
 approx = { workspace = true }
+arrow-ipc = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

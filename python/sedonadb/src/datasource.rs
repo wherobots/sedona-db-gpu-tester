@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{collections::HashMap, ffi::CString, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ffi_stream::FFI_ArrowArrayStream, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
@@ -23,14 +23,14 @@ use async_trait::async_trait;
 use datafusion::{physical_expr::conjunction, physical_plan::PhysicalExpr};
 use datafusion_common::{DataFusionError, Result};
 use pyo3::{
-    exceptions::PyNotImplementedError, pyclass, pymethods, types::PyCapsule, Bound, PyObject,
+    exceptions::PyNotImplementedError, pyclass, pymethods, types::PyCapsule, Bound, Py, PyAny,
     Python,
 };
 use sedona_datasource::{
     spec::{ExternalFormatSpec, Object, OpenReaderArgs},
     utility::ProjectedRecordBatchReader,
 };
-use sedona_expr::spatial_filter::SpatialFilter;
+use sedona_expr::spatial_filter::SpatialFilterFactory;
 use sedona_geometry::interval::IntervalTrait;
 
 use crate::{
@@ -43,17 +43,23 @@ use crate::{
 ///
 /// The main purpose of this object is to implement [ExternalFormatSpec] such
 /// that it can be used by SedonaDB/DataFusion internals.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug)]
 pub struct PyExternalFormat {
     extension: String,
-    py_spec: PyObject,
+    /// Cached at construction time. The Python side declares this via
+    /// the `list_single_object` attribute on the spec class (default
+    /// `False`); we snapshot it once to avoid GIL traffic in
+    /// `list_single_object()`, which is called on hot paths.
+    list_single_object: bool,
+    py_spec: Py<PyAny>,
 }
 
 impl Clone for PyExternalFormat {
     fn clone(&self) -> Self {
-        Python::with_gil(|py| Self {
+        Python::attach(|py| Self {
             extension: self.extension.clone(),
+            list_single_object: self.list_single_object,
             py_spec: self.py_spec.clone_ref(py),
         })
     }
@@ -71,8 +77,10 @@ impl PyExternalFormat {
         let new_extension = new_py_spec
             .getattr(py, "extension")?
             .extract::<String>(py)?;
+        let new_list_single_object = read_list_single_object(py, &new_py_spec)?;
         Ok(Self {
             extension: new_extension,
+            list_single_object: new_list_single_object,
             py_spec: new_py_spec,
         })
     }
@@ -141,10 +149,30 @@ impl PyExternalFormat {
 #[pymethods]
 impl PyExternalFormat {
     #[new]
-    fn new<'py>(py: Python<'py>, py_spec: PyObject) -> Result<Self, PySedonaError> {
+    fn new<'py>(py: Python<'py>, py_spec: Py<PyAny>) -> Result<Self, PySedonaError> {
         let extension = py_spec.getattr(py, "extension")?.extract::<String>(py)?;
-        Ok(Self { extension, py_spec })
+        let list_single_object = read_list_single_object(py, &py_spec)?;
+        Ok(Self {
+            extension,
+            list_single_object,
+            py_spec,
+        })
     }
+}
+
+/// Read the `list_single_object` attribute on a Python spec.
+///
+/// Defined on the [`ExternalFormatSpec`] base class (defaults to
+/// `False`), so any spec inheriting from the base carries it. A
+/// duck-typed spec that doesn't inherit will raise `AttributeError`
+/// — that's the intended failure mode.
+fn read_list_single_object<'py>(
+    py: Python<'py>,
+    py_spec: &Py<PyAny>,
+) -> Result<bool, PySedonaError> {
+    Ok(py_spec
+        .getattr(py, "list_single_object")?
+        .extract::<bool>(py)?)
 }
 
 #[async_trait]
@@ -153,17 +181,21 @@ impl ExternalFormatSpec for PyExternalFormat {
         &self.extension
     }
 
+    fn list_single_object(&self) -> bool {
+        self.list_single_object
+    }
+
     fn with_options(
         &self,
         options: &HashMap<String, String>,
     ) -> Result<Arc<dyn ExternalFormatSpec>> {
-        let new_external_format = Python::with_gil(|py| self.with_options_impl(py, options))
+        let new_external_format = Python::attach(|py| self.with_options_impl(py, options))
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Arc::new(new_external_format))
     }
 
     async fn infer_schema(&self, location: &Object) -> Result<Schema> {
-        let schema = Python::with_gil(|py| self.infer_schema_impl(py, location))
+        let schema = Python::attach(|py| self.infer_schema_impl(py, location))
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         Ok(schema)
@@ -173,20 +205,20 @@ impl ExternalFormatSpec for PyExternalFormat {
         &self,
         args: &OpenReaderArgs,
     ) -> Result<Box<dyn RecordBatchReader + Send>> {
-        let reader = Python::with_gil(|py| self.open_reader_impl(py, args))
+        let reader = Python::attach(|py| self.open_reader_impl(py, args))
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         Ok(reader)
     }
 }
 
-/// Wrapper around the [Object] such that the [PyExternalFormatSpec] can pass
+/// Wrapper around the [Object] such that the [PyExternalFormat] can pass
 /// required information into Python method calls
 ///
 /// Currently this only exposes `to_url()`; however, we can and should expose
 /// the ability to read portions of files using the underlying object_store.
 #[pyclass]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PyDataSourceObject {
     pub inner: Object,
 }
@@ -198,10 +230,10 @@ impl PyDataSourceObject {
     }
 }
 
-/// Wrapper around the [OpenReaderArgs] such that the [PyExternalFormatSpec] can pass
+/// Wrapper around the [OpenReaderArgs] such that the [PyExternalFormat] can pass
 /// required information into Python method calls
 #[pyclass]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PyOpenReaderArgs {
     pub inner: OpenReaderArgs,
 }
@@ -267,7 +299,7 @@ impl PyOpenReaderArgs {
     }
 }
 
-/// Wrapper around a PhysicalExpr such that the [PyExternalFormatSpec] can pass
+/// Wrapper around a PhysicalExpr such that the [PyExternalFormat] can pass
 /// required information into Python method calls
 ///
 /// This currently only exposes `bounding_box()`, but in the future could expose
@@ -284,7 +316,8 @@ impl PyFilter {
         &self,
         column_name: &str,
     ) -> Result<Option<(f64, f64, f64, f64)>, PySedonaError> {
-        let filter = SpatialFilter::try_from_expr(&self.inner)?;
+        let factory = SpatialFilterFactory::default();
+        let filter = factory.try_from_expr(&self.inner)?;
         let filter_bbox = filter.filter_bbox(column_name);
         if filter_bbox.x().is_full() || filter_bbox.y().is_full() {
             Ok(None)
@@ -311,7 +344,7 @@ impl PyFilter {
 /// it to be constructed from Python using either a set of indices or a set of names.
 #[pyclass]
 pub struct PyProjectedRecordBatchReader {
-    inner_object: PyObject,
+    inner_object: Py<PyAny>,
     projection_indices: Option<Vec<usize>>,
     projection_names: Option<Vec<String>>,
 }
@@ -320,7 +353,7 @@ pub struct PyProjectedRecordBatchReader {
 impl PyProjectedRecordBatchReader {
     #[new]
     fn new(
-        inner_object: PyObject,
+        inner_object: Py<PyAny>,
         projection_indices: Option<Vec<usize>>,
         projection_names: Option<Vec<String>>,
     ) -> Self {
@@ -352,8 +385,11 @@ impl PyProjectedRecordBatchReader {
         };
 
         let ffi_stream = FFI_ArrowArrayStream::new(Box::new(reader));
-        let stream_capsule_name = CString::new("arrow_array_stream").unwrap();
-        Ok(PyCapsule::new(py, ffi_stream, Some(stream_capsule_name))?)
+        Ok(PyCapsule::new_with_value(
+            py,
+            ffi_stream,
+            c"arrow_array_stream",
+        )?)
     }
 }
 
@@ -365,7 +401,7 @@ impl PyProjectedRecordBatchReader {
 /// an ADBC statement/cursor).
 struct WrappedRecordBatchReader {
     pub inner: Box<dyn RecordBatchReader + Send>,
-    pub shelter: Option<PyObject>,
+    pub shelter: Option<Py<PyAny>>,
 }
 
 impl RecordBatchReader for WrappedRecordBatchReader {

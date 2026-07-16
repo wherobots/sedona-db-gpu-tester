@@ -16,7 +16,7 @@
 // under the License.
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 use crate::exec::create_plan_from_sql;
@@ -27,6 +27,7 @@ use crate::{
     show::{show_batches, DisplayTableOptions},
 };
 use arrow_array::RecordBatch;
+use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::datasource::file_format::format_as_file_type;
 use datafusion::{
@@ -37,23 +38,23 @@ use datafusion::{
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
         SessionStateBuilder,
     },
-    prelude::{DataFrame, SessionConfig, SessionContext},
+    prelude::{CsvReadOptions, DataFrame, NdJsonReadOptions, SessionConfig, SessionContext},
     sql::parser::{DFParser, Statement},
 };
 use datafusion::{dataframe::DataFrameWriteOptions, execution::memory_pool::MemoryLimit};
 use datafusion_common::not_impl_err;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::sqlparser::dialect::{dialect_from_str, Dialect};
-use datafusion_expr::{LogicalPlan, LogicalPlanBuilder, SortExpr};
+use datafusion_expr::{AggregateUDFImpl, LogicalPlan, LogicalPlanBuilder, ScalarUDFImpl, SortExpr};
 use parking_lot::Mutex;
-use sedona_common::{
-    option::add_sedona_option_extension, sedona_internal_datafusion_err, CrsProviderOption,
-    SedonaOptions,
-};
-use sedona_datasource::provider::external_listing_table;
+use sedona_common::{sedona_internal_datafusion_err, SedonaOptions};
+use sedona_datasource::provider::external_table;
 use sedona_datasource::spec::ExternalFormatSpec;
-use sedona_expr::scalar_udf::IntoScalarKernelRefs;
-use sedona_expr::{aggregate_udf::IntoSedonaAccumulatorRefs, function_set::FunctionSet};
+use sedona_expr::scalar_udf::{IntoScalarKernelRefs, SedonaScalarUDF};
+use sedona_expr::{
+    aggregate_udf::{IntoSedonaAccumulatorRefs, SedonaAggregateUDF},
+    function_set::FunctionSet,
+};
 use sedona_geoparquet::options::TableGeoParquetOptions;
 use sedona_geoparquet::{
     format::GeoParquetFormatFactory,
@@ -64,12 +65,15 @@ use sedona_pointcloud::las::{
     format::{Extension, LasFormatFactory},
     options::{GeometryEncoding, LasExtraBytes, LasOptions},
 };
+use sedona_raster_functions::rs_ensure_loaded::RsEnsureLoaded;
 #[cfg(feature = "gpu")]
 use sedona_spatial_join_gpu::options::GpuOptions;
 
 use sedona_query_planner::{
-    optimizer::register_spatial_join_logical_optimizer, query_planner::SedonaQueryPlanner,
+    optimizer::{register_ensure_loaded_optimizer, register_spatial_join_logical_optimizer},
+    query_planner::SedonaQueryPlanner,
 };
+use sedona_raster::raster_loader::{AsyncRasterLoader, RasterLoaderConfig, RasterLoaderRegistry};
 
 /// Sedona SessionContext wrapper
 ///
@@ -79,7 +83,13 @@ use sedona_query_planner::{
 /// interface for configuring the behaviour of
 pub struct SedonaContext {
     pub ctx: SessionContext,
-    pub functions: FunctionSet,
+    functions: RwLock<FunctionSet>,
+    /// Per-session registry of async raster byte loaders, keyed by
+    /// `outdb_format`. Held behind an `Arc<RwLock<…>>` so the registered
+    /// `RS_EnsureLoaded` UDF instance and any extension crates' `register(&ctx)`
+    /// entry points observe the same map. See
+    /// [`SedonaContext::register_raster_loader`].
+    raster_loader_registry: Arc<RwLock<RasterLoaderRegistry>>,
 }
 
 impl SedonaContext {
@@ -109,18 +119,19 @@ impl SedonaContext {
         // and perhaps for all of these initializing them optionally from environment
         // variables.
         let session_config = SessionConfig::from_env()?.with_information_schema(true);
-        let mut session_config = add_sedona_option_extension(session_config);
+        let mut session_config = session_config.with_option_extension(SedonaOptions::default());
         let target_partitions = session_config.target_partitions();
 
-        // Always register the PROJ CrsProvider by default (if PROJ is not configured
+        // Always register the PROJ LazyProjEngine by default (if PROJ is not configured
         // before it is used an error will be raised).
         let opts = session_config
             .options_mut()
             .extensions
             .get_mut::<SedonaOptions>()
             .ok_or_else(|| sedona_internal_datafusion_err!("SedonaOptions not available"))?;
-        opts.crs_provider =
-            CrsProviderOption::new(Arc::new(sedona_proj::provider::ProjCrsProvider::default()));
+        opts.runtime = opts
+            .runtime
+            .with_crs_engine(Arc::new(sedona_proj::transform::LazyProjEngine));
 
         // Set the spilled batch in-memory size threshold to 5% of the per-partition memory limit,
         // with a minimum of 10MB. Batches larger than this threshold will be broken into smaller batches
@@ -135,23 +146,8 @@ impl SedonaContext {
                 .max(MIN_SPILLED_BATCH_IN_MEMORY_THRESHOLD_BYTES);
         }
 
-        #[cfg(feature = "pointcloud")]
-        let session_config = session_config.with_option_extension(
-            LasOptions::default()
-                .with_geometry_encoding(GeometryEncoding::Wkb)
-                .with_las_extra_bytes(LasExtraBytes::Typed),
-        );
-
-        #[cfg(feature = "gpu")]
-        let session_config = session_config.with_option_extension(GpuOptions::default());
-
-        #[allow(unused_mut)]
-        let mut state_builder = SessionStateBuilder::new()
-            .with_default_features()
-            .with_runtime_env(runtime_env)
-            .with_config(session_config);
-
         // Register the spatial join planner extension
+        #[allow(unused_mut)]
         let mut planner = SedonaQueryPlanner::new();
         #[cfg(feature = "spatial-join")]
         {
@@ -184,21 +180,51 @@ impl SedonaContext {
             }
         }
 
-        state_builder = register_spatial_join_logical_optimizer(state_builder)?;
-        state_builder = state_builder.with_query_planner(Arc::new(planner));
+        // Register the geography bounder for spherical edge types. This enables geography
+        // statistics in Parquet files and geography row-group pruning.
+        #[cfg(feature = "s2geography")]
+        {
+            opts.runtime = opts.runtime.with_bounder(
+                sedona_geometry::types::Edges::Spherical,
+                Arc::new(sedona_s2geography::rect_bounder::WkbGeographyBounder::default()),
+            )?;
+        }
 
-        let mut state = state_builder.build();
-
-        // Register GeoParquet and try to initialize our statistics accumulator. It is OK if this fails
-        // because we already registered it, but we propagate other errors for safety.
-        state.register_file_format(Arc::new(GeoParquetFormatFactory::new()), true)?;
+        // Inject the statically-set accumulator factory, which allows arrow-rs Parquet writer
+        // to write Geography statistics based on the geography bounders in our SedonaRuntime.
         let init_result =
-            sedona_geoparquet::statistics_accumulator::SedonaGeoStatsAccumulatorFactory::try_init();
+            sedona_geoparquet::statistics_accumulator::SedonaGeoStatsAccumulatorFactory::try_init(
+                &opts.runtime,
+            );
         if let Err(init_err) = init_result {
             if !matches!(init_err, DataFusionError::ParquetError(_)) {
                 return Err(init_err);
             }
         }
+
+        #[cfg(feature = "pointcloud")]
+        let session_config = session_config.with_option_extension(
+            LasOptions::default()
+                .with_geometry_encoding(GeometryEncoding::Wkb)
+                .with_las_extra_bytes(LasExtraBytes::Typed),
+        );
+
+        #[cfg(feature = "gpu")]
+        let session_config = session_config.with_option_extension(GpuOptions::default());
+
+        let mut state_builder = SessionStateBuilder::new()
+            .with_default_features()
+            .with_runtime_env(runtime_env)
+            .with_config(session_config);
+
+        state_builder = register_spatial_join_logical_optimizer(state_builder)?;
+        state_builder = register_ensure_loaded_optimizer(state_builder)?;
+        state_builder = state_builder.with_query_planner(Arc::new(planner));
+
+        let mut state = state_builder.build();
+
+        // Register GeoParquet file format
+        state.register_file_format(Arc::new(GeoParquetFormatFactory::new()), true)?;
 
         #[cfg(feature = "pointcloud")]
         {
@@ -223,14 +249,61 @@ impl SedonaContext {
     pub fn new_from_context(ctx: SessionContext) -> Result<Self> {
         let mut out = Self {
             ctx,
-            functions: FunctionSet::new(),
+            functions: RwLock::new(FunctionSet::new()),
+            raster_loader_registry: Arc::new(RwLock::new(RasterLoaderRegistry::new())),
         };
+
+        // Stash a clone of the shared registry handle inside
+        // `ConfigOptions` via the `RasterLoaderConfig` extension. The
+        // RS_EnsureLoaded async UDF reads from there at dispatch time —
+        // `AsyncScalarUDFImpl::invoke_async_with_args` only receives
+        // `Arc<ConfigOptions>`, so this is the path that keeps the
+        // registry reachable at the UDF's invocation site. Mirrors how
+        // `SedonaRuntime` works inside `SedonaOptions`.
+        //
+        // Writes through `SedonaContext::register_raster_loader` (which
+        // mutates the Arc held in `out.raster_loader_registry`) are immediately
+        // visible to UDF reads through this config extension because
+        // both handles share the same `RwLock`.
+        out.ctx
+            .state_ref()
+            .write()
+            .config_mut()
+            .options_mut()
+            .extensions
+            .insert(RasterLoaderConfig::from_handle(Arc::clone(
+                &out.raster_loader_registry,
+            )));
+
+        // Register the RS_EnsureLoaded async UDF. It pulls the registry
+        // out of `args.config_options` at dispatch time, so it doesn't
+        // need to close over the Arc itself — the UDF instance is
+        // session-agnostic. The logical optimizer rule registered above
+        // (`register_ensure_loaded_optimizer`) resolves this UDF from the
+        // function registry at rewrite time, so it must be registered
+        // before any query is planned.
+        {
+            use datafusion_expr::async_udf::AsyncScalarUDF;
+            let udf = AsyncScalarUDF::new(Arc::new(RsEnsureLoaded::new()));
+            out.ctx.register_udf(udf.into_scalar_udf());
+        };
+
+        // Register the GDAL raster byte loader. `sedona-raster-gdal` is a
+        // mandatory dep on `sedona`, but libgdal itself is dlopen'd
+        // lazily by `sedona-gdal` (workspace-default-features = false),
+        // so this registration is safe on systems without libgdal —
+        // the loader's `load()` call will surface a clean "libgdal not
+        // found" error when first invoked, but registration and import
+        // succeed regardless.
+        out.register_raster_loader(Arc::new(sedona_raster_gdal::GdalLoader::new()));
 
         // Register table functions
         out.ctx.register_udtf(
             "sd_random_geometry",
             Arc::new(RandomGeometryFunction::default()),
         );
+
+        out.register_function_set(sedona_raster_gdal::register::default_function_set());
 
         // Always register default function set
         out.register_function_set(sedona_functions::register::default_function_set());
@@ -279,18 +352,96 @@ impl SedonaContext {
             sd_order_lnglat::OrderLngLat::new(sedona_s2geography::utils::s2_cell_id_from_lnglat);
         self.register_scalar_kernels([("sd_order", sd_order_kernel)].into_iter())?;
 
+        self.register_aggregate_kernels(
+            sedona_s2geography::register::aggregate_kernels().into_iter(),
+        )?;
+
+        Ok(())
+    }
+
+    /// Register an async raster byte loader under a `format` key.
+    ///
+    /// Each loader declares the band `outdb_format` values it handles via
+    /// `AsyncRasterLoader::supports_format`. At query time the
+    /// `RS_EnsureLoaded` UDF matches each OutDb band's format against the
+    /// registered loaders (most-recently-registered first) and dispatches
+    /// the byte fetch through the first that accepts it.
+    ///
+    /// Used by both compiled-in backends (`sedona-raster-gdal`, the catch-all,
+    /// registered first at bootstrap) and out-of-tree extensions
+    /// (`sedona-raster-zarr::register(&ctx)` from user code after
+    /// construction). Loaders registered later win for the formats they
+    /// claim, so registration order matters: the catch-all goes first.
+    pub fn register_raster_loader(&self, loader: Arc<dyn AsyncRasterLoader>) {
+        // Lock poisoning here would mean a previous registrant panicked
+        // mid-write — recover-by-ignoring matches how DataFusion handles
+        // session-state writes elsewhere.
+        if let Ok(mut guard) = self.raster_loader_registry.write() {
+            guard.register(loader);
+        }
+    }
+
+    fn functions(&self) -> Result<RwLockReadGuard<'_, FunctionSet>> {
+        self.functions
+            .read()
+            .map_err(|_| sedona_internal_datafusion_err!("Function registry lock poisoned"))
+    }
+
+    fn functions_mut(&self) -> Result<RwLockWriteGuard<'_, FunctionSet>> {
+        self.functions
+            .write()
+            .map_err(|_| sedona_internal_datafusion_err!("Function registry lock poisoned"))
+    }
+
+    pub fn scalar_udf(&self, name: &str) -> Result<Option<SedonaScalarUDF>> {
+        Ok(self.functions()?.scalar_udf(name).cloned())
+    }
+
+    pub fn scalar_udf_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .ctx
+            .state()
+            .scalar_functions()
+            .keys()
+            .cloned()
+            .collect())
+    }
+
+    pub fn register_sedona_scalar_udf(&self, udf: SedonaScalarUDF) -> Result<()> {
+        let name = udf.name().to_string();
+        let mut functions = self.functions_mut()?;
+        functions.insert_scalar_udf(udf);
+        let udf = functions.scalar_udf(&name).unwrap().clone();
+        drop(functions);
+
+        self.ctx.register_udf(udf.into());
+        Ok(())
+    }
+
+    pub fn register_sedona_aggregate_udf(&self, udf: SedonaAggregateUDF) -> Result<()> {
+        let name = udf.name().to_string();
+        let mut functions = self.functions_mut()?;
+        functions.insert_aggregate_udf(udf);
+        let udf = functions.aggregate_udf(&name).unwrap().clone();
+        drop(functions);
+
+        self.ctx.register_udaf(udf.into());
         Ok(())
     }
 
     /// Register all functions in a [FunctionSet] with this context
     pub fn register_function_set(&mut self, function_set: FunctionSet) {
+        let mut functions = self
+            .functions
+            .write()
+            .expect("fresh SedonaContext function registry lock should not be poisoned");
         for udf in function_set.scalar_udfs() {
-            self.functions.insert_scalar_udf(udf.clone());
+            functions.insert_scalar_udf(udf.clone());
             self.ctx.register_udf(udf.clone().into());
         }
 
         for udf in function_set.aggregate_udfs() {
-            self.functions.insert_aggregate_udf(udf.clone());
+            functions.insert_aggregate_udf(udf.clone());
             self.ctx.register_udaf(udf.clone().into());
         }
     }
@@ -300,8 +451,9 @@ impl SedonaContext {
         &mut self,
         kernels: impl Iterator<Item = (&'a str, impl IntoScalarKernelRefs)>,
     ) -> Result<()> {
+        let mut functions = self.functions_mut()?;
         for (name, kernel) in kernels {
-            let udf = self.functions.add_scalar_udf_impl(name, kernel)?;
+            let udf = functions.add_scalar_udf_impl(name, kernel)?;
             self.ctx.register_udf(udf.clone().into());
         }
 
@@ -312,8 +464,9 @@ impl SedonaContext {
         &mut self,
         kernels: impl Iterator<Item = (&'a str, impl IntoSedonaAccumulatorRefs)>,
     ) -> Result<()> {
+        let mut functions = self.functions_mut()?;
         for (name, kernel) in kernels {
-            let udf = self.functions.add_aggregate_udf_kernel(name, kernel)?;
+            let udf = functions.add_aggregate_udf_kernel(name, kernel)?;
             self.ctx.register_udaf(udf.clone().into());
         }
 
@@ -383,12 +536,18 @@ impl SedonaContext {
     }
 
     /// Creates a [`DataFrame`] for reading a [ExternalFormatSpec]
+    ///
+    /// The `partitioning` parameter controls hive-style partition discovery:
+    /// - `None`: auto-discover partition columns from directory structure
+    /// - `Some(vec![])`: disable partition discovery
+    /// - `Some(vec![...])`: use explicit partition columns
     pub async fn read_external_format<P: DataFilePaths>(
         &self,
         spec: Arc<dyn ExternalFormatSpec>,
         table_paths: P,
         options: Option<&HashMap<String, String>>,
         check_extension: bool,
+        partitioning: Option<Vec<(String, DataType)>>,
     ) -> Result<DataFrame> {
         let urls = table_paths.to_urls()?;
 
@@ -411,12 +570,69 @@ impl SedonaContext {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect::<HashMap<String, String>>();
             let spec = spec.with_options(&options_without_filesystems)?;
-            external_listing_table(spec, &self.ctx, urls, check_extension).await?
+            external_table(spec, &self.ctx, urls, check_extension, partitioning).await?
         } else {
-            external_listing_table(spec, &self.ctx, urls, check_extension).await?
+            external_table(spec, &self.ctx, urls, check_extension, partitioning).await?
         };
 
-        self.ctx.read_table(Arc::new(provider))
+        self.ctx.read_table(provider)
+    }
+
+    /// Creates a [`DataFrame`] for reading CSV file(s).
+    ///
+    /// `options` carries object-store / cloud credentials (e.g. `aws.*`,
+    /// `gcs.*`) used to register the object store before reading, matching
+    /// [`Self::read_parquet`]. `delimiter` must be a single byte.
+    pub async fn read_csv(
+        &self,
+        table_paths: Vec<String>,
+        options: &HashMap<String, String>,
+        has_header: bool,
+        delimiter: &str,
+    ) -> Result<DataFrame> {
+        let bytes = delimiter.as_bytes();
+        if bytes.len() != 1 {
+            return plan_err!("CSV delimiter must be a single byte, got {delimiter:?}");
+        }
+
+        let urls = table_paths.clone().to_urls()?;
+        if !urls.is_empty() {
+            ensure_object_store_registered_with_options(
+                &mut self.ctx.state(),
+                urls[0].as_str(),
+                Some(options),
+            )
+            .await?;
+        }
+
+        let csv_options = CsvReadOptions::new()
+            .has_header(has_header)
+            .delimiter(bytes[0]);
+        self.ctx.read_csv(table_paths, csv_options).await
+    }
+
+    /// Creates a [`DataFrame`] for reading newline-delimited JSON file(s).
+    ///
+    /// `options` carries object-store / cloud credentials used to register
+    /// the object store before reading, matching [`Self::read_parquet`].
+    pub async fn read_json(
+        &self,
+        table_paths: Vec<String>,
+        options: &HashMap<String, String>,
+    ) -> Result<DataFrame> {
+        let urls = table_paths.clone().to_urls()?;
+        if !urls.is_empty() {
+            ensure_object_store_registered_with_options(
+                &mut self.ctx.state(),
+                urls[0].as_str(),
+                Some(options),
+            )
+            .await?;
+        }
+
+        self.ctx
+            .read_json(table_paths, NdJsonReadOptions::default())
+            .await
     }
 }
 
@@ -634,15 +850,82 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::assert_batches_eq;
     use sedona_datasource::spec::{Object, OpenReaderArgs};
+    use sedona_geometry::types::Edges;
     use sedona_schema::{
         crs::{deserialize_crs, lnglat},
-        datatypes::{Edges, SedonaType},
+        datatypes::SedonaType,
         schema::SedonaSchema,
     };
     use sedona_testing::data::test_geoparquet;
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn outdb_registry_has_gdal_at_bootstrap_and_accepts_runtime_registration() {
+        use arrow_buffer::Buffer;
+        use sedona_raster::raster_loader::{
+            AsyncRasterLoader, RasterLoadRequest, RasterLoadResult,
+        };
+
+        let ctx = SedonaContext::new();
+        // GDAL is the catch-all backend, registered at bootstrap: it resolves
+        // any format, including the unset `None` that RS_FromPath emits.
+        // Extension backends like Zarr add themselves later via
+        // `register_raster_loader`.
+        {
+            let reg = ctx.raster_loader_registry.read().unwrap();
+            let loader = reg
+                .get(None)
+                .expect("fresh SedonaContext should register the GDAL backend at bootstrap");
+            assert_eq!(loader.name(), "gdal");
+        }
+
+        // Mock runtime registration on top of the bootstrap state.
+        #[derive(Debug)]
+        struct MockLoader;
+        #[async_trait]
+        impl AsyncRasterLoader for MockLoader {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            fn supports_format(&self, format: Option<&str>) -> bool {
+                format == Some("mock")
+            }
+            async fn load(
+                &self,
+                reqs: &[&RasterLoadRequest],
+            ) -> std::result::Result<Vec<RasterLoadResult>, arrow_schema::ArrowError> {
+                Ok(reqs
+                    .iter()
+                    .map(|req| {
+                        RasterLoadResult::unresolved(Buffer::from_vec(Vec::<u8>::new()), req)
+                    })
+                    .collect())
+            }
+        }
+        ctx.register_raster_loader(Arc::new(MockLoader));
+        {
+            let reg = ctx.raster_loader_registry.read().unwrap();
+            // The mock wins for its own format (most-recently-registered)...
+            assert_eq!(reg.get(Some("mock")).unwrap().name(), "mock");
+            // ...while everything else, including the unset `None`, still
+            // falls through to the GDAL catch-all.
+            assert_eq!(reg.get(None).unwrap().name(), "gdal");
+        }
+
+        // RS_EnsureLoaded is registered as a UDF at session bootstrap.
+        let udf = ctx
+            .ctx
+            .state()
+            .scalar_functions()
+            .get("rs_ensureloaded")
+            .cloned();
+        assert!(
+            udf.is_some(),
+            "RS_EnsureLoaded should be registered by SedonaContext::new()"
+        );
+    }
 
     #[tokio::test]
     async fn basic_sql() -> Result<()> {
@@ -660,6 +943,113 @@ mod tests {
                 "+--------------+",
                 "| POINT(30 10) |",
                 "+--------------+",
+            ],
+            &batches
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nested_expressions_sql() -> Result<()> {
+        let ctx = SedonaContext::new();
+
+        // Test get_field on a struct
+        let batches = ctx
+            .sql("SELECT get_field(named_struct('a', 1, 'b', 2), 'a') AS a")
+            .await?
+            .collect()
+            .await?;
+        #[rustfmt::skip]
+        assert_batches_eq!(
+            [
+                "+---+",
+                "| a |",
+                "+---+",
+                "| 1 |",
+                "+---+",
+            ],
+            &batches
+        );
+
+        // Test map_extract on a map
+        let batches = ctx
+            .sql("SELECT map_extract(map {'x': 10, 'y': 20}, 'x') AS x")
+            .await?
+            .collect()
+            .await?;
+        #[rustfmt::skip]
+        assert_batches_eq!(
+            [
+                "+------+",
+                "| x    |",
+                "+------+",
+                "| [10] |",
+                "+------+",
+            ],
+            &batches
+        );
+
+        // Test map bracket notation shorthand (returns scalar, not array)
+        let batches = ctx
+            .sql("SELECT map {'x': 10, 'y': 20}['x'] AS x")
+            .await?
+            .collect()
+            .await?;
+        #[rustfmt::skip]
+        assert_batches_eq!(
+            [
+                "+----+",
+                "| x  |",
+                "+----+",
+                "| 10 |",
+                "+----+",
+            ],
+            &batches
+        );
+
+        // Test struct dot notation and map bracket notation on table columns
+        ctx.sql(
+            "CREATE TABLE nested_test AS SELECT \
+             named_struct('a', 1, 'b', 2) AS s, \
+             map {'x': 10, 'y': 20} AS m",
+        )
+        .await?
+        .collect()
+        .await?;
+
+        // Struct field access via dot notation on column
+        let batches = ctx
+            .sql("SELECT s.a FROM nested_test")
+            .await?
+            .collect()
+            .await?;
+        #[rustfmt::skip]
+        assert_batches_eq!(
+            [
+                "+------------------+",
+                "| nested_test.s[a] |",
+                "+------------------+",
+                "| 1                |",
+                "+------------------+",
+            ],
+            &batches
+        );
+
+        // Map key access via bracket notation on column
+        let batches = ctx
+            .sql("SELECT m['x'] FROM nested_test")
+            .await?
+            .collect()
+            .await?;
+        #[rustfmt::skip]
+        assert_batches_eq!(
+            [
+                "+------------------+",
+                "| nested_test.m[x] |",
+                "+------------------+",
+                "| 10               |",
+                "+------------------+",
             ],
             &batches
         );
@@ -819,7 +1209,7 @@ mod tests {
 
         // Ensure read_external_format() works
         let df = ctx
-            .read_external_format(spec.clone(), file_that_exists.clone(), None, false)
+            .read_external_format(spec.clone(), file_that_exists.clone(), None, false, None)
             .await
             .unwrap();
         let batches = df.collect().await.unwrap();
@@ -845,6 +1235,7 @@ mod tests {
             file_that_exists.clone(),
             Some(&kv_options),
             false,
+            None,
         )
         .await
         .expect_err("should error for unsupported key/value options");
@@ -858,6 +1249,7 @@ mod tests {
             file_that_exists.clone(),
             Some(&kv_options),
             false,
+            None,
         )
         .await
         .expect("should succeed because aws and gcs options were stripped");
@@ -934,5 +1326,158 @@ mod tests {
             .get::<SedonaOptions>()
             .expect("SedonaOptions not found");
         assert_eq!(opts.spatial_join.spilled_batch_in_memory_size_threshold, 0);
+    }
+
+    /// Test geography literal bounding via the WkbBounder2DFactory → SpatialFilterFactory path.
+    ///
+    /// This covers antimeridian wraparound, distance expansion (~100km), and NULL handling.
+    #[cfg(feature = "s2geography")]
+    #[tokio::test]
+    async fn test_geography_literal_bounder() {
+        use datafusion::physical_expr::expressions::Literal as PhysicalLiteral;
+        use sedona_common::option::SedonaOptions;
+        use sedona_expr::spatial_filter::SpatialFilterFactory;
+        use sedona_geometry::interval::IntervalTrait;
+        use sedona_schema::datatypes::{WKB_GEOGRAPHY, WKB_VIEW_GEOGRAPHY};
+        use sedona_testing::create::create_scalar;
+
+        let ctx = SedonaContext::new_local_interactive().await.unwrap();
+
+        // Derive the factory from the context's SedonaOptions (which has the geography
+        // bounder registered during context creation when s2geography feature is enabled)
+        let state = ctx.ctx.state();
+        let sedona_options = state
+            .config_options()
+            .extensions
+            .get::<SedonaOptions>()
+            .expect("SedonaOptions should be registered");
+        let factory = SpatialFilterFactory::default()
+            .with_bounder_factory(sedona_options.runtime.bounder_factory().clone());
+
+        for sedona_type in [WKB_GEOGRAPHY, WKB_VIEW_GEOGRAPHY] {
+            let storage_field = sedona_type.to_storage_field("", true).unwrap();
+
+            // Test antimeridian wraparound bounds
+            let scalar = create_scalar(Some("MULTIPOINT ((-179 42), (179 43))"), &sedona_type);
+            let literal =
+                PhysicalLiteral::new_with_metadata(scalar, Some(storage_field.metadata().into()));
+            let raw_bounds = factory.literal_bounds(&literal, None).unwrap();
+
+            // Should produce a wraparound interval crossing the antimeridian
+            assert!(
+                raw_bounds.x().is_wraparound(),
+                "Expected wraparound x interval for antimeridian-crossing input"
+            );
+            // Check x bounds are reasonable (near ±179)
+            assert!(
+                raw_bounds.x().lo() > 178.99999 && raw_bounds.x().lo() <= 179.0,
+                "x.lo() {} should be near 179",
+                raw_bounds.x().lo()
+            );
+            assert!(
+                raw_bounds.x().hi() >= -179.0 && raw_bounds.x().hi() < -178.99999,
+                "x.hi() {} should be near -179",
+                raw_bounds.x().hi()
+            );
+            // Check y bounds
+            assert!(
+                raw_bounds.y().lo() > 41.0 && raw_bounds.y().lo() <= 42.0,
+                "y.lo() {} should be near 42",
+                raw_bounds.y().lo()
+            );
+            assert!(
+                raw_bounds.y().hi() >= 43.0 && raw_bounds.y().hi() < 44.0,
+                "y.hi() {} should be near 43",
+                raw_bounds.y().hi()
+            );
+
+            // Test distance expansion (~100km ≈ 0.9 degrees)
+            let expanded_bounds = factory.literal_bounds(&literal, Some(100_000.0)).unwrap();
+            assert!(
+                expanded_bounds.x().is_wraparound(),
+                "Expanded bounds should still be wraparound"
+            );
+            // Expanded bounds should be larger than raw bounds
+            assert!(
+                raw_bounds.x().lo() - expanded_bounds.x().lo() > 0.5,
+                "Expanded x.lo() should be > 0.5 degrees larger"
+            );
+            assert!(
+                expanded_bounds.x().hi() - raw_bounds.x().hi() > 0.5,
+                "Expanded x.hi() should be > 0.5 degrees larger"
+            );
+            assert!(
+                raw_bounds.y().lo() - expanded_bounds.y().lo() > 0.5,
+                "Expanded y.lo() should be > 0.5 degrees larger"
+            );
+            assert!(
+                expanded_bounds.y().hi() - raw_bounds.y().hi() > 0.5,
+                "Expanded y.hi() should be > 0.5 degrees larger"
+            );
+
+            // Test NULL literal → empty bounds
+            let null_scalar = create_scalar(None, &sedona_type);
+            let null_literal = PhysicalLiteral::new_with_metadata(
+                null_scalar,
+                Some(storage_field.metadata().into()),
+            );
+            let null_bounds = factory.literal_bounds(&null_literal, None).unwrap();
+            assert!(
+                null_bounds.is_empty(),
+                "NULL literal should produce empty bounds"
+            );
+        }
+    }
+
+    /// Test that LazyProjEngine is properly wired up through the global PROJ engine.
+    ///
+    /// This covers the three CrsEngine methods: to_projjson, get_transform_crs_to_crs,
+    /// and get_transform_pipeline.
+    #[cfg(feature = "proj")]
+    #[tokio::test]
+    async fn test_lazy_proj_engine() {
+        use sedona_common::option::SedonaOptions;
+
+        let ctx = SedonaContext::new_local_interactive().await.unwrap();
+
+        // Derive the CrsEngine from the context's SedonaOptions
+        let state = ctx.ctx.state();
+        let sedona_options = state
+            .config_options()
+            .extensions
+            .get::<SedonaOptions>()
+            .expect("SedonaOptions should be registered");
+        let engine = sedona_options.runtime.crs_engine();
+
+        // Test to_projjson: convert EPSG:4326 to PROJJSON
+        let projjson = engine.to_projjson("EPSG:4326").unwrap();
+        assert!(
+            projjson.contains("WGS 84") || projjson.contains("\"id\""),
+            "PROJJSON should contain WGS 84 or id field: {}",
+            projjson
+        );
+
+        // Test get_transform_crs_to_crs: WGS84 to Web Mercator
+        let transform = engine
+            .get_transform_crs_to_crs("EPSG:4326", "EPSG:3857", None, "")
+            .unwrap();
+        let mut coord = (0.0, 0.0); // (lng, lat) = (0, 0)
+        transform.transform_coord(&mut coord).unwrap();
+        // (0, 0) in WGS84 should transform to (0, 0) in Web Mercator
+        assert!(
+            coord.0.abs() < 1.0 && coord.1.abs() < 1.0,
+            "Origin should map to near-origin in Web Mercator: {:?}",
+            coord
+        );
+
+        // Test get_transform_pipeline: a simple pipeline that does nothing
+        let pipeline_transform = engine.get_transform_pipeline("+proj=noop", "").unwrap();
+        let mut coord2 = (10.0, 20.0);
+        pipeline_transform.transform_coord(&mut coord2).unwrap();
+        assert!(
+            (coord2.0 - 10.0).abs() < 1e-10 && (coord2.1 - 20.0).abs() < 1e-10,
+            "noop pipeline should preserve coordinates: {:?}",
+            coord2
+        );
     }
 }

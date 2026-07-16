@@ -43,11 +43,12 @@ use parquet::{
     geospatial::statistics::GeospatialStatistics,
 };
 use sedona_expr::{
-    spatial_filter::{SpatialFilter, TableGeoStatistics},
+    spatial_filter::{SpatialFilter, SpatialFilterFactory, TableGeoStatistics},
     statistics::GeoStatistics,
 };
 use sedona_geometry::{
     bounding_box::BoundingBox,
+    bounds::WkbBounder2DFactory,
     interval::{Interval, IntervalTrait},
     types::{GeometryTypeAndDimensions, GeometryTypeAndDimensionsSet},
 };
@@ -113,6 +114,11 @@ pub(crate) struct GeoParquetFileOpener {
     pub metrics: GeoParquetFileOpenerMetrics,
     pub options: TableGeoParquetOptions,
     pub metadata_cache: Option<Arc<dyn FileMetadataCache>>,
+    /// Factory for creating bounders used for spatial pruning
+    ///
+    /// Enables spatial pruning for both GEOMETRY and GEOGRAPHY columns.
+    /// This is typically obtained from `SedonaOptions::runtime.bounder_factory()`.
+    pub bounder_factory: WkbBounder2DFactory,
 }
 
 impl FileOpener for GeoParquetFileOpener {
@@ -136,7 +142,10 @@ impl FileOpener for GeoParquetFileOpener {
 
             if self_clone.enable_pruning {
                 if let Some(predicate) = self_clone.predicate.as_ref() {
-                    let spatial_filter = SpatialFilter::try_from_expr(predicate)?;
+                    let factory = SpatialFilterFactory::default()
+                        .with_bounder_factory(self_clone.bounder_factory.clone());
+
+                    let spatial_filter = factory.try_from_expr(predicate)?;
 
                     if let Some(geoparquet_metadata) = maybe_geoparquet_metadata.as_ref() {
                         filter_access_plan_using_geoparquet_file_metadata(

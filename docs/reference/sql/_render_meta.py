@@ -113,6 +113,8 @@ def deduplicate_common_arg_combinations(expanded_args):
         all_names[:2] = ["geomA", "geomB"]
     elif all_names[:2] == ["geog", "geog"]:
         all_names[:2] = ["geogA", "geogB"]
+    elif all_names[:2] == ["rast", "rast"]:
+        all_names[:2] = ["rastA", "rastB"]
 
     return [
         {
@@ -187,6 +189,8 @@ def to_str(v):
             return " "
         elif v["t"] == "Para":
             return "".join(to_str(item) for item in v["c"])
+        elif v["t"] == "RawInline":
+            return v["c"][1]
         if v["t"] == "Quoted":
             quote_type = v["c"][0]["t"]
             if quote_type == "SingleQuote":

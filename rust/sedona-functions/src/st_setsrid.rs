@@ -17,17 +17,17 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::{
-    builder::{BinaryBuilder, NullBufferBuilder},
-    new_null_array, ArrayRef, StringViewArray,
+    builder::{BinaryBuilder, NullBufferBuilder, StringViewBuilder},
+    new_null_array, Array, ArrayRef, StringViewArray,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
-use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
     cast::{as_int64_array, as_string_view_array},
     error::Result,
-    DataFusionError, ScalarValue,
+    exec_err, DataFusionError, ScalarValue,
 };
+use datafusion_common::{config::ConfigOptions, plan_err};
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_common::sedona_internal_err;
 use sedona_expr::{
@@ -38,8 +38,9 @@ use sedona_expr::{
     scalar_udf::{ScalarKernelRef, SedonaScalarKernel, SedonaScalarUDF},
 };
 use sedona_geometry::transform::CrsEngine;
+use sedona_geometry::types::Edges;
 use sedona_schema::{
-    crs::{deserialize_crs, CachedCrsNormalization, CachedSRIDToCrs},
+    crs::{deserialize_crs, normalize_crs, CachedSRIDToCrs, Crs},
     datatypes::SedonaType,
     matchers::ArgMatcher,
 };
@@ -214,6 +215,7 @@ fn invoke_set_crs(
     let item_crs_matcher = ArgMatcher::is_item_crs();
     if item_crs_matcher.match_type(return_type) {
         let normalized_crs_value = normalize_crs_array(crs_arg, maybe_engine)?;
+        validate_crs_array_for_type(&normalized_crs_value, item_type)?;
         make_item_crs(
             item_type,
             item_arg,
@@ -259,6 +261,8 @@ fn determine_return_type(
                 }
                 None => None,
             };
+
+            validate_crs_for_type(&new_crs, &item_type)?;
 
             match item_type {
                 SedonaType::Wkb(edges, _) => Ok(Some(SedonaType::Wkb(edges, new_crs))),
@@ -334,6 +338,9 @@ impl SedonaScalarKernel for SRIDifiedKernel {
                 }
             };
 
+            // Check that the CRS is valid for the target type
+            validate_crs_for_type(&new_crs, &inner_result)?;
+
             match &mut inner_result {
                 SedonaType::Wkb(_, crs) => *crs = new_crs,
                 SedonaType::WkbView(_, crs) => *crs = new_crs,
@@ -404,6 +411,7 @@ impl SedonaScalarKernel for SRIDifiedKernel {
         } else {
             let (item_type, _) = parse_item_crs_arg_type(return_type)?;
             let normalized_crs_value = normalize_crs_array(&args[orig_args_len], None)?;
+            validate_crs_array_for_type(&normalized_crs_value, &item_type)?;
             make_item_crs(
                 &item_type,
                 result,
@@ -456,9 +464,11 @@ fn crs_input_nulls(crs_value: &ColumnarValue) -> Option<&NullBuffer> {
 /// to a null value in the CRS array) and 4326 (which maps to a value of OGC:CRS84
 /// in the CRS array).
 ///
-/// For CRS arrays of strings, this function attempts to abbreviate any inputs. For example,
-/// PROJJSON input will attempt to be abbreviated to authority:code if possible (or left
-/// as is otherwise). The special value "0" maps to a null value in the CRS array.
+/// For CRS arrays of strings, this function normalizes each input to its
+/// round-trippable definition (`to_crs_string`): an `authority:code` stays
+/// compact, while a PROJJSON/WKT definition is preserved in full rather than
+/// collapsed to its embedded code. The special value "0" maps to a null value
+/// in the CRS array.
 fn normalize_crs_array(
     crs_value: &ColumnarValue,
     maybe_engine: Option<&Arc<dyn CrsEngine + Send + Sync>>,
@@ -495,23 +505,22 @@ fn normalize_crs_array(
             Ok(Arc::new(utf8_view_array))
         }
         _ => {
-            let mut crs_norm = CachedCrsNormalization::new();
-
             let string_value = crs_value.cast_to(&DataType::Utf8View, None)?;
             let string_array_ref = ColumnarValue::values_to_arrays(&[string_value])?;
             let string_view_array = as_string_view_array(&string_array_ref[0])?;
-            let utf8_view_array = string_view_array
-                .iter()
-                .map(|maybe_crs| -> Result<Option<String>> {
-                    if let Some(crs_str) = maybe_crs {
-                        crs_norm.normalize(crs_str)
-                    } else {
-                        Ok(None)
-                    }
-                })
-                .collect::<Result<StringViewArray>>()?;
+            // Deduplicate: when many rows carry the same (possibly large)
+            // PROJJSON/WKT definition, the bytes are stored once in the view
+            // buffer and shared across rows.
+            let mut builder = StringViewBuilder::with_capacity(string_view_array.len())
+                .with_deduplicate_strings();
+            for maybe_crs in string_view_array.iter() {
+                match maybe_crs {
+                    Some(crs_str) => builder.append_option(normalize_crs(crs_str)?),
+                    None => builder.append_null(),
+                }
+            }
 
-            Ok(Arc::new(utf8_view_array))
+            Ok(Arc::new(builder.finish()))
         }
     }
 }
@@ -534,6 +543,67 @@ pub fn validate_crs(
     Ok(())
 }
 
+/// Given a resolved [Crs], validate that it is appropriate for a given output
+///
+/// This is primarily to enforce that the geography type may only have a
+/// geographic CRS. The unset CRS is also allowed for now but this may be
+/// updated in the future (in general a Geography type should always have a
+/// CRS).
+pub fn validate_crs_for_type(crs: &Crs, sedona_type: &SedonaType) -> Result<()> {
+    let edges = match sedona_type {
+        SedonaType::Wkb(edges, _) | SedonaType::WkbView(edges, _) => edges,
+        _ => {
+            return sedona_internal_err!(
+                "Non-geometry type in CRS--type validation: {sedona_type}"
+            );
+        }
+    };
+
+    // For geography, ensure the CRS is geographical if present
+    if !matches!(edges, Edges::Planar) {
+        if let Some(crs) = crs {
+            if crs.geographic_params()?.is_none() {
+                return plan_err!(
+                    "Can't assign non-geographic CRS {crs} to column of type {sedona_type}"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Given an array of CRSes (pre-normalized to stringview) check validity against type
+///
+/// This check is skipped for Geometry but occurs for Geography to ensure the
+/// target types are valid.
+pub fn validate_crs_array_for_type(crs_array: &ArrayRef, sedona_type: &SedonaType) -> Result<()> {
+    let edges = match sedona_type {
+        SedonaType::Wkb(edges, _) | SedonaType::WkbView(edges, _) => edges,
+        _ => {
+            return sedona_internal_err!(
+                "Non-geometry type in CRS--type validation: {sedona_type}"
+            );
+        }
+    };
+
+    // For geography, ensure the CRS is geographical if present
+    if !matches!(edges, Edges::Planar) {
+        let crs_array_stringview = as_string_view_array(crs_array)?;
+        for item in crs_array_stringview.iter().flatten() {
+            if let Some(crs) = deserialize_crs(item)? {
+                if crs.geographic_params()?.is_none() {
+                    return exec_err!(
+                        "Can't assign non-geographic CRS item {item} to column of type {sedona_type}"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use std::rc::Rc;
@@ -546,7 +616,7 @@ mod test {
     use sedona_geometry::{error::SedonaGeometryError, transform::CrsTransform};
     use sedona_schema::{
         crs::lnglat,
-        datatypes::{Edges, WKB_GEOMETRY, WKB_GEOMETRY_ITEM_CRS},
+        datatypes::{WKB_GEOGRAPHY, WKB_GEOGRAPHY_ITEM_CRS, WKB_GEOMETRY, WKB_GEOMETRY_ITEM_CRS},
     };
     use sedona_testing::{
         compare::assert_value_equal,
@@ -563,6 +633,38 @@ mod test {
 
         let udf: ScalarUDF = st_set_crs_udf().into();
         assert_eq!(udf.name(), "st_setcrs");
+    }
+
+    #[test]
+    fn normalize_crs_array_dedups_repeats_and_preserves_nulls() {
+        // A large PROJJSON repeated across rows, interleaved with a null and a
+        // short authority code, exercises the string path of normalize_crs_array.
+        const PROJJSON: &str = r#"{"type":"GeographicCRS","name":"NAD83","datum":{"type":"GeodeticReferenceFrame","name":"NAD83","ellipsoid":{"name":"GRS 1980","semi_major_axis":6378137,"inverse_flattening":298.257222101}},"coordinate_system":{"subtype":"ellipsoidal","axis":[{"name":"Geodetic latitude","abbreviation":"Lat","direction":"north","unit":"degree"},{"name":"Geodetic longitude","abbreviation":"Lon","direction":"east","unit":"degree"}]},"id":{"authority":"EPSG","code":4269}}"#;
+        let input = StringViewArray::from(vec![
+            Some(PROJJSON),
+            None,
+            Some(PROJJSON),
+            Some("EPSG:4326"),
+        ]);
+        let out = normalize_crs_array(&ColumnarValue::Array(Arc::new(input)), None).unwrap();
+        let out = out.as_any().downcast_ref::<StringViewArray>().unwrap();
+
+        // Null placement matches the input row-for-row.
+        assert_eq!(out.len(), 4);
+        assert!(out.is_null(1), "the null row must be preserved");
+        // The PROJJSON is preserved in full (not collapsed to "EPSG:4269") and
+        // is identical across the two rows that carried it.
+        assert!(out.value(0).contains("GeographicCRS"));
+        assert_ne!(out.value(0), "EPSG:4269");
+        assert_eq!(out.value(0), out.value(2));
+        // EPSG:4326 is kept verbatim (<=12 bytes, inlined into the view).
+        assert_eq!(out.value(3), "EPSG:4326");
+
+        // Deduplication: the repeated PROJJSON lives in the shared data buffer
+        // exactly once, so total buffer bytes equal a single copy (the inlined
+        // EPSG:4326 contributes nothing to the buffer).
+        let buffer_bytes: usize = out.data_buffers().iter().map(|b| b.len()).sum();
+        assert_eq!(buffer_bytes, out.value(0).len());
     }
 
     #[test]
@@ -660,6 +762,56 @@ mod test {
         assert_eq!(err.message(), "Unknown geometry error")
     }
 
+    #[test]
+    fn udf_crs_geography() {
+        let udf: ScalarUDF = st_set_crs_udf().into();
+
+        let wkb_geography_lnglat = SedonaType::Wkb(Edges::Spherical, lnglat());
+        let geog_arg = create_scalar_value(Some("POINT (0 1)"), &WKB_GEOGRAPHY);
+        let geog_lnglat = create_scalar_value(Some("POINT (0 1)"), &wkb_geography_lnglat);
+
+        let geographic_crs_scalar = ScalarValue::Utf8(Some("EPSG:4326".to_string()));
+        let projected_crs_scalar = ScalarValue::Utf8(Some("EPSG:3857".to_string()));
+        let null_crs_scalar = ScalarValue::Utf8(None);
+
+        // Call with a geographic CRS (should succeed for geography)
+        let (return_type, result) = call_udf(
+            &udf,
+            geog_arg.clone(),
+            &[WKB_GEOGRAPHY, SedonaType::Arrow(DataType::Utf8)],
+            geographic_crs_scalar.clone(),
+        )
+        .unwrap();
+        assert_eq!(return_type, wkb_geography_lnglat);
+        assert_value_equal(&result, &geog_lnglat);
+
+        // Call with a null scalar destination (result should be NULL per SQL NULL propagation)
+        let (return_type, result) = call_udf(
+            &udf,
+            geog_arg.clone(),
+            &[WKB_GEOGRAPHY, SedonaType::Arrow(DataType::Utf8)],
+            null_crs_scalar.clone(),
+        )
+        .unwrap();
+        assert_eq!(return_type, WKB_GEOGRAPHY);
+        let null_geog = create_scalar_value(None, &WKB_GEOGRAPHY);
+        assert_value_equal(&result, &null_geog);
+
+        // Call with a projected CRS (should fail for geography - only geographic CRS allowed)
+        let err = call_udf(
+            &udf,
+            geog_arg.clone(),
+            &[WKB_GEOGRAPHY, SedonaType::Arrow(DataType::Utf8)],
+            projected_crs_scalar.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            err.message().contains("Can't assign non-geographic CRS"),
+            "Expected error about non-geographic CRS, got: {}",
+            err.message()
+        );
+    }
+
     #[rstest]
     fn udf_item_srid_output(
         #[values(WKB_GEOMETRY, WKB_GEOMETRY_ITEM_CRS.clone())] sedona_type: SedonaType,
@@ -753,7 +905,7 @@ mod test {
                     None
                 ],
                 [
-                    Some("OGC:CRS84"),
+                    Some("EPSG:4326"),
                     Some("EPSG:3857"),
                     Some("EPSG:3857"),
                     None,
@@ -761,6 +913,74 @@ mod test {
                 ],
                 &WKB_GEOMETRY
             )
+        );
+    }
+
+    #[rstest]
+    fn udf_item_crs_output_geography(
+        #[values(WKB_GEOGRAPHY, WKB_GEOGRAPHY_ITEM_CRS.clone())] sedona_type: SedonaType,
+    ) {
+        let tester = ScalarUdfTester::new(
+            st_set_crs_udf().into(),
+            vec![sedona_type.clone(), SedonaType::Arrow(DataType::Utf8)],
+        );
+        tester.assert_return_type(WKB_GEOGRAPHY_ITEM_CRS.clone());
+
+        // Test with all geographic CRSes (should succeed)
+        let geography_array = create_array(
+            &[
+                Some("POINT (0 1)"),
+                Some("POINT (2 3)"),
+                Some("POINT (4 5)"),
+                Some("POINT (6 7)"),
+            ],
+            &sedona_type,
+        );
+        let geographic_crs_array = create_array!(
+            Utf8,
+            [
+                Some("EPSG:4326"),
+                Some("EPSG:4269"), // NAD83 - geographic
+                Some("0"),         // unset
+                None
+            ]
+        ) as ArrayRef;
+
+        let result = tester
+            .invoke_array_array(geography_array.clone(), geographic_crs_array)
+            .unwrap();
+        assert_eq!(
+            &result,
+            &create_array_item_crs(
+                &[
+                    Some("POINT (0 1)"),
+                    Some("POINT (2 3)"),
+                    Some("POINT (4 5)"),
+                    None
+                ],
+                [Some("EPSG:4326"), Some("EPSG:4269"), None, None],
+                &WKB_GEOGRAPHY
+            )
+        );
+
+        // Test with a projected CRS (should fail for geography)
+        let projected_crs_array = create_array!(
+            Utf8,
+            [
+                Some("EPSG:4326"),
+                Some("EPSG:3857"), // Web Mercator - projected, should fail
+                Some("EPSG:4326"),
+                Some("EPSG:4326")
+            ]
+        ) as ArrayRef;
+
+        let err = tester
+            .invoke_array_array(geography_array, projected_crs_array)
+            .unwrap_err();
+        assert!(
+            err.message().contains("Can't assign non-geographic CRS"),
+            "Expected error about non-geographic CRS, got: {}",
+            err.message()
         );
     }
 
@@ -819,6 +1039,12 @@ mod test {
             _options: &str,
         ) -> Result<Rc<dyn CrsTransform>, SedonaGeometryError> {
             Err(SedonaGeometryError::Unknown)
+        }
+
+        fn to_projjson(&self, _crs_string: &str) -> Result<String, SedonaGeometryError> {
+            Err(SedonaGeometryError::Invalid(
+                "don't even think about it".to_string(),
+            ))
         }
     }
 }

@@ -55,7 +55,7 @@ test_that("dataframe can be created from nanoarrow objects", {
 
 test_that("dataframe can be created from an FFI table provider", {
   df <- as_sedonadb_dataframe(data.frame(one = 1, two = "two"))
-  provider <- df$df$to_provider()
+  provider <- df$df$to_provider(df$ctx)
   df2 <- as_sedonadb_dataframe(provider)
   expect_identical(
     sd_collect(df2),
@@ -438,6 +438,24 @@ test_that("sd_transmute() works with dplyr-like transmute syntax", {
     df_in |> sd_transmute(x, y = x + integer_one) |> sd_collect(),
     data.frame(x = 1:10, y = 2:11)
   )
+
+  # Check that we can reuse names to build complex expressions
+  expect_identical(
+    df_in |> sd_transmute(x, x = x + 1L, y = x + 1L) |> sd_collect(),
+    data.frame(x = 2:11, y = 3:12)
+  )
+})
+
+test_that("sd_transmute() arguments can refer to previous arguments", {
+  df_in <- data.frame(x = 1:10)
+
+  # checks that (1) unnamed inputs like `x` are named `x` in the output
+  # and (2) named inputs are given an alias and (3) expressions are
+  # translated.
+  expect_identical(
+    df_in |> sd_transmute(x, y = x + 1L, y = y + 1L) |> sd_collect(),
+    data.frame(x = 1:10, y = 3:12)
+  )
 })
 
 test_that("sd_filter() works with dplyr-like filter syntax", {
@@ -533,5 +551,11 @@ test_that("sd_summarise() works with dplyr-like summarise syntax", {
   expect_identical(
     df_in |> sd_summarise(x = sum(x)) |> sd_collect(),
     data.frame(x = sum(as.double(1:10)))
+  )
+
+  # Check that we can reuse names to build complex expressions
+  expect_identical(
+    df_in |> sd_summarise(x = x + 1, x = sum(x)) |> sd_collect(),
+    data.frame(x = sum(as.double(1:10 + 1)))
   )
 })

@@ -35,11 +35,12 @@ jobs:
   format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Run air format
       - run: curl -LsSf https://github.com/posit-dev/air/releases/latest/download/air-installer.sh | sh
       - run: cd r/sedonadb && air format . --check
+      - run: cd r/sedonafns && air format . --check
 
   test:
     runs-on: ${{ matrix.config.os }}
@@ -61,7 +62,7 @@ jobs:
       R_KEEP_PKG_SOURCE: yes
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: r-lib/actions/setup-r@v2
         with:
           r-version: ${{ matrix.config.r }}
@@ -115,17 +116,50 @@ jobs:
         with:
           prefix-key: "r-v4"
           workspaces: ${{ env.CACHE_WORKSPACE }}
+          cache-bin: false
 
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
           needs: check
+          extra-packages: any::glue, any::here, any::rlang, any::yaml, any::roxygen2, any::rcmdcheck
           working-directory: r/sedonadb
           cache: false
 
-      - name: Install R Package
+      - name: Install sedonadb R Package
         run: |
           R CMD INSTALL r/sedonadb --preclean
 
-      - name: Test R Package
+      - name: Test sedonadb R Package
         run: |
           R -e 'library(testthat); test_local("r/sedonadb", MultiReporter$new(list(CheckReporter$new(), LocationReporter$new())))'
+
+      - name: Install sedonafns R Package
+        run: |
+          R CMD INSTALL r/sedonafns --preclean
+
+      - name: Test sedonafns R Package
+        run: |
+          R -e 'library(testthat); test_local("r/sedonafns", MultiReporter$new(list(CheckReporter$new(), LocationReporter$new())))'
+
+      - name: Install sdplyr R Package
+        run: |
+          R CMD INSTALL r/sdplyr --preclean
+
+      - name: Test sdplyr R Package
+        run: |
+          R -e 'library(testthat); test_local("r/sdplyr", MultiReporter$new(list(CheckReporter$new(), LocationReporter$new())))'
+
+      # These two packages are quick to CMD check after sedonadb is installed,
+      # so do that here
+      - uses: r-lib/actions/check-r-package@v2
+        env:
+          # The install/test step above already bootstraps generated sedonafns
+          # sources. Avoid running the same roxygen bootstrap again here, which
+          # can crash Rscript on Windows while building the check tarball.
+          R_SEDONADB_FNS_SKIP_BOOTSTRAP: "1"
+        with:
+          working-directory: r/sedonafns
+
+      - uses: r-lib/actions/check-r-package@v2
+        with:
+          working-directory: r/sdplyr

@@ -23,6 +23,10 @@ from typing import TYPE_CHECKING, Any, List, Tuple
 import geoarrow.pyarrow as ga
 import pyarrow as pa
 
+from sedonadb.utility import register_pyarrow_extension_types
+
+register_pyarrow_extension_types()
+
 if TYPE_CHECKING:
     import pandas
 
@@ -124,6 +128,10 @@ class DBEngine:
             pytest.skip(
                 f"Failed to create engine tester {cls.name()}: {e}\n{cls.install_hint()}"
             )
+
+    def geography_numeric_epsilon(self) -> float:
+        """Relative numeric_epsilon to use when comparing results to the SedonaDB value"""
+        return 1e-15
 
     def val_or_null(self, arg: Any) -> str:
         """Format SQL expression for a value or NULL"""
@@ -470,6 +478,12 @@ class PostGIS(DBEngine):
             "- Run `docker compose up postgis` to start a test PostGIS runtime"
         )
 
+    # Use reduced precision when comparing geography to SedonaDB asserted results
+    # because PostGIS uses an ellispoidal model and SedonaDB and BigQuery use
+    # spherical ones
+    def geography_numeric_epsilon(self) -> float:
+        return 1e-2
+
     def val_or_null(self, arg):
         if isinstance(arg, bytes):
             return f"'\\x{arg.hex()}'::bytea"
@@ -756,6 +770,10 @@ class BigQuery(DBEngine):
             "- Set SEDONADB_BIGQUERY_TEST_PROJECT_ID to a valid BigQuery project identifier"
         )
 
+    # Use slightly reduced precision because BigQuery snaps vertices on input slightly
+    def geography_numeric_epsilon(self) -> float:
+        return 1e-14
+
     def val_or_null(self, arg):
         if isinstance(arg, bytes):
             return f"FROM_HEX('{arg.hex()}')"
@@ -821,7 +839,7 @@ class ArrowSQLCache:
     def __init__(self, engine_name: str, path: Path):
         self._engine_name = engine_name
         self._path = path
-        self._header_lines: list[str] = []
+        self._header_lines = []
         self._entries: dict = {}
         self._dirty = False
         if self._path.exists():

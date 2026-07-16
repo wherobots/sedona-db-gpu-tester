@@ -15,7 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from sedonadb.utility import sedona  # noqa: F401
+
+if TYPE_CHECKING:
+    from sedonadb_expr import GeoMethods, RasterMethods
+
+    from sedonadb.expr import Expr
+    from sedonadb.functions import Functions
 
 
 class Literal:
@@ -38,8 +46,9 @@ class Literal:
         value: An arbitrary Python object.
     """
 
-    def __init__(self, value: Any):
+    def __init__(self, value: Any, ctx=None):
         self._value = value
+        self._ctx = ctx
 
     def __arrow_c_array__(self, requested_schema=None):
         resolved_lit = _resolve_arrow_lit(self._value)
@@ -48,36 +57,71 @@ class Literal:
     def __repr__(self):
         return f"<Literal>\n{repr(self._value)}"
 
+    @property
+    def funcs(self) -> "Functions":
+        """Pipe this expression into another SedonaDB function
 
-def lit(value: Any) -> Literal:
+        Examples:
+
+            >>> sd = sedona.db.connect()
+            >>> sd.lit(5.0).funcs.sqrt()
+            Expr(sqrt(Float64(5)))
+        """
+        from sedonadb.functions import Functions
+
+        if self._ctx is None:
+            raise ValueError("Can't pipe Literal without context into Functions")
+
+        return Functions(self._ctx, self)
+
+    @property
+    def geo(self) -> "GeoMethods[Expr]":
+        from sedonadb_expr import GeoMethods
+
+        return GeoMethods(self)
+
+    @property
+    def rst(self) -> "RasterMethods[Expr]":
+        from sedonadb_expr import RasterMethods
+
+        return RasterMethods(self)
+
+    def _call(self, name, *args) -> "Expr":
+        return self.funcs[name](*args)
+
+    def alias(self, name: str):
+        """Give this literal a column name.
+
+        Promotes the literal into an `Expr` (since SedonaDB column naming
+        is an `Expr` concern, not a `Literal` concern) and applies the
+        alias there. Useful when projecting a constant column via
+        `DataFrame.select()`.
+
+        Examples:
+
+            >>> from sedonadb.expr import lit
+            >>> lit(7).alias("seven")
+            Expr(Int64(7) AS seven)
+        """
+        from sedonadb.expr.expression import _to_expr
+
+        return _to_expr(self, self._ctx).alias(name)
+
+
+def lit(value: Any, ctx: Any = None) -> Literal:
     """Create a literal (constant) expression
 
-    Creates a `Literal` object around value, or returns value if it is
-    already a `Literal`. This is the primary function that should be used
-    to wrap an arbitrary Python object a constant to prepare it as input
-    to any SedonaDB logical expression context (e.g., parameterized SQL).
-
-    Literal values can be created from a variety of Python objects whose
-    representation as a scalar constant is unambiguous. Any object that
-    is accepted by `pyarrow.array([...])` is supported in addition to:
-
-    - Shapely geometries become SedonaDB geometry objects.
-    - GeoSeries objects of length 1 become SedonaDB geometries
-      with CRS preserved.
-    - GeoDataFrame objects with a single column and single row become
-      SedonaDB geometries with CRS preserved.
-    - Pandas DataFrame objects with a single column and single row
-      are converted using `pa.array()`.
-    - SedonaDB DataFrame objects that evaluate to a single column and
-      row become a scalar value according to the single represented
-      value.
-    - pyproj CRS objects become PROJJSON strings (e.g., so they may be used
-      in `ST_SetCRS()`, `ST_Point()`, or `ST_GeomFromWKT()`).
+    See documentation in `SedonaContext`.
     """
     if isinstance(value, Literal):
-        return value
+        if ctx is not None:
+            # Create a new literal with the assigned context
+            return Literal(value._value, ctx)
+        else:
+            # Otherwise just return the existing literal
+            return value
     else:
-        return Literal(value)
+        return Literal(value, ctx)
 
 
 def _resolve_arrow_lit(obj: Any):
@@ -148,8 +192,8 @@ def _lit_from_shapely(obj):
 
 
 def _lit_from_wkb_and_crs(wkb, crs):
-    import pyarrow as pa
     import geoarrow.pyarrow as ga
+    import pyarrow as pa
 
     type = ga.wkb().with_crs(crs)
     storage = pa.array([wkb], type.storage_type)

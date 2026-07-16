@@ -66,8 +66,8 @@ impl fmt::Display for RasterDisplay<'_> {
 
         // Compute axis-aligned bounding box from 4 corners in world coordinates.
         // This handles both skewed and non-skewed rasters correctly.
-        let w = width as i64;
-        let h = height as i64;
+        let w = width;
+        let h = height;
         let (ulx, uly) = to_world_coordinate(raster, 0, 0);
         let (urx, ury) = to_world_coordinate(raster, w, 0);
         let (lrx, lry) = to_world_coordinate(raster, w, h);
@@ -84,6 +84,7 @@ impl fmt::Display for RasterDisplay<'_> {
 
         let has_outdb = bands
             .iter()
+            .filter_map(Result::ok)
             .any(|band| matches!(band.metadata().storage_type(), Ok(StorageType::OutDbRef)));
 
         // Write: [WxH/nbands] @ [xmin ymin xmax ymax]
@@ -125,7 +126,7 @@ mod tests {
         // i=0: w=1, h=2, scale=(0.1, -0.2), skew=(0, 0), CRS=OGC:CRS84
         // Bounds: xmin=1, ymin=1.6, xmax=1.1, ymax=2
         let rasters = generate_test_rasters(1, None).unwrap();
-        let raster_array = RasterStructArray::new(&rasters);
+        let raster_array = RasterStructArray::try_new(&rasters).unwrap();
         let raster = raster_array.get(0).unwrap();
 
         let display = format!("{}", RasterDisplay(&raster));
@@ -138,7 +139,7 @@ mod tests {
         // Corners: (3,4), (3.6,4.24), (3.84,2.64), (3.24,2.4)
         // AABB: xmin=3, ymin=2.4, xmax=3.84, ymax=4.24
         let rasters = generate_test_rasters(3, None).unwrap();
-        let raster_array = RasterStructArray::new(&rasters);
+        let raster_array = RasterStructArray::try_new(&rasters).unwrap();
         let raster = raster_array.get(2).unwrap();
 
         let display = format!("{}", RasterDisplay(&raster));
@@ -152,7 +153,7 @@ mod tests {
     fn display_write_to_fmt_write() {
         // Verify RasterDisplay works with any fmt::Write target (e.g., String)
         let rasters = generate_test_rasters(1, None).unwrap();
-        let raster_array = RasterStructArray::new(&rasters);
+        let raster_array = RasterStructArray::try_new(&rasters).unwrap();
         let raster = raster_array.get(0).unwrap();
 
         let mut buf = String::new();

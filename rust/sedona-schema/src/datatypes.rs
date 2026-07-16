@@ -21,7 +21,10 @@ use serde_json::Value;
 use std::fmt::{Debug, Display};
 use std::sync::LazyLock;
 
-use crate::crs::{deserialize_crs, deserialize_crs_from_obj, Crs};
+/// Re-export for external crates that depended on this enum in this crate
+pub use sedona_geometry::types::Edges;
+
+use crate::crs::{deserialize_crs, deserialize_crs_from_obj, lnglat, Crs};
 use crate::extension_type::ExtensionType;
 use crate::raster::RasterSchema;
 
@@ -40,19 +43,6 @@ impl From<DataType> for SedonaType {
     }
 }
 
-/// Edge interpolations
-///
-/// While at the logical level we refer to geometries and geographies, at the execution
-/// layer we can reuse implementations for structural manipulation more efficiently if
-/// we consider the edge interpolation as a parameter of the physical type. This maps to
-/// the concept of "edges" in GeoArrow and "algorithm" in Parquet and Iceberg (where the
-/// planar case would be resolved to a geometry instead of a geography).
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum Edges {
-    Planar,
-    Spherical,
-}
-
 /// Sentinel for [`SedonaType::Wkb`] with planar edges
 ///
 /// This constant is useful when defining type signatures as these ignore the Crs when
@@ -67,13 +57,28 @@ pub const WKB_VIEW_GEOMETRY: SedonaType = SedonaType::WkbView(Edges::Planar, Crs
 /// Sentinel for [`SedonaType::Wkb`] with spherical edges
 ///
 /// This constant is useful when defining type signatures as these ignore the Crs when
-/// matching (and `SedonaType::Wkb(...)` is verbose)
+/// matching (and `SedonaType::Wkb(...)` is verbose). Note that [WKB_GEOGRAPHY_WGS84]
+/// is likely more appropriate in many cases.
 pub const WKB_GEOGRAPHY: SedonaType = SedonaType::Wkb(Edges::Spherical, Crs::None);
 
 /// Sentinel for [`SedonaType::WkbView`] with spherical edges
 ///
 /// See [`WKB_GEOGRAPHY`]
 pub const WKB_VIEW_GEOGRAPHY: SedonaType = SedonaType::WkbView(Edges::Spherical, Crs::None);
+
+/// Sentinel for [`SedonaType::Wkb`] with spherical edges and longitude, latitude CRS
+///
+/// This constant is useful when defining type signatures as these ignore the Crs when
+/// matching (and `SedonaType::Wkb(...)` is verbose)
+pub static WKB_GEOGRAPHY_WGS84: LazyLock<SedonaType> =
+    LazyLock::new(|| SedonaType::Wkb(Edges::Spherical, lnglat()));
+
+/// Sentinel for [`SedonaType::WkbView`] with spherical edges and longitude, latitude CRS
+///
+/// This constant is useful when defining type signatures as these ignore the Crs when
+/// matching (and `SedonaType::WkbView(...)` is verbose)
+pub static WKB_VIEW_GEOGRAPHY_WGS84: LazyLock<SedonaType> =
+    LazyLock::new(|| SedonaType::WkbView(Edges::Spherical, lnglat()));
 
 /// Sentinel for [`SedonaType::Raster`]
 pub const RASTER: SedonaType = SedonaType::Raster;
@@ -226,9 +231,7 @@ impl SedonaType {
             SedonaType::Wkb(Edges::Planar, _) | SedonaType::WkbView(Edges::Planar, _) => {
                 "geometry".to_string()
             }
-            SedonaType::Wkb(Edges::Spherical, _) | SedonaType::WkbView(Edges::Spherical, _) => {
-                "geography".to_string()
-            }
+            SedonaType::Wkb(_, _) | SedonaType::WkbView(_, _) => "geography".to_string(),
             SedonaType::Raster => "raster".to_string(),
             SedonaType::Arrow(data_type) => match data_type {
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "utf8".to_string(),
@@ -325,8 +328,8 @@ fn display_geometry(
 
     match edges {
         Edges::Planar => {}
-        Edges::Spherical => {
-            params.push("Spherical".to_string());
+        other => {
+            params.push(format!("{other:?}"));
         }
     }
 
@@ -408,7 +411,7 @@ fn serialize_edges_and_crs(edges: &Edges, crs: &Crs) -> String {
 
     let edges_component = match edges {
         Edges::Planar => None,
-        Edges::Spherical => Some(r#""edges":"spherical""#),
+        other => Some(format!(r#""edges":"{other}""#)),
     };
 
     match (crs_component, edges_component) {
@@ -420,6 +423,10 @@ fn serialize_edges_and_crs(edges: &Edges, crs: &Crs) -> String {
 }
 
 /// Deserialize a specific GeoArrow "edges" value
+///
+/// This must accept all strings produced by `Edges::Display` in `sedona-geometry`.
+/// Any new variant added to `Edges` must be handled here, or SedonaDB will reject
+/// files it wrote.
 fn deserialize_edges(edges: &Value) -> Result<Edges> {
     match edges.as_str() {
         Some(edges_str) => {
@@ -608,6 +615,18 @@ mod tests {
         assert_eq!(
             serialize_edges_and_crs(&Edges::Spherical, &lnglat()),
             r#"{"edges":"spherical","crs":"OGC:CRS84"}"#
+        );
+        // An EPSG:4326 type-CRS is canonicalized to OGC:CRS84 in metadata (so
+        // GeoArrow/GeoParquet stay axis-order-explicit), even though
+        // deserialize_crs now preserves the "EPSG:4326" string for round-trips.
+        assert_eq!(
+            serialize_edges_and_crs(&Edges::Planar, &deserialize_crs("EPSG:4326").unwrap()),
+            r#"{"crs":"OGC:CRS84"}"#
+        );
+        // A non-lnglat authority code is serialized verbatim.
+        assert_eq!(
+            serialize_edges_and_crs(&Edges::Planar, &deserialize_crs("EPSG:3857").unwrap()),
+            r#"{"crs":"EPSG:3857"}"#
         );
     }
 

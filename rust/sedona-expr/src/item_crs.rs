@@ -622,12 +622,11 @@ pub fn parse_item_crs_arg(
 
     match item_type {
         SedonaType::Wkb(_, crs) | SedonaType::WkbView(_, crs) => {
+            // Store the round-trippable definition (the item-level CRS column is
+            // read back through deserialize_crs), preserving a full PROJJSON/WKT
+            // rather than collapsing it to its embedded authority code.
             let crs_scalar = if let Some(crs) = crs {
-                if let Some(auth_code) = crs.to_authority_code()? {
-                    ScalarValue::Utf8View(Some(auth_code))
-                } else {
-                    ScalarValue::Utf8View(Some(crs.to_json()))
-                }
+                ScalarValue::Utf8View(Some(crs.to_crs_string()))
             } else {
                 ScalarValue::Utf8View(None)
             };
@@ -690,9 +689,10 @@ fn ensure_crs_string_arrays_equal2(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<()>
 mod test {
     use datafusion_expr::ScalarUDF;
     use rstest::rstest;
+    use sedona_geometry::types::Edges;
     use sedona_schema::{
         crs::lnglat,
-        datatypes::{Edges, SedonaType, WKB_GEOMETRY, WKB_GEOMETRY_ITEM_CRS},
+        datatypes::{SedonaType, WKB_GEOMETRY, WKB_GEOMETRY_ITEM_CRS},
     };
     use sedona_testing::{
         create::create_array_item_crs, create::create_scalar_item_crs, testers::ScalarUdfTester,

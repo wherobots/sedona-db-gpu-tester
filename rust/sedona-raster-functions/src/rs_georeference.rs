@@ -25,6 +25,7 @@ use datafusion_common::error::Result;
 use datafusion_common::DataFusionError;
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
+use sedona_raster::affine_transformation::AffineMatrix;
 use sedona_raster::traits::RasterRef;
 use sedona_schema::{datatypes::SedonaType, matchers::ArgMatcher};
 
@@ -46,24 +47,36 @@ pub fn rs_georeference_udf() -> SedonaScalarUDF {
 /// [world file](https://en.wikipedia.org/wiki/World_file).
 ///
 /// Both formats output six lines: scalex, skewy, skewx, scaley, upperleftx, upperlefty.
-/// The difference is how the upper-left coordinate is reported:
+/// The difference is how the upper-left coordinate is reported. Shared with the
+/// [`RS_SetGeoReference`](crate::rs_set_georeference) setter so the two agree on
+/// accepted format strings.
+///
+/// The two conventions are the world-file pixel-corner vs pixel-center
+/// distinction, which is the same as the GeoZarr `"pixel"` (cell-area, corner)
+/// vs `"node"` (cell-center) registration — so `"PIXEL"` and `"NODE"` are
+/// accepted as aliases for `GDAL` and `ESRI` respectively.
+///
+/// The center shift (`ESRI`/`NODE`) maps pixel-space `(0.5, 0.5)` through the
+/// full affine, so it is exact for skewed (rotated) rasters too:
+/// `dx = (scalex + skewx) * 0.5`, `dy = (skewy + scaley) * 0.5`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GeoReferenceFormat {
-    /// GDAL format: upperleftx and upperlefty are the coordinates of the upper-left corner
-    /// of the upper-left pixel.
+pub(crate) enum GeoReferenceFormat {
+    /// GDAL format (alias `PIXEL`): upperleftx and upperlefty are the coordinates of
+    /// the upper-left corner of the upper-left pixel.
     Gdal,
-    /// ESRI format: upperleftx and upperlefty are shifted to the center of the upper-left
-    /// pixel, i.e. `upperleftx + scalex * 0.5` and `upperlefty + scaley * 0.5`.
+    /// ESRI format (alias `NODE`): upperleftx and upperlefty are shifted to the center
+    /// of the upper-left pixel, i.e. the world coordinates of pixel-space `(0.5, 0.5)`.
     Esri,
 }
 
 impl GeoReferenceFormat {
-    fn from_str(s: &str) -> Result<Self> {
+    pub(crate) fn from_str(s: &str) -> Result<Self> {
         match s.to_uppercase().as_str() {
-            "GDAL" => Ok(GeoReferenceFormat::Gdal),
-            "ESRI" => Ok(GeoReferenceFormat::Esri),
+            "GDAL" | "PIXEL" => Ok(GeoReferenceFormat::Gdal),
+            "ESRI" | "NODE" => Ok(GeoReferenceFormat::Esri),
             _ => Err(DataFusionError::Execution(format!(
-                "Invalid GeoReference format '{}'. Supported formats are 'GDAL' and 'ESRI'.",
+                "Invalid GeoReference format '{}'. Supported formats are \
+                 'GDAL' (alias 'PIXEL') and 'ESRI' (alias 'NODE').",
                 s
             ))),
         }
@@ -174,8 +187,10 @@ fn format_georeference(
                     )
                 }
                 GeoReferenceFormat::Esri => {
-                    let esri_upper_left_x = upper_left_x + scale_x * 0.5;
-                    let esri_upper_left_y = upper_left_y + scale_y * 0.5;
+                    // World coordinates of pixel-space (0.5, 0.5) — the full
+                    // affine keeps the center shift exact under skew.
+                    let affine = AffineMatrix::from_metadata(&metadata);
+                    let (esri_upper_left_x, esri_upper_left_y) = affine.transform(0.5, 0.5);
                     format!(
                         "{:.10}\n{:.10}\n{:.10}\n{:.10}\n{:.10}\n{:.10}",
                         scale_x, skew_y, skew_x, scale_y, esri_upper_left_x, esri_upper_left_y
@@ -240,13 +255,16 @@ mod tests {
         let udf: ScalarUDF = rs_georeference_udf().into();
         let tester = ScalarUdfTester::new(udf, vec![RASTER, SedonaType::Arrow(DataType::Utf8)]);
 
+        // Index 0 is north-up (plain half-scale shift); index 2 is skewed, so
+        // its center shift includes the skew halves: dx = (0.2 + 0.06) * 0.5,
+        // dy = (0.08 - 0.4) * 0.5.
         let expected: Arc<dyn Array> = Arc::new(StringArray::from(vec![
             Some("0.1000000000\n0.0000000000\n0.0000000000\n-0.2000000000\n1.0500000000\n1.9000000000"),
             None,
-            Some("0.2000000000\n0.0800000000\n0.0600000000\n-0.4000000000\n3.1000000000\n3.8000000000"),
+            Some("0.2000000000\n0.0800000000\n0.0600000000\n-0.4000000000\n3.1300000000\n3.8400000000"),
         ]));
 
-        for format in ["ESRI", "esri"] {
+        for format in ["ESRI", "esri", "NODE", "node"] {
             let rasters = generate_test_rasters(3, Some(1)).unwrap();
             let result = tester
                 .invoke_array_scalar(Arc::new(rasters), format)
@@ -275,7 +293,7 @@ mod tests {
             Some("GDAL"), // explicit GDAL
             Some("ESRI"), // won't matter since raster 1 is null
             None,         // null format -> NULL output
-            Some("ESRI"), // explicit ESRI
+            Some("ESRI"), // explicit ESRI on a skewed raster
         ]));
 
         let result = tester
@@ -288,8 +306,9 @@ mod tests {
                 None,
                 // null format -> NULL output
                 None,
-                // explicit ESRI
-                Some("0.3000000000\n0.1200000000\n0.0900000000\n-0.6000000000\n4.1500000000\n4.7000000000"),
+                // explicit ESRI on a skewed raster: the center shift uses the
+                // full affine, dx = (0.3 + 0.09) * 0.5, dy = (0.12 - 0.6) * 0.5
+                Some("0.3000000000\n0.1200000000\n0.0900000000\n-0.6000000000\n4.1950000000\n4.7600000000"),
         ]));
         assert_array_equal(&result, &expected);
     }

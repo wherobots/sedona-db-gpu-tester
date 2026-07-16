@@ -41,6 +41,7 @@ use datafusion_catalog::{memory::DataSourceExec, Session};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{plan_err, GetExt, Result, Statistics};
 use datafusion_datasource_parquet::metadata::DFParquetMetadata;
+use datafusion_datasource_parquet::{CachedParquetFileReaderFactory, ParquetFileReaderFactory};
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_expr::{
     expressions::Column, projection::ProjectionExprs, LexRequirement, PhysicalExpr,
@@ -51,9 +52,10 @@ use datafusion_physical_plan::{
 use futures::{StreamExt, TryStreamExt};
 use object_store::{ObjectMeta, ObjectStore};
 
-use sedona_common::{sedona_internal_datafusion_err, sedona_internal_err};
+use sedona_common::{sedona_internal_datafusion_err, sedona_internal_err, SedonaOptions};
 
 use sedona_expr::metadata_preserving_column::MetadataPreservingColumn;
+use sedona_geometry::bounds::WkbBounder2DFactory;
 use sedona_schema::extension_type::ExtensionType;
 
 use crate::{
@@ -339,8 +341,22 @@ impl FileFormat for GeoParquetFormat {
             source = source.with_metadata_size_hint(metadata_size_hint)
         }
 
+        // Use the CachedParquetFileReaderFactory so the inner ParquetOpener's
+        // metadata fetches go through the file metadata cache.
         let file_metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
+        let object_store = state
+            .runtime_env()
+            .object_store(config.object_store_url.clone())?;
         source.metadata_cache = Some(file_metadata_cache.clone());
+        source = source.with_parquet_file_reader_factory(Arc::new(
+            CachedParquetFileReaderFactory::new(object_store, file_metadata_cache),
+        ));
+
+        // Inject bounder factory from SedonaOptions for geography pruning support
+        if let Some(sedona_options) = state.config().options().extensions.get::<SedonaOptions>() {
+            source.bounder_factory = sedona_options.runtime.bounder_factory().clone();
+        }
+
         let conf = FileScanConfigBuilder::from(config)
             .with_source(Arc::new(source))
             .build();
@@ -394,6 +410,11 @@ pub struct GeoParquetFileSource {
     predicate: Option<Arc<dyn PhysicalExpr>>,
     options: TableGeoParquetOptions,
     metadata_cache: Option<Arc<dyn FileMetadataCache>>,
+    /// Factory for creating bounders used for spatial pruning
+    ///
+    /// Enables spatial pruning for both GEOMETRY and GEOGRAPHY columns.
+    /// This is typically obtained from `SedonaOptions::runtime.bounder_factory()`.
+    bounder_factory: WkbBounder2DFactory,
 }
 
 impl GeoParquetFileSource {
@@ -406,7 +427,17 @@ impl GeoParquetFileSource {
             predicate: None,
             options,
             metadata_cache: None,
+            bounder_factory: WkbBounder2DFactory::default(),
         }
+    }
+
+    /// Set the bounder factory for spatial pruning support
+    ///
+    /// This factory is used for spatial pruning of GEOMETRY and GEOGRAPHY columns.
+    /// Typically obtained from `SedonaOptions::runtime.bounder_factory()`.
+    pub fn with_bounder_factory(mut self, factory: WkbBounder2DFactory) -> Self {
+        self.bounder_factory = factory;
+        self
     }
 
     pub fn with_options(&self, options: TableGeoParquetOptions) -> Self {
@@ -464,6 +495,7 @@ impl GeoParquetFileSource {
                     parquet_source.table_parquet_options().clone(),
                 ),
                 metadata_cache: None,
+                bounder_factory: WkbBounder2DFactory::default(),
             })
         } else {
             sedona_internal_err!("GeoParquetFileSource constructed from non-ParquetSource")
@@ -478,6 +510,7 @@ impl GeoParquetFileSource {
             predicate: Some(predicate),
             options: self.options.clone(),
             metadata_cache: self.metadata_cache.clone(),
+            bounder_factory: self.bounder_factory.clone(),
         }
     }
 
@@ -489,6 +522,22 @@ impl GeoParquetFileSource {
             predicate: self.predicate.clone(),
             options: self.options.clone(),
             metadata_cache: self.metadata_cache.clone(),
+            bounder_factory: self.bounder_factory.clone(),
+        }
+    }
+
+    /// Apply a [ParquetFileReaderFactory] to the inner [ParquetSource]
+    pub fn with_parquet_file_reader_factory(
+        &self,
+        factory: Arc<dyn ParquetFileReaderFactory>,
+    ) -> Self {
+        Self {
+            inner: self.inner.clone().with_parquet_file_reader_factory(factory),
+            metadata_size_hint: self.metadata_size_hint,
+            predicate: self.predicate.clone(),
+            options: self.options.clone(),
+            metadata_cache: self.metadata_cache.clone(),
+            bounder_factory: self.bounder_factory.clone(),
         }
     }
 }
@@ -520,6 +569,7 @@ impl FileSource for GeoParquetFileSource {
             metrics: GeoParquetFileOpenerMetrics::new(self.inner.metrics()),
             options: self.options.clone(),
             metadata_cache: self.metadata_cache.clone(),
+            bounder_factory: self.bounder_factory.clone(),
         }))
     }
 
@@ -539,6 +589,7 @@ impl FileSource for GeoParquetFileSource {
                 )?;
                 updated_inner.options = self.options.clone();
                 updated_inner.metadata_cache = self.metadata_cache.clone();
+                updated_inner.bounder_factory = self.bounder_factory.clone();
                 Ok(inner_result.with_updated_node(Arc::new(updated_inner)))
             }
             None => Ok(inner_result),
@@ -557,6 +608,7 @@ impl FileSource for GeoParquetFileSource {
         );
         source.options = self.options.clone();
         source.metadata_cache = self.metadata_cache.clone();
+        source.bounder_factory = self.bounder_factory.clone();
         Arc::new(source)
     }
 
@@ -591,6 +643,7 @@ impl FileSource for GeoParquetFileSource {
                 )?;
                 updated_source.options = self.options.clone();
                 updated_source.metadata_cache = self.metadata_cache.clone();
+                updated_source.bounder_factory = self.bounder_factory.clone();
                 Ok(Some(Arc::new(updated_source)))
             }
             None => Ok(None),
@@ -663,8 +716,10 @@ mod test {
 
     use arrow_array::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::datasource::physical_plan::ParquetSource;
+    use datafusion::datasource::file_format::FileFormat;
+    use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
     use datafusion::datasource::table_schema::TableSchema;
+    use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::{
         execution::SessionStateBuilder,
         prelude::{col, ParquetReadOptions, SessionContext},
@@ -675,8 +730,9 @@ mod test {
     use datafusion_physical_expr::PhysicalExpr;
 
     use rstest::rstest;
+    use sedona_geometry::types::Edges;
     use sedona_schema::crs::{deserialize_crs, lnglat};
-    use sedona_schema::datatypes::{Edges, SedonaType, WKB_GEOMETRY};
+    use sedona_schema::datatypes::{SedonaType, WKB_GEOMETRY};
     use sedona_schema::schema::SedonaSchema;
     use sedona_testing::create::create_scalar;
     use sedona_testing::data::{geoarrow_data_dir, test_geoparquet};
@@ -959,6 +1015,44 @@ mod test {
             .as_any()
             .downcast_ref::<GeoParquetFormat>()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn create_physical_plan_installs_cached_reader_factory() {
+        // The inner ParquetOpener uses its own ParquetFileReaderFactory for
+        // metadata fetches; if it is left at DataFusion's default it bypasses
+        // the file metadata cache. create_physical_plan must install a custom
+        // factory so that per-query metadata reads are cached.
+        let ctx = setup_context();
+        let format = GeoParquetFormat::new(TableGeoParquetOptions::default());
+        let schema = Arc::new(Schema::new(vec![WKB_GEOMETRY
+            .to_storage_field("geometry", true)
+            .unwrap()]));
+        let table_schema = TableSchema::new(schema, vec![]);
+        let file_source = format.file_source(table_schema);
+        let conf =
+            FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), file_source).build();
+
+        let plan = format
+            .create_physical_plan(&ctx.state(), conf)
+            .await
+            .unwrap();
+
+        let data_source_exec = plan
+            .as_any()
+            .downcast_ref::<DataSourceExec>()
+            .expect("plan root should be DataSourceExec");
+        let file_scan_conf = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+            .expect("data source should be FileScanConfig");
+        let geo_source = file_scan_conf
+            .file_source()
+            .as_any()
+            .downcast_ref::<GeoParquetFileSource>()
+            .expect("file source should be GeoParquetFileSource");
+        assert!(geo_source.inner.parquet_file_reader_factory().is_some());
     }
 
     #[tokio::test]

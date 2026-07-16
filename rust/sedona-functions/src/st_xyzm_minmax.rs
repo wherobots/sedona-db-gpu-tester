@@ -129,10 +129,11 @@ struct STXyzmMinMax {
 
 impl SedonaScalarKernel for STXyzmMinMax {
     fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
-        let matcher = ArgMatcher::new(
-            vec![ArgMatcher::is_geometry()],
-            SedonaType::Arrow(DataType::Float64),
-        );
+        let arg0 = match self.dim {
+            "x" | "y" => ArgMatcher::is_geometry(),
+            _ => ArgMatcher::is_geometry_or_geography(),
+        };
+        let matcher = ArgMatcher::new(vec![arg0], SedonaType::Arrow(DataType::Float64));
 
         matcher.match_args(args)
     }
@@ -148,7 +149,7 @@ impl SedonaScalarKernel for STXyzmMinMax {
         executor.execute_wkb_void(|maybe_item| {
             match maybe_item {
                 Some(item) => {
-                    builder.append_option(invoke_scalar(&item, self.dim, self.is_max)?);
+                    builder.append_option(invoke_scalar(item, self.dim, self.is_max)?);
                 }
                 None => builder.append_null(),
             }

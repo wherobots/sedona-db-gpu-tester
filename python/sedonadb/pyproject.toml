@@ -42,11 +42,13 @@ test = [
     "polars",
     "pytest",
     "pyyaml",
+    "rasterio",
 ]
 geopandas = [
     "adbc-driver-manager[dbapi]",
     "geoarrow-pyarrow",
     "geopandas",
+    "sedonadb-expr",
 ]
 
 [tool.maturin]

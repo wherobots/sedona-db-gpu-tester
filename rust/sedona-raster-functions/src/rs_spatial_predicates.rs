@@ -377,8 +377,8 @@ const CONVEXHULL_WKB_SIZE: usize = 93;
 
 /// Create WKB for a convex hull polygon for the raster
 fn write_convexhull_wkb(raster: &dyn RasterRef, out: &mut impl std::io::Write) -> Result<()> {
-    let width = raster.metadata().width() as i64;
-    let height = raster.metadata().height() as i64;
+    let width = raster.metadata().width();
+    let height = raster.metadata().height();
 
     let (ulx, uly) = to_world_coordinate(raster, 0, 0);
     let (urx, ury) = to_world_coordinate(raster, width, 0);
@@ -400,11 +400,11 @@ mod tests {
     use arrow_array::{create_array, ArrayRef};
     use datafusion_expr::ScalarUDF;
     use rstest::rstest;
+    use sedona_geometry::types::Edges;
     use sedona_raster::builder::RasterBuilder;
     use sedona_raster::traits::{BandMetadata, RasterMetadata};
     use sedona_schema::crs::deserialize_crs;
     use sedona_schema::crs::OGC_CRS84_PROJJSON;
-    use sedona_schema::datatypes::Edges;
     use sedona_schema::datatypes::RASTER;
     use sedona_schema::datatypes::WKB_GEOMETRY;
     use sedona_schema::raster::{BandDataType, StorageType};

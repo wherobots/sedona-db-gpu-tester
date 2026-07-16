@@ -16,6 +16,7 @@
 # under the License.
 
 import geopandas
+import geopandas.testing
 import pyproj
 import pytest
 from sedonadb.testing import PostGIS, SedonaDB, geom_or_null, val_or_null
@@ -86,6 +87,44 @@ def test_st_srid(eng, geom, srid, expected_srid):
         f"SELECT ST_SRID(ST_SetSrid({geom_or_null(geom)}, {val_or_null(srid)}))",
         expected_srid,
     )
+
+
+def test_st_transform_bind_crs(con):
+    # Check the two argument version
+    df = con.sql(
+        "SELECT ST_Transform(ST_Point(0, 1, 4326), $1) AS geom", params=("EPSG:3857",)
+    ).to_pandas()
+    expected = con.sql(
+        "SELECT ST_Transform(ST_Point(0, 1, 4326), 'EPSG:3857') AS geom"
+    ).to_pandas()
+    geopandas.testing.assert_geodataframe_equal(df, expected)
+
+    # Check the three argument version
+    df = con.sql(
+        "SELECT ST_Transform(ST_Point(0, 1), 4326, $1) AS geom", params=("EPSG:3857",)
+    ).to_pandas()
+    expected = con.sql(
+        "SELECT ST_Transform(ST_Point(0, 1), 4326, 'EPSG:3857') AS geom"
+    ).to_pandas()
+    geopandas.testing.assert_geodataframe_equal(df, expected)
+
+
+def test_st_set_crs_bind_crs(con):
+    df = con.sql(
+        "SELECT ST_SetCrs(ST_Point(0, 1), $1) AS geom", params=("EPSG:3857",)
+    ).to_pandas()
+    expected = con.sql(
+        "SELECT ST_SetCrs(ST_Point(0, 1), 'EPSG:3857') AS geom"
+    ).to_pandas()
+    geopandas.testing.assert_geodataframe_equal(df, expected)
+
+
+def test_st_set_srid_bind_srid(con):
+    df = con.sql(
+        "SELECT ST_SetSRID(ST_Point(0, 1), $1) AS geom", params=(3857,)
+    ).to_pandas()
+    expected = con.sql("SELECT ST_SetSRID(ST_Point(0, 1), 3857) AS geom").to_pandas()
+    geopandas.testing.assert_geodataframe_equal(df, expected)
 
 
 # PostGIS does not have an API ST_SetCrs, ST_Crs
@@ -159,6 +198,71 @@ def test_st_crs_sedonadb(eng):
         "SELECT ST_CRS(ST_SetCrs(ST_GeomFromText('POINT (1 1)'), NULL))",
         None,
     )
+
+
+# EPSG:3857 as WKT (carries an embedded EPSG authority) and a bespoke Lambert
+# Conformal Conic WKT with no authority code anywhere.
+WKT_3857 = (
+    'PROJCS["WGS 84 / Pseudo-Mercator",GEOGCS["WGS 84",DATUM["WGS_1984",'
+    'SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],'
+    'AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],'
+    'UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],'
+    'AUTHORITY["EPSG","4326"]],PROJECTION["Mercator_1SP"],'
+    'PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],'
+    'PARAMETER["false_easting",0],PARAMETER["false_northing",0],'
+    'UNIT["metre",1,AUTHORITY["EPSG","9001"]],AUTHORITY["EPSG","3857"]]'
+)
+WKT_LCC_NO_AUTHORITY = (
+    'PROJCS["Custom LCC",GEOGCS["WGS 84",DATUM["WGS_1984",'
+    'SPHEROID["WGS 84",6378137,298.257223563]]],'
+    'PROJECTION["Lambert_Conformal_Conic_2SP"],'
+    'PARAMETER["standard_parallel_1",33],PARAMETER["standard_parallel_2",45],'
+    'PARAMETER["latitude_of_origin",39],PARAMETER["central_meridian",-96],'
+    'UNIT["metre",1]]'
+)
+
+
+# WKT1/WKT2 CRS strings round-trip through ST_SetCrs/ST_Crs unchanged, whether
+# or not they carry an embedded authority. (ST_SetCrs/ST_Crs are SedonaDB-only.)
+@pytest.mark.parametrize("wkt", [WKT_3857, WKT_LCC_NO_AUTHORITY])
+def test_st_crs_wkt_roundtrips(con, wkt):
+    result = con.sql(
+        "SELECT ST_Crs(ST_SetCrs(ST_GeomFromText('POINT (0 1)'), $1)) AS crs",
+        params=(wkt,),
+    ).to_arrow_table()
+    assert result["crs"][0].as_py() == wkt
+
+
+def test_st_srid_from_wkt(con):
+    """A WKT carrying an EPSG authority resolves to that SRID."""
+    result = con.sql(
+        "SELECT ST_SRID(ST_SetCrs(ST_GeomFromText('POINT (0 1)'), $1)) AS srid",
+        params=(WKT_3857,),
+    ).to_arrow_table()
+    assert result["srid"][0].as_py() == 3857
+
+
+def test_st_srid_from_authorityless_wkt_errors(con):
+    """A WKT with no authority code anywhere has no SRID to extract."""
+    with pytest.raises(Exception, match="SRID"):
+        con.sql(
+            "SELECT ST_SRID(ST_SetCrs(ST_GeomFromText('POINT (0 1)'), $1))",
+            params=(WKT_LCC_NO_AUTHORITY,),
+        ).to_arrow_table()
+
+
+def test_st_transform_from_wkt_crs(con):
+    """A WKT CRS feeds the PROJ transform like any other CRS string: a point at
+    the EPSG:3857 coordinates of (lon 1, lat 1) transforms back to ~POINT (1 1)."""
+    df = con.sql(
+        "SELECT ST_Transform("
+        "ST_SetCrs(ST_GeomFromText('POINT (111319.490793274 111325.142866385)'), $1),"
+        " 'EPSG:4326') AS geom",
+        params=(WKT_3857,),
+    ).to_pandas()
+    point = df.geometry[0]
+    assert point.x == pytest.approx(1.0, abs=1e-6)
+    assert point.y == pytest.approx(1.0, abs=1e-6)
 
 
 @pytest.mark.parametrize("eng", [SedonaDB, PostGIS])

@@ -16,6 +16,7 @@
 # under the License.
 
 import json
+import re
 import tempfile
 from pathlib import Path
 
@@ -503,16 +504,16 @@ def test_write_geoparquet_2_0(con, geoarrow_data):
         assert table_roundtrip == table
 
         # Check for metadata and logical type
-        file = parquet.ParquetFile(tmp_parquet)
-        file_kv_metadata = file.metadata.metadata
-        assert b"geo" in file_kv_metadata
-        geo_metadata = json.loads(file_kv_metadata[b"geo"])
-        assert geo_metadata["version"] == "2.0.0"
+        with parquet.ParquetFile(tmp_parquet) as file:
+            file_kv_metadata = file.metadata.metadata
+            assert b"geo" in file_kv_metadata
+            geo_metadata = json.loads(file_kv_metadata[b"geo"])
+            assert geo_metadata["version"] == "2.0.0"
 
-        assert (
-            file.metadata.schema.column(2).logical_type.to_json()
-            == '{"Type": "Geometry"}'
-        )
+            assert (
+                file.metadata.schema.column(2).logical_type.to_json()
+                == '{"Type": "Geometry"}'
+            )
 
 
 def test_write_geoparquet_no_metadata(con, geoarrow_data):
@@ -535,19 +536,19 @@ def test_write_geoparquet_no_metadata(con, geoarrow_data):
         assert table_roundtrip == table
 
         # Check for absent metadata and but correct logical type
-        file = parquet.ParquetFile(tmp_parquet)
-        file_kv_metadata = file.metadata.metadata
-        assert file_kv_metadata is None or b"geo" not in file_kv_metadata
+        with parquet.ParquetFile(tmp_parquet) as file:
+            file_kv_metadata = file.metadata.metadata
+            assert file_kv_metadata is None or b"geo" not in file_kv_metadata
 
-        assert (
-            file.metadata.schema.column(2).logical_type.to_json()
-            == '{"Type": "Geometry"}'
-        )
-        geo_stats = file.metadata.row_group(0).column(2).geo_statistics
-        assert geo_stats is not None
-        assert geo_stats.geospatial_types == [3, 6]
-        assert geo_stats.xmin <= -180
-        assert geo_stats.xmax >= 180
+            assert (
+                file.metadata.schema.column(2).logical_type.to_json()
+                == '{"Type": "Geometry"}'
+            )
+            geo_stats = file.metadata.row_group(0).column(2).geo_statistics
+            assert geo_stats is not None
+            assert geo_stats.geospatial_types == [3, 6]
+            assert geo_stats.xmin <= -180
+            assert geo_stats.xmax >= 180
 
 
 def test_write_geoparquet_geography_no_metadata(con, geoarrow_data):
@@ -570,24 +571,24 @@ def test_write_geoparquet_geography_no_metadata(con, geoarrow_data):
         assert table_roundtrip == table
 
         # Check for absent metadata and but correct logical type
-        file = parquet.ParquetFile(tmp_parquet)
-        file_kv_metadata = file.metadata.metadata
-        assert file_kv_metadata is None or b"geo" not in file_kv_metadata
+        with parquet.ParquetFile(tmp_parquet) as file:
+            file_kv_metadata = file.metadata.metadata
+            assert file_kv_metadata is None or b"geo" not in file_kv_metadata
 
-        assert (
-            file.metadata.schema.column(2).logical_type.to_json()
-            == '{"Type": "Geography"}'
-        )
+            assert (
+                file.metadata.schema.column(2).logical_type.to_json()
+                == '{"Type": "Geography"}'
+            )
 
-        # We should only have stats if s2geography is enabled
-        geo_stats = file.metadata.row_group(0).column(2).geo_statistics
-        if "s2geography" not in sedonadb.__features__:
-            assert geo_stats is None
-        else:
-            assert geo_stats is not None
-            assert geo_stats.geospatial_types == [3, 6]
-            assert geo_stats.xmin == -180
-            assert geo_stats.xmax == 180
+            # We should only have stats if s2geography is enabled
+            geo_stats = file.metadata.row_group(0).column(2).geo_statistics
+            if "s2geography" not in sedonadb.__features__:
+                assert geo_stats is None
+            else:
+                assert geo_stats is not None
+                assert geo_stats.geospatial_types == [3, 6]
+                assert geo_stats.xmin == -180
+                assert geo_stats.xmax == 180
 
 
 def test_read_parquet_validate_wkb_single_valid_row(con, tmp_path):
@@ -664,3 +665,147 @@ def test_read_parquet_validate_wkb_partial_invalid_rows(con, tmp_path):
         con.read_parquet(
             path, geometry_columns=geometry_columns, validate=True
         ).to_arrow_table()
+
+
+def test_prune_geography_parquet():
+    """Test that geography parquet files can be pruned with statistics crossing the antimeridian."""
+    if "s2geography" not in sedonadb.__features__:
+        pytest.skip("Python package built without s2geography")
+
+    con = sedonadb.connect()
+
+    # Create random points crossing the antimeridian (bounds=[170, 10, 190, 30]
+    # which wraps to [170, 10, -170, 30]). Create a non-trivial number of row groups
+    # so we can check pruning.
+    con.funcs.table.sd_random_geometry(
+        "Point", 100_000, seed=59837, bounds=[170, 10, 190, 30]
+    ).to_view("pts", overwrite=True)
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp_parquet = Path(td) / "geog.parquet"
+
+        # Write as geography with small row groups to enable pruning
+        con.sql(
+            "SELECT ST_SetSRID(ST_GeogFromWKB(ST_AsBinary(geometry)), 4326) as geog FROM pts"
+        ).to_parquet(
+            tmp_parquet,
+            geoparquet_version="2.0",
+            max_row_group_size=10_000,
+            sort_by=["geog"],
+        )
+
+        # Verify the parquet file has geography statistics with antimeridian wraparound
+        with parquet.ParquetFile(tmp_parquet) as f:
+            assert f.metadata.num_row_groups > 1
+
+            # Check that at least one row group has wraparound statistics (xmin > xmax)
+            has_wraparound = False
+            for i in range(f.metadata.num_row_groups):
+                stats = f.metadata.row_group(i).column(0).geo_statistics
+                if stats is not None and stats.xmin > stats.xmax:
+                    has_wraparound = True
+                    break
+            assert has_wraparound, (
+                "Expected at least one row group with antimeridian wraparound"
+            )
+
+        # Query 1: Query crossing the antimeridian - should match results
+        query_antimeridian = f"""
+            SELECT * FROM "{tmp_parquet}" WHERE
+            ST_Intersects(geog, ST_SetSRID(ST_GeogFromText(
+                'POLYGON ((179 20, -179 20, -179 22, 179 22, 179 20))'
+            ), 4326))
+        """
+        result_count = con.sql(query_antimeridian).count()
+        assert result_count > 0, "Expected results from antimeridian-crossing query"
+
+        # Query 2: Query a small region that should only match some row groups
+        # This queries the far west side (around 170-172 longitude)
+        query_partial = f"""
+            SELECT * FROM "{tmp_parquet}" WHERE
+            ST_Intersects(geog, ST_SetSRID(ST_GeogFromText(
+                'POLYGON ((170 10, 172 10, 172 12, 170 12, 170 10))'
+            ), 4326))
+        """
+
+        # Verify the query returns results
+        result_count = con.sql(query_partial).count()
+        assert result_count > 0, "Expected some results from partial region query"
+
+        # Verify pruning occurred via EXPLAIN ANALYZE
+        explained = con.sql(query_partial).explain("analyze").to_pandas()
+        plan_text = explained.iloc[0, 1]
+
+        # Check that spatial pruning metrics are reported
+        assert "row_groups_spatial_pruned" in plan_text, (
+            "Expected row_groups_spatial_pruned in explain output"
+        )
+
+        # Verify that pruning actually reduced the number of row groups scanned
+        match = re.search(
+            r"row_groups_spatial_pruned=(\d+) total .* (\d+) matched", plan_text
+        )
+
+        # Make sure we actually had a match
+        assert match
+
+        # Check that we actually reduced row groups with spatial pruning
+        total = int(match.group(1))
+        matched = int(match.group(2))
+        assert matched < total, (
+            f"Expected pruning to reduce row groups: {matched} matched out of {total}"
+        )
+
+
+def test_read_partitioned_parquet(con):
+    t = con.funcs.table.sd_random_geometry(seed=3847)
+    t = t.select(
+        id=t.id,
+        geom=con.funcs.st_setsrid(t.geometry, 3857),
+        grp=con.funcs.floor(t.id / 100).cast(pa.string()),
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        out_dir = Path(td) / "out_dir"
+
+        t.to_parquet(out_dir, partition_by="grp")
+
+        # Test default partitioning read behaviour (autodiscover)
+        result = con.read_parquet(out_dir)
+        assert result.columns == t.columns
+        geopandas.testing.assert_geodataframe_equal(
+            result.sort("id").to_pandas(),
+            t.sort("id").to_pandas(),
+        )
+
+        # Test auto-discovery of partition columns (partitioning=None)
+        result = con.read_parquet(out_dir, partitioning=None)
+        assert result.columns == t.columns
+        geopandas.testing.assert_geodataframe_equal(
+            result.sort("id").to_pandas(),
+            t.sort("id").to_pandas(),
+        )
+
+        # Explicit partitioning (list)
+        result_explicit = con.read_parquet(out_dir, partitioning=["grp"])
+        assert result_explicit.columns == t.columns
+        geopandas.testing.assert_geodataframe_equal(
+            result_explicit.sort("id").to_pandas(),
+            t.sort("id").to_pandas(),
+        )
+
+        # Explicit partitioning (str)
+        result_explicit = con.read_parquet(out_dir, partitioning="grp")
+        assert result_explicit.columns == t.columns
+        geopandas.testing.assert_geodataframe_equal(
+            result_explicit.sort("id").to_pandas(),
+            t.sort("id").to_pandas(),
+        )
+
+        # partitioning=[] disables auto-discovery
+        result_disabled = con.read_parquet(out_dir, partitioning=[])
+        assert result_disabled.columns == ["id", "geom"]
+        geopandas.testing.assert_geodataframe_equal(
+            result_disabled.sort("id").to_pandas(),
+            t.sort("id").to_pandas()[["id", "geom"]],
+        )

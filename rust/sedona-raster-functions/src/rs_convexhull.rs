@@ -24,10 +24,10 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_expr::item_crs::make_item_crs;
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
+use sedona_geometry::types::Edges;
 use sedona_geometry::wkb_factory::write_wkb_polygon;
 use sedona_raster::affine_transformation::to_world_coordinate;
 use sedona_raster::traits::RasterRef;
-use sedona_schema::datatypes::Edges;
 use sedona_schema::{datatypes::SedonaType, matchers::ArgMatcher};
 
 /// RS_ConvexHull() scalar UDF documentation
@@ -107,8 +107,8 @@ impl SedonaScalarKernel for RsConvexHull {
 /// of the raster in world coordinates. Due to skew/rotation in the affine
 /// transformation, each corner must be computed individually.
 fn write_convexhull_wkb(raster: &dyn RasterRef, out: &mut impl std::io::Write) -> Result<()> {
-    let width = raster.metadata().width() as i64;
-    let height = raster.metadata().height() as i64;
+    let width = raster.metadata().width();
+    let height = raster.metadata().height();
 
     // Compute the four corners in pixel coordinates:
     // Upper-left (0, 0), Upper-right (width, 0), Lower-right (width, height), Lower-left (0, height)
