@@ -33,7 +33,7 @@ on:
       - 'r/**'
 jobs:
   format:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -53,7 +53,7 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - {os: ubuntu-latest, r: 'release'}
+          - {os: depot-ubuntu-24.04, r: 'release'}
           - {os: macos-latest, r: 'release'}
           - {os: windows-latest, r: 'release'}
 
@@ -92,7 +92,7 @@ jobs:
           New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
 
       - name: Install dependencies (Linux)
-        if: matrix.config.os == 'ubuntu-latest'
+        if: matrix.config.os == 'depot-ubuntu-24.04'
         run: sudo apt-get update && sudo apt-get install -y libgeos-dev
 
       - name: Install dependencies (MacOS)

@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   expr-build:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
