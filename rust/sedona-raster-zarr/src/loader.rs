@@ -29,8 +29,8 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use sedona_common::sedona_internal_datafusion_err;
-use sedona_raster::affine_transformation::AffineMatrix;
-use sedona_raster::builder::RasterBuilder;
+use sedona_raster::builder::{RasterBuilder, StartBandArgs};
+use sedona_raster::geo_transform::geotransform_from_bbox_and_spatial_shape;
 use sedona_raster::traits::is_spatial_dim_pair;
 use sedona_schema::datatypes::SedonaType;
 use sedona_schema::raster::BandDataType;
@@ -176,15 +176,13 @@ impl ZarrChunkReader {
             // defers pixel-byte resolution to the raster byte loader.
             let anchor = build_chunk_anchor(&self.group_uri, &info.path, &self.chunk_indices);
             let source_shape: Vec<i64> = info.chunk_shape.iter().map(|&n| n as i64).collect();
-            builder.start_band_nd(
-                Some(info.path.as_str()),
-                &dim_names_ref,
-                &source_shape,
-                info.data_type,
-                nodata_ref,
-                Some(anchor.as_str()),
-                Some("zarr"),
-            )?;
+            builder.start_band(StartBandArgs {
+                name: Some(info.path.as_str()),
+                nodata: nodata_ref,
+                outdb_uri: Some(anchor.as_str()),
+                outdb_format: Some("zarr"),
+                ..StartBandArgs::new(&dim_names_ref, &source_shape, info.data_type)
+            })?;
             builder.band_data_writer().append_value([0u8; 0]);
             builder.finish_band()?;
         }
@@ -457,13 +455,9 @@ fn transform_from_bbox(
     let bbox = geo.bbox?;
     let height = array_infos[0].shape[y_axis];
     let width = array_infos[0].shape[x_axis];
-    match AffineMatrix::from_bbox_and_spatial_shape(
-        bbox,
-        height,
-        width,
-        geo.registration.as_deref(),
-    ) {
-        Ok(matrix) => {
+    match geotransform_from_bbox_and_spatial_shape(bbox, height, width, geo.registration.as_deref())
+    {
+        Ok(gt) => {
             // Mirror the coordinate-array path: when the group declares no CRS,
             // infer a geographic one from the spatial dim names (lat/lon).
             // Generic y/x stay CRS-less (attach via RS_SetCRS).
@@ -479,7 +473,7 @@ fn transform_from_bbox(
                 "Zarr group at {group_uri} has no `spatial:transform`; derived a \
                  geotransform from `spatial:bbox` and the {height}x{width} array shape"
             );
-            Some(matrix.to_gdal_geotransform())
+            Some(gt)
         }
         Err(e) => {
             log::warn!(

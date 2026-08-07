@@ -34,9 +34,9 @@ use pyo3::types::{PyCapsule, PyDict, PyList};
 use sedona::context::{SedonaDataFrame, SedonaWriteOptions};
 use sedona::projected_reader::simplify_record_batch_reader;
 use sedona::show::{DisplayMode, DisplayTableOptions};
+use sedona_extension::runtime::RuntimeHandle;
 use sedona_geoparquet::options::TableGeoParquetOptions;
 use sedona_schema::schema::SedonaSchema;
-use tokio::runtime::Runtime;
 
 use crate::context::InternalContext;
 use crate::error::PySedonaError;
@@ -50,11 +50,11 @@ use crate::schema::PySedonaSchema;
 
 pub struct InternalDataFrame {
     pub inner: DataFrame,
-    pub runtime: Arc<Runtime>,
+    pub runtime: Arc<RuntimeHandle>,
 }
 
 impl InternalDataFrame {
-    pub fn new(inner: DataFrame, runtime: Arc<Runtime>) -> Self {
+    pub fn new(inner: DataFrame, runtime: Arc<RuntimeHandle>) -> Self {
         Self { inner, runtime }
     }
 }
@@ -586,6 +586,39 @@ impl InternalDataFrame {
                 write_options,
                 Some(writer_options),
             ),
+        )??;
+        Ok(())
+    }
+
+    fn to_csv<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        has_header: bool,
+        delimiter: &str,
+    ) -> Result<(), PySedonaError> {
+        let bytes = delimiter.as_bytes();
+        if bytes.len() != 1 {
+            return Err(PySedonaError::SedonaPython(format!(
+                "CSV delimiter must be a single byte, got {delimiter:?}"
+            )));
+        }
+
+        wait_for_future(
+            py,
+            &self.runtime,
+            self.inner
+                .clone()
+                .write_sedona_csv(&path, has_header, bytes[0]),
+        )??;
+        Ok(())
+    }
+
+    fn to_json<'py>(&self, py: Python<'py>, path: String) -> Result<(), PySedonaError> {
+        wait_for_future(
+            py,
+            &self.runtime,
+            self.inner.clone().write_sedona_json(&path),
         )??;
         Ok(())
     }

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use sedona_schema::raster::{BandDataType, RasterSchema};
 
-use crate::traits::{BandMetadata, BandOverrides, MetadataRef, RasterRef};
+use crate::traits::{BandOverrides, RasterRef};
 use crate::view_entries::{ViewEntries, ViewEntry};
 
 /// Raster-level metadata overrides for [`RasterBuilder::start_raster_from`] and
@@ -51,9 +51,9 @@ const MAX_INLINE_VIEW_LEN: u32 = 12;
 /// Required steps to build a raster:
 /// 1. Create a RasterBuilder with a specified capacity
 /// 2. For each raster to add:
-///    - Call `start_raster` with the appropriate metadata, CRS
+///    - Call `start_raster_2d` with the geotransform parameters and CRS
 ///    - For each band in the raster:
-///       - Call `start_band` with the band metadata
+///       - Call `start_band_2d` with the band data type and nodata
 ///       - Use `band_data_writer` to get a BinaryViewBuilder and write the band data
 ///       - Call `finish_band` to complete the band
 ///    - Call `finish_raster` to complete the raster
@@ -61,29 +61,17 @@ const MAX_INLINE_VIEW_LEN: u32 = 12;
 ///
 /// Example usage:
 /// ```
-/// use sedona_raster::traits::{RasterMetadata, BandMetadata};
-/// use sedona_schema::raster::{StorageType, BandDataType};
+/// use sedona_schema::raster::BandDataType;
 /// use sedona_raster::builder::RasterBuilder;
 ///
 /// let mut builder = RasterBuilder::new(1);
-/// let metadata = RasterMetadata {
-///     width: 100, height: 100,
-///     upperleft_x: 0.0, upperleft_y: 0.0,
-///     scale_x: 1.0, scale_y: -1.0,
-///     skew_x: 0.0, skew_y: 0.0,
-/// };
-/// // Start a raster from RasterMetadata struct
-/// builder.start_raster(&metadata, Some("EPSG:4326")).unwrap();
+/// // Start a 100x100 raster with a north-up geotransform.
+/// builder
+///     .start_raster_2d(100, 100, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, Some("EPSG:4326"))
+///     .unwrap();
 ///
 /// // Add a band:
-/// let band_metadata = BandMetadata {
-///     nodata_value: Some(vec![0u8]),
-///     storage_type: StorageType::InDb,
-///     datatype: BandDataType::UInt8,
-///     outdb_url: None,
-///     outdb_band_id: None,
-/// };
-/// builder.start_band(band_metadata).unwrap();
+/// builder.start_band_2d(BandDataType::UInt8, Some(&[0u8])).unwrap();
 /// let band_writer = builder.band_data_writer();
 /// band_writer.append_value(&vec![/* band data bytes */]);
 /// builder.finish_band().unwrap();
@@ -154,18 +142,39 @@ pub struct RasterBuilder {
     raster_validity: BooleanBuilder,
 }
 
-/// Arguments to [`RasterBuilder::start_band_with_view`]. Bundled into a
-/// struct to keep the call site readable — eight slots is enough that
-/// positional args invite mis-ordering bugs.
-pub(crate) struct StartBandWithViewArgs<'a> {
+/// Arguments to [`RasterBuilder::start_band`]. Bundled into a struct to keep
+/// the call site readable — eight slots is enough that positional args invite
+/// mis-ordering bugs.
+pub struct StartBandArgs<'a> {
     pub name: Option<&'a str>,
     pub dim_names: &'a [&'a str],
     pub source_shape: &'a [i64],
-    pub view: &'a [ViewEntry],
+    /// Per-axis window of offsets/steps over `source_shape`. `None` is the
+    /// canonical identity view (the whole source buffer in C order).
+    pub view: Option<&'a [ViewEntry]>,
     pub data_type: BandDataType,
     pub nodata: Option<&'a [u8]>,
     pub outdb_uri: Option<&'a str>,
     pub outdb_format: Option<&'a str>,
+}
+
+impl<'a> StartBandArgs<'a> {
+    /// The required band descriptors; the optional fields (`name`, `view`,
+    /// `nodata`, `outdb_uri`, `outdb_format`) default to `None`. Override any of
+    /// them with struct-update syntax, e.g.
+    /// `StartBandArgs { nodata: Some(&nd), ..StartBandArgs::new(dims, shape, dtype) }`.
+    pub fn new(dim_names: &'a [&'a str], source_shape: &'a [i64], data_type: BandDataType) -> Self {
+        Self {
+            name: None,
+            dim_names,
+            source_shape,
+            view: None,
+            data_type,
+            nodata: None,
+            outdb_uri: None,
+            outdb_format: None,
+        }
+    }
 }
 
 impl RasterBuilder {
@@ -269,7 +278,7 @@ impl RasterBuilder {
         self.current_raster_bands.clear();
         // Preserve legacy current_width/current_height for start_band_2d (set
         // by start_raster_2d). Callers using this direct entry point drive
-        // their own shapes via start_band_nd.
+        // their own shapes via start_band.
         self.current_width = 0;
         self.current_height = 0;
 
@@ -348,27 +357,6 @@ impl RasterBuilder {
         Ok(())
     }
 
-    /// Start a 2-D raster from a `&dyn MetadataRef`. Matches the pre-N-D
-    /// signature so callers from before the refactor keep compiling without
-    /// changing argument lists.
-    pub fn start_raster(
-        &mut self,
-        metadata: &dyn MetadataRef,
-        crs: Option<&str>,
-    ) -> Result<(), ArrowError> {
-        self.start_raster_2d(
-            metadata.width(),
-            metadata.height(),
-            metadata.upper_left_x(),
-            metadata.upper_left_y(),
-            metadata.scale_x(),
-            metadata.scale_y(),
-            metadata.skew_x(),
-            metadata.skew_y(),
-            crs,
-        )
-    }
-
     /// Start a new band with explicit N-D parameters.
     ///
     /// `outdb_uri` is the *location* of the external resource (scheme is
@@ -376,27 +364,68 @@ impl RasterBuilder {
     /// used to interpret the bytes at that location (e.g. `"geotiff"`,
     /// `"zarr"`). A null `outdb_format` means the band is in-memory — the
     /// band's `data` buffer is authoritative.
-    #[allow(clippy::too_many_arguments)]
-    pub fn start_band_nd(
-        &mut self,
-        name: Option<&str>,
-        dim_names: &[&str],
-        shape: &[i64],
-        data_type: BandDataType,
-        nodata: Option<&[u8]>,
-        outdb_uri: Option<&str>,
-        outdb_format: Option<&str>,
-    ) -> Result<(), ArrowError> {
+    ///
+    /// `view` is a per-axis window of offsets/steps over `source_shape`.
+    /// `None` is the canonical identity view — the whole source buffer in C
+    /// order — encoded as the identity null sentinel. A `Some` view is
+    /// validated against `source_shape`; the band schema stores a view only as
+    /// that identity null sentinel, so an identity `Some` view is stored the
+    /// same as `None` and a non-identity view is rejected. View persistence is
+    /// tracked in <https://github.com/apache/sedona-db/issues/897>.
+    pub fn start_band(&mut self, args: StartBandArgs<'_>) -> Result<(), ArrowError> {
+        let StartBandArgs {
+            name,
+            dim_names,
+            source_shape,
+            view,
+            data_type,
+            nodata,
+            outdb_uri,
+            outdb_format,
+        } = args;
+
+        // A caller-supplied view is validated against source_shape. The schema
+        // stores views only as the identity null sentinel today, so a
+        // non-identity view can't round-trip — reject it up front, before any
+        // column append, rather than persisting mislocated bytes.
+        if let Some(view) = view {
+            let ndim = dim_names.len();
+            if ndim == 0 {
+                return Err(ArrowError::InvalidArgumentError(
+                    "start_band: 0-dimensional bands are not supported".into(),
+                ));
+            }
+            if source_shape.len() != ndim || view.len() != ndim {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "start_band: dim_names ({}), source_shape ({}), and view ({}) \
+                     must all have the same length",
+                    ndim,
+                    source_shape.len(),
+                    view.len()
+                )));
+            }
+            let view_entries = ViewEntries::new(view.to_vec());
+            view_entries.validate(source_shape)?;
+            if !view_entries.is_identity(source_shape) {
+                return Err(ArrowError::InvalidArgumentError(
+                    "start_band: persisting a non-identity band view is not yet \
+                     supported (see https://github.com/apache/sedona-db/issues/897); \
+                     materialize the band (e.g. via RS_EnsureContiguous) first"
+                        .into(),
+                ));
+            }
+        }
+
         if dim_names.is_empty() {
             return Err(ArrowError::InvalidArgumentError(
-                "start_band_nd: 0-dimensional bands are not supported".into(),
+                "start_band: 0-dimensional bands are not supported".into(),
             ));
         }
-        if dim_names.len() != shape.len() {
+        if dim_names.len() != source_shape.len() {
             return Err(ArrowError::InvalidArgumentError(format!(
-                "start_band_nd: dim_names ({}) and shape ({}) must have the same length",
+                "start_band: dim_names ({}) and shape ({}) must have the same length",
                 dim_names.len(),
-                shape.len(),
+                source_shape.len(),
             )));
         }
         // Name
@@ -413,10 +442,10 @@ impl RasterBuilder {
         self.band_dim_names_offsets.push(next);
 
         // Shape
-        for &s in shape {
+        for &s in source_shape {
             self.band_shape_values.append_value(s);
         }
-        let next = *self.band_shape_offsets.last().unwrap() + shape.len() as i32;
+        let next = *self.band_shape_offsets.last().unwrap() + source_shape.len() as i32;
         self.band_shape_offsets.push(next);
 
         // Data type
@@ -452,73 +481,10 @@ impl RasterBuilder {
         // Record this band's dims/shape for strict validation at finish_raster.
         self.current_raster_bands.push((
             dim_names.iter().map(|s| s.to_string()).collect(),
-            shape.to_vec(),
+            source_shape.to_vec(),
         ));
 
         Ok(())
-    }
-
-    /// Start a band carrying an explicit `view` — a per-axis window of
-    /// offsets/steps over `source_shape` — rather than the implicit identity.
-    ///
-    /// This is the entry point view persistence will use, so callers such as
-    /// [`BandRef::copy_into`] route through it unchanged once persistence
-    /// lands. Today the band schema stores a view only as the canonical
-    /// identity null sentinel, so a non-identity `view` is rejected; an
-    /// identity view is stored exactly as [`Self::start_band_nd`] does. View
-    /// persistence is tracked in
-    /// <https://github.com/apache/sedona-db/issues/897>.
-    pub(crate) fn start_band_with_view(
-        &mut self,
-        args: StartBandWithViewArgs<'_>,
-    ) -> Result<(), ArrowError> {
-        let StartBandWithViewArgs {
-            name,
-            dim_names,
-            source_shape,
-            view,
-            data_type,
-            nodata,
-            outdb_uri,
-            outdb_format,
-        } = args;
-        let ndim = dim_names.len();
-        if ndim == 0 {
-            return Err(ArrowError::InvalidArgumentError(
-                "start_band_with_view: 0-dimensional bands are not supported".into(),
-            ));
-        }
-        if source_shape.len() != ndim || view.len() != ndim {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "start_band_with_view: dim_names ({}), source_shape ({}), and view ({}) \
-                 must all have the same length",
-                ndim,
-                source_shape.len(),
-                view.len()
-            )));
-        }
-        let view_entries = ViewEntries::new(view.to_vec());
-        view_entries.validate(source_shape)?;
-        // The schema stores views only as the identity null sentinel today, so a
-        // non-identity view can't round-trip — reject it up front, before any
-        // column append, rather than persisting mislocated bytes.
-        if !view_entries.is_identity(source_shape) {
-            return Err(ArrowError::InvalidArgumentError(
-                "start_band_with_view: persisting a non-identity band view is not yet \
-                 supported (see https://github.com/apache/sedona-db/issues/897); \
-                 materialize the band (e.g. via RS_EnsureContiguous) first"
-                    .into(),
-            ));
-        }
-        self.start_band_nd(
-            name,
-            dim_names,
-            source_shape,
-            data_type,
-            nodata,
-            outdb_uri,
-            outdb_format,
-        )
     }
 
     /// Convenience: start a 2D band with `dim_names=["y","x"]` and `shape=[height, width]`.
@@ -535,42 +501,14 @@ impl RasterBuilder {
                 "start_band_2d requires prior start_raster_2d (width and height are 0)".into(),
             ));
         }
-        self.start_band_nd(
-            None,
-            &["y", "x"],
-            &[self.current_height, self.current_width],
-            data_type,
+        self.start_band(StartBandArgs {
             nodata,
-            None,
-            None,
-        )
-    }
-
-    /// Start a 2-D band from a concrete [`BandMetadata`] struct. Matches
-    /// the pre-N-D signature so callers from before the refactor keep
-    /// compiling. For OutDb bands the `outdb_url` + `outdb_band_id` are
-    /// recombined into the SedonaDB `<url>#band=N` URI convention.
-    pub fn start_band(&mut self, metadata: BandMetadata) -> Result<(), ArrowError> {
-        if self.current_width == 0 && self.current_height == 0 {
-            return Err(ArrowError::InvalidArgumentError(
-                "start_band requires prior start_raster / start_raster_2d (width and height are 0)"
-                    .into(),
-            ));
-        }
-        let outdb_uri = match (metadata.outdb_url.as_deref(), metadata.outdb_band_id) {
-            (Some(url), Some(band_id)) => Some(format!("{url}#band={band_id}")),
-            (Some(url), None) => Some(url.to_string()),
-            _ => None,
-        };
-        self.start_band_nd(
-            None,
-            &["y", "x"],
-            &[self.current_height, self.current_width],
-            metadata.datatype,
-            metadata.nodata_value.as_deref(),
-            outdb_uri.as_deref(),
-            None,
-        )
+            ..StartBandArgs::new(
+                &["y", "x"],
+                &[self.current_height, self.current_width],
+                data_type,
+            )
+        })
     }
 
     /// Get direct access to the BinaryViewBuilder for writing the current band's data.
@@ -655,13 +593,13 @@ impl RasterBuilder {
 
     /// Finish writing the current band.
     ///
-    /// Validates that exactly one data value was appended since `start_band_nd()`.
+    /// Validates that exactly one data value was appended since `start_band()`.
     pub fn finish_band(&mut self) -> Result<(), ArrowError> {
         let current_count = self.band_data.len();
         if current_count != self.band_data_count_at_start + 1 {
             return Err(ArrowError::InvalidArgumentError(
                 format!(
-                    "Expected exactly one band data value per band, but got {} appended since start_band_nd()",
+                    "Expected exactly one band data value per band, but got {} appended since start_band()",
                     current_count - self.band_data_count_at_start
                 ),
             ));
@@ -903,12 +841,11 @@ impl RasterBuilder {
 mod tests {
     use super::*;
     use crate::array::RasterStructArray;
-    use crate::traits::{RasterMetadata, RasterRef};
+    use crate::traits::RasterRef;
     use arrow_array::RecordBatch;
     use arrow_ipc::reader::StreamReader;
     use arrow_ipc::writer::StreamWriter;
     use arrow_schema::Schema;
-    use sedona_schema::raster::StorageType;
     use std::io::Cursor;
 
     #[test]
@@ -916,30 +853,15 @@ mod tests {
         // Create a simple raster for testing using the correct API
         let mut builder = RasterBuilder::new(10); // capacity
 
-        let metadata = RasterMetadata {
-            width: 10,
-            height: 10,
-            upperleft_x: 0.0,
-            upperleft_y: 0.0,
-            scale_x: 1.0,
-            scale_y: -1.0,
-            skew_x: 0.0,
-            skew_y: 0.0,
-        };
-
         let epsg4326 = "EPSG:4326";
-        builder.start_raster(&metadata, Some(epsg4326)).unwrap();
-
-        let band_metadata = BandMetadata {
-            nodata_value: Some(vec![255u8]),
-            storage_type: StorageType::InDb,
-            datatype: BandDataType::UInt8,
-            outdb_url: None,
-            outdb_band_id: None,
-        };
+        builder
+            .start_raster_2d(10, 10, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, Some(epsg4326))
+            .unwrap();
 
         // Add a single band with some test data using the correct API
-        builder.start_band(band_metadata.clone()).unwrap();
+        builder
+            .start_band_2d(BandDataType::UInt8, Some(&[255u8]))
+            .unwrap();
         let test_data = vec![1u8; 100]; // 10x10 raster with value 1
         builder.band_data_writer().append_value(&test_data);
         builder.finish_band().unwrap();
@@ -955,34 +877,31 @@ mod tests {
         assert!(!rasters.is_empty());
 
         let raster = rasters.get(0).unwrap();
-        let metadata = raster.metadata();
 
-        assert_eq!(metadata.width(), 10);
-        assert_eq!(metadata.height(), 10);
-        assert_eq!(metadata.scale_x(), 1.0);
-        assert_eq!(metadata.scale_y(), -1.0);
+        assert_eq!(raster.width().unwrap(), 10);
+        assert_eq!(raster.height().unwrap(), 10);
+        assert_eq!(raster.transform()[1], 1.0);
+        assert_eq!(raster.transform()[5], -1.0);
 
-        let bands = raster.bands();
-        assert_eq!(bands.len(), 1);
-        assert!(!bands.is_empty());
+        assert_eq!(raster.num_bands(), 1);
+        assert_ne!(raster.num_bands(), 0);
 
-        // Access band with 1-based band_number
-        let band = bands.band(1).unwrap();
+        // Bands are 0-based.
+        let band = raster.band(0).unwrap();
         assert_eq!(
             band.nd_buffer().unwrap().as_contiguous().unwrap().len(),
             100
         );
         assert_eq!(band.nd_buffer().unwrap().as_contiguous().unwrap()[0], 1u8);
 
-        let band_meta = band.metadata();
-        assert_eq!(band_meta.storage_type().unwrap(), StorageType::InDb);
-        assert_eq!(band_meta.data_type().unwrap(), BandDataType::UInt8);
+        assert!(band.is_indb());
+        assert_eq!(band.data_type(), BandDataType::UInt8);
 
         let crs = raster.crs().unwrap();
         assert_eq!(crs, epsg4326);
 
         // Test iterator over bands
-        let band_iter: Vec<_> = bands.iter().collect();
+        let band_iter: Vec<_> = (0..raster.num_bands()).map(|i| raster.band(i)).collect();
         assert_eq!(band_iter.len(), 1);
     }
 
@@ -990,30 +909,15 @@ mod tests {
     fn test_multi_band_iterator() {
         let mut builder = RasterBuilder::new(3);
 
-        let metadata = RasterMetadata {
-            width: 5,
-            height: 5,
-            upperleft_x: 0.0,
-            upperleft_y: 0.0,
-            scale_x: 1.0,
-            scale_y: -1.0,
-            skew_x: 0.0,
-            skew_y: 0.0,
-        };
-
-        builder.start_raster(&metadata, None).unwrap();
+        builder
+            .start_raster_2d(5, 5, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, None)
+            .unwrap();
 
         // Add three bands using the correct API
         for band_idx in 0..3 {
-            let band_metadata = BandMetadata {
-                nodata_value: Some(vec![255u8]),
-                storage_type: StorageType::InDb,
-                datatype: BandDataType::UInt8,
-                outdb_url: None,
-                outdb_band_id: None,
-            };
-
-            builder.start_band(band_metadata).unwrap();
+            builder
+                .start_band_2d(BandDataType::UInt8, Some(&[255u8]))
+                .unwrap();
             let test_data = vec![band_idx as u8; 25]; // 5x5 raster
             builder.band_data_writer().append_value(&test_data);
             builder.finish_band().unwrap();
@@ -1026,15 +930,12 @@ mod tests {
 
         let rasters = RasterStructArray::try_new(&raster_array).unwrap();
         let raster = rasters.get(0).unwrap();
-        let bands = raster.bands();
 
-        assert_eq!(bands.len(), 3);
+        assert_eq!(raster.num_bands(), 3);
 
-        // Test each band has different data
-        // Use 1-based band numbers
+        // Test each band has different data (bands are 0-based).
         for i in 0..3 {
-            // Access band with 1-based band_number
-            let band = bands.band(i + 1).unwrap();
+            let band = raster.band(i).unwrap();
             let expected_value = i as u8;
             assert!(band
                 .nd_buffer()
@@ -1046,8 +947,8 @@ mod tests {
         }
 
         // Test iterator
-        let band_values: Vec<u8> = bands
-            .iter()
+        let band_values: Vec<u8> = (0..raster.num_bands())
+            .map(|i| raster.band(i))
             .enumerate()
             .map(|(i, band)| {
                 let band = band.unwrap();
@@ -1067,30 +968,13 @@ mod tests {
         // Create an original raster
         let mut source_builder = RasterBuilder::new(10);
 
-        let original_metadata = RasterMetadata {
-            width: 42,
-            height: 24,
-            upperleft_x: -122.0,
-            upperleft_y: 37.8,
-            scale_x: 0.1,
-            scale_y: -0.1,
-            skew_x: 0.0,
-            skew_y: 0.0,
-        };
-
         source_builder
-            .start_raster(&original_metadata, None)
+            .start_raster_2d(42, 24, -122.0, 37.8, 0.1, -0.1, 0.0, 0.0, None)
             .unwrap();
 
-        let band_metadata = BandMetadata {
-            nodata_value: Some(vec![255u8]),
-            storage_type: StorageType::InDb,
-            datatype: BandDataType::UInt8,
-            outdb_url: None,
-            outdb_band_id: None,
-        };
-
-        source_builder.start_band(band_metadata).unwrap();
+        source_builder
+            .start_band_2d(BandDataType::UInt8, Some(&[255u8]))
+            .unwrap();
         let test_data = vec![42u8; 1008]; // 42x24 raster
         source_builder.band_data_writer().append_value(&test_data);
         source_builder.finish_band().unwrap();
@@ -1104,19 +988,22 @@ mod tests {
         let source_raster = iterator.get(0).unwrap();
 
         target_builder
-            .start_raster(&source_raster.metadata(), source_raster.crs())
+            .start_raster_from(&source_raster, RasterOverrides::default())
             .unwrap();
 
-        // Add new band data while preserving original metadata
-        let new_band_metadata = BandMetadata {
-            nodata_value: None,
-            storage_type: StorageType::InDb,
-            datatype: BandDataType::UInt16,
-            outdb_url: None,
-            outdb_band_id: None,
-        };
-
-        target_builder.start_band(new_band_metadata).unwrap();
+        // Add new band data while preserving original metadata. `start_raster_from`
+        // copies the N-D spatial grid, so add the band with an explicit shape
+        // matching the source's [height, width].
+        target_builder
+            .start_band(StartBandArgs::new(
+                &["y", "x"],
+                &[
+                    source_raster.height().unwrap(),
+                    source_raster.width().unwrap(),
+                ],
+                BandDataType::UInt16,
+            ))
+            .unwrap();
         let new_data = vec![100u16; 1008]; // Different data, same dimensions
         let new_data_bytes: Vec<u8> = new_data.iter().flat_map(|&x| x.to_le_bytes()).collect();
 
@@ -1131,21 +1018,19 @@ mod tests {
         // Verify the metadata was copied correctly
         let target_iterator = RasterStructArray::try_new(&target_array).unwrap();
         let target_raster = target_iterator.get(0).unwrap();
-        let target_metadata = target_raster.metadata();
 
         // All metadata should match the original
-        assert_eq!(target_metadata.width(), 42);
-        assert_eq!(target_metadata.height(), 24);
-        assert_eq!(target_metadata.upper_left_x(), -122.0);
-        assert_eq!(target_metadata.upper_left_y(), 37.8);
-        assert_eq!(target_metadata.scale_x(), 0.1);
-        assert_eq!(target_metadata.scale_y(), -0.1);
+        assert_eq!(target_raster.width().unwrap(), 42);
+        assert_eq!(target_raster.height().unwrap(), 24);
+        assert_eq!(target_raster.transform()[0], -122.0);
+        assert_eq!(target_raster.transform()[3], 37.8);
+        assert_eq!(target_raster.transform()[1], 0.1);
+        assert_eq!(target_raster.transform()[5], -0.1);
 
         // But band data and metadata should be different
-        let target_band = target_raster.bands().band(1).unwrap();
-        let target_band_meta = target_band.metadata();
-        assert_eq!(target_band_meta.data_type().unwrap(), BandDataType::UInt16);
-        assert!(target_band_meta.nodata_value().is_none());
+        let target_band = target_raster.band(0).unwrap();
+        assert_eq!(target_band.data_type(), BandDataType::UInt16);
+        assert!(target_band.nodata().is_none());
         assert_eq!(
             target_band
                 .nd_buffer()
@@ -1156,11 +1041,8 @@ mod tests {
             2016
         ); // 1008 * 2 bytes per u16
 
-        let result = target_raster.bands().band(0);
-        assert!(result.is_err(), "Band number 0 should be invalid");
-
-        let result = target_raster.bands().band(2);
-        assert!(result.is_err(), "Band number 2 should be out of range");
+        let result = target_raster.band(1);
+        assert!(result.is_err(), "Band index 1 should be out of range");
     }
 
     #[test]
@@ -1200,18 +1082,9 @@ mod tests {
         // Create a test raster with bands of different data types
         let mut builder = RasterBuilder::new(1);
 
-        let metadata = RasterMetadata {
-            width: 2,
-            height: 2,
-            upperleft_x: 0.0,
-            upperleft_y: 0.0,
-            scale_x: 1.0,
-            scale_y: -1.0,
-            skew_x: 0.0,
-            skew_y: 0.0,
-        };
-
-        builder.start_raster(&metadata, None).unwrap();
+        builder
+            .start_raster_2d(2, 2, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, None)
+            .unwrap();
 
         // Test all BandDataType variants
         let test_cases = vec![
@@ -1271,15 +1144,7 @@ mod tests {
         ];
 
         for (expected_data_type, test_data) in test_cases {
-            let band_metadata = BandMetadata {
-                nodata_value: None,
-                storage_type: StorageType::InDb,
-                datatype: expected_data_type,
-                outdb_url: None,
-                outdb_band_id: None,
-            };
-
-            builder.start_band(band_metadata).unwrap();
+            builder.start_band_2d(expected_data_type, None).unwrap();
             builder.band_data_writer().append_value(&test_data);
             builder.finish_band().unwrap();
         }
@@ -1290,9 +1155,12 @@ mod tests {
         // Test the data type conversion for each band
         let iterator = RasterStructArray::try_new(&raster_array).unwrap();
         let raster = iterator.get(0).unwrap();
-        let bands = raster.bands();
 
-        assert_eq!(bands.len(), 10, "Expected 10 bands for all data types");
+        assert_eq!(
+            raster.num_bands(),
+            10,
+            "Expected 10 bands for all data types"
+        );
 
         // Verify each band returns the correct data type
         let expected_types = [
@@ -1310,10 +1178,8 @@ mod tests {
 
         // i is zero-based index
         for (i, expected_type) in expected_types.iter().enumerate() {
-            // Bands are 1-based band_number
-            let band = bands.band(i + 1).unwrap();
-            let band_metadata = band.metadata();
-            let actual_type = band_metadata.data_type().unwrap();
+            let band = raster.band(i).unwrap();
+            let actual_type = band.data_type();
 
             assert_eq!(
                 actual_type, *expected_type,
@@ -1327,43 +1193,26 @@ mod tests {
         // Test creating raster with OutDb reference metadata
         let mut builder = RasterBuilder::new(10);
 
-        let metadata = RasterMetadata {
-            width: 1024,
-            height: 1024,
-            upperleft_x: 0.0,
-            upperleft_y: 0.0,
-            scale_x: 1.0,
-            scale_y: -1.0,
-            skew_x: 0.0,
-            skew_y: 0.0,
-        };
-
-        builder.start_raster(&metadata, None).unwrap();
+        builder
+            .start_raster_2d(1024, 1024, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, None)
+            .unwrap();
 
         // Test InDb band (should have null OutDb fields)
-        let indb_band_metadata = BandMetadata {
-            nodata_value: Some(vec![255u8]),
-            storage_type: StorageType::InDb,
-            datatype: BandDataType::UInt8,
-            outdb_url: None,
-            outdb_band_id: None,
-        };
-
-        builder.start_band(indb_band_metadata).unwrap();
+        builder
+            .start_band_2d(BandDataType::UInt8, Some(&[255u8]))
+            .unwrap();
         let test_data = vec![1u8; 100];
         builder.band_data_writer().append_value(&test_data);
         builder.finish_band().unwrap();
 
-        // Test OutDbRef band (should have OutDb fields populated)
-        let outdb_band_metadata = BandMetadata {
-            nodata_value: None,
-            storage_type: StorageType::OutDbRef,
-            datatype: BandDataType::Float32,
-            outdb_url: Some("s3://mybucket/satellite_image.tif".to_string()),
-            outdb_band_id: Some(2),
-        };
-
-        builder.start_band(outdb_band_metadata).unwrap();
+        // Test OutDbRef band: an out-db location is carried as an `outdb_uri`
+        // with the SedonaDB `#band=N` fragment; the band's own `data` is empty.
+        builder
+            .start_band(StartBandArgs {
+                outdb_uri: Some("s3://mybucket/satellite_image.tif#band=2"),
+                ..StartBandArgs::new(&["y", "x"], &[1024, 1024], BandDataType::Float32)
+            })
+            .unwrap();
         // For OutDbRef, data field could be empty or contain metadata/thumbnail
         builder.band_data_writer().append_value([]);
         builder.finish_band().unwrap();
@@ -1374,33 +1223,23 @@ mod tests {
         // Verify the band metadata
         let iterator = RasterStructArray::try_new(&raster_array).unwrap();
         let raster = iterator.get(0).unwrap();
-        let bands = raster.bands();
 
-        assert_eq!(bands.len(), 2);
+        assert_eq!(raster.num_bands(), 2);
 
         // Test InDb band
-        let indb_band = bands.band(1).unwrap();
-        let indb_metadata = indb_band.metadata();
-        assert_eq!(indb_metadata.storage_type().unwrap(), StorageType::InDb);
-        assert_eq!(indb_metadata.data_type().unwrap(), BandDataType::UInt8);
-        assert!(indb_metadata.outdb_url().is_none());
-        assert!(indb_metadata.outdb_band_id().is_none());
+        let indb_band = raster.band(0).unwrap();
         assert!(indb_band.is_indb());
+        assert_eq!(indb_band.data_type(), BandDataType::UInt8);
+        assert!(indb_band.outdb_uri().is_none());
 
         // Test OutDbRef band
-        let outdb_band = bands.band(2).unwrap();
-        let outdb_metadata = outdb_band.metadata();
-        assert_eq!(
-            outdb_metadata.storage_type().unwrap(),
-            StorageType::OutDbRef
-        );
-        assert_eq!(outdb_metadata.data_type().unwrap(), BandDataType::Float32);
-        assert_eq!(
-            outdb_metadata.outdb_url().unwrap(),
-            "s3://mybucket/satellite_image.tif"
-        );
-        assert_eq!(outdb_metadata.outdb_band_id().unwrap(), 2);
+        let outdb_band = raster.band(1).unwrap();
         assert!(!outdb_band.is_indb());
+        assert_eq!(outdb_band.data_type(), BandDataType::Float32);
+        assert_eq!(
+            outdb_band.outdb_uri().unwrap(),
+            "s3://mybucket/satellite_image.tif#band=2"
+        );
     }
 
     #[test]
@@ -1408,28 +1247,11 @@ mod tests {
         // Create a simple raster with one band
         let mut builder = RasterBuilder::new(1);
 
-        let metadata = RasterMetadata {
-            width: 10,
-            height: 10,
-            upperleft_x: 0.0,
-            upperleft_y: 0.0,
-            scale_x: 1.0,
-            scale_y: -1.0,
-            skew_x: 0.0,
-            skew_y: 0.0,
-        };
+        builder
+            .start_raster_2d(10, 10, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, None)
+            .unwrap();
 
-        builder.start_raster(&metadata, None).unwrap();
-
-        let band_metadata = BandMetadata {
-            nodata_value: None,
-            storage_type: StorageType::InDb,
-            datatype: BandDataType::UInt8,
-            outdb_url: None,
-            outdb_band_id: None,
-        };
-
-        builder.start_band(band_metadata).unwrap();
+        builder.start_band_2d(BandDataType::UInt8, None).unwrap();
         builder.band_data_writer().append_value([1u8; 100]);
         builder.finish_band().unwrap();
         builder.finish_raster().unwrap();
@@ -1437,22 +1259,16 @@ mod tests {
         let raster_array = builder.finish().unwrap();
         let iterator = RasterStructArray::try_new(&raster_array).unwrap();
         let raster = iterator.get(0).unwrap();
-        let bands = raster.bands();
 
-        // Test invalid band number (0-based)
-        let result = bands.band(0);
-        assert!(result.is_err());
-        let err = result.err().unwrap().to_string();
-        assert!(err.contains("band numbers must be 1-based"));
-
-        // Test out of range band number
-        let result = bands.band(2);
+        // Test out of range band number (bands are 0-based, so index 1 is out
+        // of range for this single-band raster)
+        let result = raster.band(1);
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
         assert!(err.contains("is out of range"));
 
         // Test valid band number should still work
-        let result = bands.band(1);
+        let result = raster.band(0);
         assert!(result.is_ok());
         let band = result.unwrap();
         assert_eq!(
@@ -1578,15 +1394,10 @@ mod tests {
 
         // 3D band: [time=3, y=4, x=5]
         builder
-            .start_band_nd(
-                Some("temperature"),
-                &["time", "y", "x"],
-                &[3, 4, 5],
-                BandDataType::Float32,
-                None,
-                None,
-                None,
-            )
+            .start_band(StartBandArgs {
+                name: Some("temperature"),
+                ..StartBandArgs::new(&["time", "y", "x"], &[3, 4, 5], BandDataType::Float32)
+            })
             .unwrap();
         let data = vec![0u8; 3 * 4 * 5 * 4]; // 3*4*5 Float32 elements
         builder.band_data_writer().append_value(&data);
@@ -1627,15 +1438,14 @@ mod tests {
             )
             .unwrap();
         builder
-            .start_band_nd(
-                Some("sst"),
-                &["latitude", "longitude"],
-                &[180, 360],
-                BandDataType::Float32,
-                None,
-                None,
-                None,
-            )
+            .start_band(StartBandArgs {
+                name: Some("sst"),
+                ..StartBandArgs::new(
+                    &["latitude", "longitude"],
+                    &[180, 360],
+                    BandDataType::Float32,
+                )
+            })
             .unwrap();
         let data = vec![0u8; 180 * 360 * 4];
         builder.band_data_writer().append_value(&data);
@@ -1664,15 +1474,10 @@ mod tests {
 
         // Band 0: 3D [time=12, y=64, x=64]
         builder
-            .start_band_nd(
-                Some("temperature"),
-                &["time", "y", "x"],
-                &[12, 64, 64],
-                BandDataType::Float32,
-                None,
-                None,
-                None,
-            )
+            .start_band(StartBandArgs {
+                name: Some("temperature"),
+                ..StartBandArgs::new(&["time", "y", "x"], &[12, 64, 64], BandDataType::Float32)
+            })
             .unwrap();
         let data_3d = vec![0u8; 12 * 64 * 64 * 4];
         builder.band_data_writer().append_value(&data_3d);
@@ -1680,15 +1485,10 @@ mod tests {
 
         // Band 1: 2D [y=64, x=64]
         builder
-            .start_band_nd(
-                Some("elevation"),
-                &["y", "x"],
-                &[64, 64],
-                BandDataType::Float64,
-                None,
-                None,
-                None,
-            )
+            .start_band(StartBandArgs {
+                name: Some("elevation"),
+                ..StartBandArgs::new(&["y", "x"], &[64, 64], BandDataType::Float64)
+            })
             .unwrap();
         let data_2d = vec![0u8; 64 * 64 * 8];
         builder.band_data_writer().append_value(&data_2d);
@@ -1725,15 +1525,11 @@ mod tests {
             .start_raster_nd(&transform, &["x", "y"], &[32, 32], None)
             .unwrap();
         builder
-            .start_band_nd(
-                None,
+            .start_band(StartBandArgs::new(
                 &["time", "pressure", "y", "x"],
                 &[6, 10, 32, 32],
                 BandDataType::Float32,
-                None,
-                None,
-                None,
-            )
+            ))
             .unwrap();
         let data = vec![0u8; 6 * 10 * 32 * 32 * 4];
         builder.band_data_writer().append_value(&data);
@@ -1793,15 +1589,11 @@ mod tests {
             .start_raster_nd(&transform, &["x", "y"], &[4, 3], None)
             .unwrap();
         builder
-            .start_band_nd(
-                None,
+            .start_band(StartBandArgs::new(
                 &["y", "x"],
                 &[3, 4],
                 BandDataType::UInt8,
-                None,
-                None,
-                None,
-            )
+            ))
             .unwrap();
         builder.band_data_writer().append_value(vec![0u8; 12]);
         builder.finish_band().unwrap();
@@ -1812,15 +1604,11 @@ mod tests {
             .start_raster_nd(&transform, &["x", "y"], &[5, 3], None)
             .unwrap();
         builder
-            .start_band_nd(
-                None,
+            .start_band(StartBandArgs::new(
                 &["z", "y", "x"],
                 &[2, 3, 5],
                 BandDataType::Float64,
-                None,
-                None,
-                None,
-            )
+            ))
             .unwrap();
         builder
             .band_data_writer()
@@ -1834,7 +1622,7 @@ mod tests {
             .start_raster_nd(&transform, &["x"], &[10], None)
             .unwrap();
         builder
-            .start_band_nd(None, &["x"], &[10], BandDataType::UInt16, None, None, None)
+            .start_band(StartBandArgs::new(&["x"], &[10], BandDataType::UInt16))
             .unwrap();
         builder.band_data_writer().append_value(vec![0u8; 20]);
         builder.finish_band().unwrap();
@@ -1887,15 +1675,10 @@ mod tests {
 
         // Named band
         builder
-            .start_band_nd(
-                Some("temperature"),
-                &["y", "x"],
-                &[4, 4],
-                BandDataType::Float32,
-                None,
-                None,
-                None,
-            )
+            .start_band(StartBandArgs {
+                name: Some("temperature"),
+                ..StartBandArgs::new(&["y", "x"], &[4, 4], BandDataType::Float32)
+            })
             .unwrap();
         builder.band_data_writer().append_value(vec![0u8; 64]);
         builder.finish_band().unwrap();
@@ -1925,15 +1708,11 @@ mod tests {
             .start_raster_nd(&transform, &["longitude", "latitude"], &[360, 180], None)
             .unwrap();
         builder
-            .start_band_nd(
-                None,
+            .start_band(StartBandArgs::new(
                 &["latitude", "longitude"],
                 &[180, 360],
                 BandDataType::UInt8,
-                None,
-                None,
-                None,
-            )
+            ))
             .unwrap();
         builder
             .band_data_writer()
@@ -1985,7 +1764,7 @@ mod tests {
             .unwrap();
         // Band is missing "y" entirely.
         builder
-            .start_band_nd(None, &["x"], &[4], BandDataType::UInt8, None, None, None)
+            .start_band(StartBandArgs::new(&["x"], &[4], BandDataType::UInt8))
             .unwrap();
         builder.band_data_writer().append_value(vec![0u8; 4]);
         builder.finish_band().unwrap();
@@ -2000,13 +1779,13 @@ mod tests {
     #[test]
     fn test_start_band_rejects_zero_dim() {
         // 0-D bands carry no spatial extent and no caller has a use for
-        // them. start_band_nd must reject an empty dim_names slice eagerly so
+        // them. start_band must reject an empty dim_names slice eagerly so
         // the malformed band never reaches the buffer layer.
         let mut builder = RasterBuilder::new(1);
         let transform = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
         builder.start_raster_nd(&transform, &[], &[], None).unwrap();
         let err = builder
-            .start_band_nd(None, &[], &[], BandDataType::UInt8, None, None, None)
+            .start_band(StartBandArgs::new(&[], &[], BandDataType::UInt8))
             .unwrap_err();
         assert!(
             err.to_string().contains("0-dimensional"),
@@ -2025,15 +1804,11 @@ mod tests {
             .start_raster_nd(&transform, &["x", "y"], &[3, 2], None)
             .unwrap();
         builder
-            .start_band_nd(
-                None,
+            .start_band(StartBandArgs::new(
                 &["y", "x"],
                 &[2, 3],
                 BandDataType::UInt8,
-                None,
-                None,
-                None,
-            )
+            ))
             .unwrap();
         let pixels: Vec<u8> = (0..6).collect();
         builder.band_data_writer().append_value(pixels.clone());
@@ -2069,15 +1844,11 @@ mod tests {
             .start_raster_nd(&transform, &["x", "y"], &[2, 2], None)
             .unwrap();
         builder
-            .start_band_nd(
-                None,
+            .start_band(StartBandArgs::new(
                 &["y", "x"],
                 &[2, 2],
                 BandDataType::UInt8,
-                None,
-                None,
-                None,
-            )
+            ))
             .unwrap();
         builder.band_data_writer().append_value(vec![0u8; 4]);
         builder.finish_band().unwrap();
@@ -2115,15 +1886,11 @@ mod tests {
             .unwrap();
         // Band has "x" and "y" but x-size disagrees with top-level shape.
         builder
-            .start_band_nd(
-                None,
+            .start_band(StartBandArgs::new(
                 &["y", "x"],
                 &[4, 8],
                 BandDataType::UInt8,
-                None,
-                None,
-                None,
-            )
+            ))
             .unwrap();
         builder.band_data_writer().append_value(vec![0u8; 32]);
         builder.finish_band().unwrap();
@@ -2138,7 +1905,7 @@ mod tests {
 
     #[test]
     fn test_view_null_round_trips_through_arrow_ipc() {
-        // Schema invariant: a band built via start_band_nd serialises with a
+        // Schema invariant: a band built via start_band serialises with a
         // null view row, and the null must survive an Arrow IPC round-trip.
         // If a future change accidentally writes a non-null empty list
         // instead, downstream readers (DuckDB, PyArrow, sedona-py) will
@@ -2150,15 +1917,11 @@ mod tests {
             .start_raster_nd(&transform, &["x", "y"], &[3, 2], None)
             .unwrap();
         builder
-            .start_band_nd(
-                None,
+            .start_band(StartBandArgs::new(
                 &["y", "x"],
                 &[2, 3],
                 BandDataType::UInt8,
-                None,
-                None,
-                None,
-            )
+            ))
             .unwrap();
         builder.band_data_writer().append_value(vec![0u8; 6]);
         builder.finish_band().unwrap();

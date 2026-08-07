@@ -17,10 +17,25 @@
 
 use std::borrow::Cow;
 
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::{exec_datafusion_err, exec_err, DataFusionError, Result};
 use sedona_geometry::transform::{transform, CrsEngine};
 use sedona_schema::crs::{deserialize_crs, CoordinateReferenceSystem, Crs, CrsRef};
 use wkb::reader::read_wkb;
+
+/// Run `f` with the session's CRS engine: the `SedonaOptions` runtime engine
+/// when config options are available (the query path), falling back to the
+/// default engine (which errors when no engine is registered) otherwise (e.g.
+/// direct `invoke_batch` calls).
+///
+/// The engine resolution lives in `sedona-common` so that geometry and raster
+/// CRS functions can share it; this is a thin re-export for raster call sites.
+pub fn with_crs_engine<T>(
+    config_options: Option<&ConfigOptions>,
+    f: impl FnOnce(&dyn CrsEngine) -> Result<T>,
+) -> Result<T> {
+    sedona_common::option::with_crs_engine(config_options, f)
+}
 
 /// Resolve an optional CRS string to a concrete CRS object.
 ///
@@ -137,11 +152,11 @@ mod tests {
     fn align_wkb_borrows_when_crses_are_missing_or_equal() {
         let wkb = sample_wkb();
         with_global_proj_engine(|engine| {
-            let source = resolve_crs(Some("EPSG:4326"))?;
-            let target = resolve_crs(Some("EPSG:4326"))?;
+            let source = resolve_crs(Some("EPSG:4326")).unwrap();
+            let target = resolve_crs(Some("EPSG:4326")).unwrap();
 
             assert!(matches!(
-                align_wkb_to_crs(&wkb, None, None, "source", "target", engine)?,
+                align_wkb_to_crs(&wkb, None, None, "source", "target", engine).unwrap(),
                 Cow::Borrowed(_)
             ));
             assert!(matches!(
@@ -152,7 +167,8 @@ mod tests {
                     "source",
                     "target",
                     engine,
-                )?,
+                )
+                .unwrap(),
                 Cow::Borrowed(_)
             ));
             Ok(())
@@ -164,8 +180,8 @@ mod tests {
     fn align_wkb_owns_transformed_coordinates() {
         let wkb = sample_wkb();
         with_global_proj_engine(|engine| {
-            let source = resolve_crs(Some("EPSG:4326"))?;
-            let target = resolve_crs(Some("EPSG:3857"))?;
+            let source = resolve_crs(Some("EPSG:4326")).unwrap();
+            let target = resolve_crs(Some("EPSG:3857")).unwrap();
             let aligned = align_wkb_to_crs(
                 &wkb,
                 source.as_deref(),
@@ -173,7 +189,8 @@ mod tests {
                 "source",
                 "target",
                 engine,
-            )?;
+            )
+            .unwrap();
             assert!(matches!(aligned, Cow::Owned(_)));
             assert_ne!(aligned.as_ref(), wkb);
             Ok(())
@@ -185,7 +202,7 @@ mod tests {
     fn align_wkb_errors_when_only_one_crs_is_present() {
         let wkb = sample_wkb();
         with_global_proj_engine(|engine| {
-            let crs = resolve_crs(Some("EPSG:4326"))?;
+            let crs = resolve_crs(Some("EPSG:4326")).unwrap();
             assert!(align_wkb_to_crs(
                 &wkb,
                 crs.as_deref(),

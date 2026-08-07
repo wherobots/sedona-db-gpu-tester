@@ -21,13 +21,8 @@ use datafusion_common::error::Result;
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::builder::RasterBuilder;
-use sedona_raster::traits::BandMetadata;
-use sedona_raster::traits::RasterMetadata;
 use sedona_schema::{
-    crs::lnglat,
-    datatypes::SedonaType,
-    matchers::ArgMatcher,
-    raster::{BandDataType, StorageType},
+    crs::lnglat, datatypes::SedonaType, matchers::ArgMatcher, raster::BandDataType,
 };
 
 /// RS_Example() scalar UDF implementation
@@ -60,30 +55,15 @@ impl SedonaScalarKernel for RsExample {
         let executor = RasterExecutor::new(arg_types, args);
         let mut builder = RasterBuilder::new(1);
 
-        let raster_metadata = RasterMetadata {
-            width: 64,
-            height: 32,
-            upperleft_x: 43.08,
-            upperleft_y: 79.07,
-            scale_x: 2.0,
-            scale_y: 2.0,
-            skew_x: 1.0,
-            skew_y: 1.0,
-        };
+        let width: i64 = 64;
+        let height: i64 = 32;
         let crs = lnglat().unwrap().to_crs_string();
-        builder.start_raster(&raster_metadata, Some(&crs))?;
+        builder.start_raster_2d(width, height, 43.08, 79.07, 2.0, 2.0, 1.0, 1.0, Some(&crs))?;
         let nodata_value = 127u8;
         for band_id in 1..=3 {
-            builder.start_band(BandMetadata {
-                datatype: BandDataType::UInt8,
-                nodata_value: Some(vec![nodata_value]),
-                storage_type: StorageType::InDb,
-                outdb_url: None,
-                outdb_band_id: None,
-            })?;
+            builder.start_band_2d(BandDataType::UInt8, Some(&[nodata_value]))?;
 
-            let mut band_data =
-                vec![band_id as u8; (raster_metadata.width * raster_metadata.height) as usize];
+            let mut band_data = vec![band_id as u8; (width * height) as usize];
             band_data[0] = nodata_value; // set the top corner to nodata
 
             builder.band_data_writer().append_value(&band_data);
@@ -98,10 +78,8 @@ impl SedonaScalarKernel for RsExample {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion_common::ScalarValue;
     use datafusion_expr::ScalarUDF;
-    use sedona_raster::array::RasterStructArray;
-    use sedona_raster::traits::RasterRef;
+    use sedona_testing::raster_spec::{assert_raster_scalar_equals, RasterSpec};
 
     #[test]
     fn udf_size() {
@@ -116,23 +94,19 @@ mod tests {
         let arg_types = vec![];
 
         let result = kernel.invoke_batch(&arg_types, &args).unwrap();
-        if let ColumnarValue::Scalar(ScalarValue::Struct(arc_struct)) = result {
-            let raster_array = RasterStructArray::try_new(arc_struct.as_ref()).unwrap();
-
-            assert_eq!(raster_array.len(), 1);
-            let raster = raster_array.get(0).unwrap();
-            let metadata = raster.metadata();
-            assert_eq!(metadata.width(), 64);
-            assert_eq!(metadata.height(), 32);
-
-            let bands = raster.bands();
-            let band = bands.band(1).unwrap();
-            let band_metadata = band.metadata();
-            assert_eq!(band_metadata.data_type().unwrap(), BandDataType::UInt8);
-            assert_eq!(band_metadata.nodata_value(), Some(&[127u8][..]));
-            assert_eq!(band_metadata.storage_type().unwrap(), StorageType::InDb);
-        } else {
+        let ColumnarValue::Scalar(scalar) = result else {
             panic!("Expected scalar struct result");
+        };
+
+        // RS_Example builds a 64x32, 3-band UInt8 raster with origin
+        // (43.08, 79.07), scale 2, skew 1, nodata 127. Every pixel of band N
+        // is N except the top-left corner, which is set to the nodata value.
+        let mut expected = RasterSpec::d2(64, 32).transform([43.08, 2.0, 1.0, 79.07, 1.0, 2.0]);
+        for band_id in 1u8..=3 {
+            let mut band_data = vec![band_id; 64 * 32];
+            band_data[0] = 127;
+            expected = expected.band_values(&band_data).nodata(127u8);
         }
+        assert_raster_scalar_equals(&scalar, &expected);
     }
 }

@@ -160,6 +160,26 @@ pub enum BandDataType {
 }
 
 impl BandDataType {
+    /// The minimum representable value of this data type, as the little-endian
+    /// bytes of the type itself. Conventionally used as a nodata sentinel when
+    /// no explicit nodata is available — never a silent 0, which would be
+    /// indistinguishable from real zero-valued pixels. Byte form (rather than
+    /// `f64`) so `Int64`/`UInt64` minima stay exact.
+    pub fn min_value_le_bytes(&self) -> Vec<u8> {
+        match self {
+            BandDataType::UInt8 => u8::MIN.to_le_bytes().to_vec(),
+            BandDataType::UInt16 => u16::MIN.to_le_bytes().to_vec(),
+            BandDataType::UInt32 => u32::MIN.to_le_bytes().to_vec(),
+            BandDataType::UInt64 => u64::MIN.to_le_bytes().to_vec(),
+            BandDataType::Int8 => i8::MIN.to_le_bytes().to_vec(),
+            BandDataType::Int16 => i16::MIN.to_le_bytes().to_vec(),
+            BandDataType::Int32 => i32::MIN.to_le_bytes().to_vec(),
+            BandDataType::Int64 => i64::MIN.to_le_bytes().to_vec(),
+            BandDataType::Float32 => f32::MIN.to_le_bytes().to_vec(),
+            BandDataType::Float64 => f64::MIN.to_le_bytes().to_vec(),
+        }
+    }
+
     /// Byte size of a single pixel for this data type.
     pub fn byte_size(&self) -> usize {
         match self {
@@ -203,21 +223,6 @@ impl BandDataType {
             BandDataType::Int8 => "SIGNED_8BITS",
         }
     }
-}
-
-/// Where a band's pixel data lives.
-///
-/// Restored from the pre-N-D schema to keep downstream code that pattern-
-/// matches on `StorageType::InDb` / `StorageType::OutDbRef` compiling.
-/// The current N-D schema discriminates via `BandRef::is_indb()` (true ↔
-/// `InDb`, false ↔ `OutDbRef`); this enum is the shim over that.
-#[repr(u16)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy)]
-pub enum StorageType {
-    /// Band data is materialized into the raster row's `data` Arrow column.
-    InDb = 0,
-    /// Band data lives outside the row and is referenced by `outdb_uri`.
-    OutDbRef = 1,
 }
 
 /// Hard-coded column indices for performant access to nested struct fields.

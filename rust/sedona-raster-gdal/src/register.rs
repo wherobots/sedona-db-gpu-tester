@@ -20,9 +20,17 @@ use sedona_expr::function_set::FunctionSet;
 /// Export the set of GDAL-backed functions defined in this crate.
 pub fn default_function_set() -> FunctionSet {
     let mut function_set = FunctionSet::new();
+    function_set.insert_scalar_udf(crate::rs_as_geotiff::rs_as_geotiff_udf());
     function_set.insert_scalar_udf(crate::rs_as_raster::rs_as_raster_udf());
+    function_set.insert_scalar_udf(crate::rs_clip::rs_clip_udf());
+    function_set.insert_scalar_udf(crate::rs_from_gdal_raster::rs_from_gdal_raster_udf());
     function_set.insert_scalar_udf(crate::rs_frompath::rs_frompath_udf());
     function_set.insert_scalar_udf(crate::rs_metadata::rs_metadata_udf());
     function_set.insert_scalar_udf(crate::rs_polygonize::rs_polygonize_udf());
+    function_set.insert_scalar_udf(crate::rs_reproject_match::rs_reproject_match_udf());
+    function_set.insert_scalar_udf(crate::rs_resample::rs_resample_udf());
+    function_set.insert_scalar_udf(crate::rs_tile::rs_tile_udf());
+    function_set.insert_scalar_udf(crate::rs_zonal_stats::rs_zonal_stats_udf());
+    function_set.insert_scalar_udf(crate::rs_zonal_stats::rs_zonal_stats_all_udf());
     function_set
 }

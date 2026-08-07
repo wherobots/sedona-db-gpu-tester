@@ -20,11 +20,12 @@ use arrow_array::{ArrayRef, Float64Array, Int64Array};
 use arrow_schema::DataType;
 
 use datafusion_common::{exec_datafusion_err, Result, ScalarValue};
-use datafusion_expr::{AggregateUDF, ScalarUDF};
+use datafusion_expr::{AggregateUDF, ColumnarValue, ScalarUDF};
 use geo_types::Rect;
 use rand::{distr::Uniform, rngs::StdRng, Rng, RngExt, SeedableRng};
 
 use sedona_common::sedona_internal_err;
+use sedona_geometry::transform::CrsEngine;
 use sedona_geometry::types::GeometryTypeId;
 use sedona_schema::datatypes::{SedonaType, RASTER, WKB_GEOMETRY};
 use sedona_schema::raster::BandDataType;
@@ -72,6 +73,20 @@ pub mod benchmark {
         name: &str,
         config: impl Into<BenchmarkArgs>,
     ) {
+        scalar_with_crs_engine(c, functions, lib, name, config, None)
+    }
+
+    /// Benchmark a reprojecting [ScalarUDF], injecting a [CrsEngine] into the
+    /// tester so functions that resolve a CRS (e.g. `ST_Transform`) use a real
+    /// engine instead of the erroring default. Otherwise identical to [scalar].
+    pub fn scalar_with_crs_engine(
+        c: &mut Criterion,
+        functions: &FunctionSet,
+        lib: &str,
+        name: &str,
+        config: impl Into<BenchmarkArgs>,
+        crs_engine: Option<Arc<dyn CrsEngine + Send + Sync>>,
+    ) {
         let not_found_err = format!("{name} was not found in function set");
         let udf: ScalarUDF = functions
             .scalar_udf(name)
@@ -86,7 +101,10 @@ pub mod benchmark {
             )
             .unwrap();
         c.bench_function(&data.make_label(lib, name), |b| {
-            b.iter(|| data.invoke_scalar(&udf).unwrap())
+            b.iter(|| {
+                data.invoke_scalar_with_crs_engine(&udf, crs_engine.clone())
+                    .unwrap()
+            })
         });
     }
 
@@ -171,6 +189,8 @@ pub enum BenchmarkArgs {
     ArrayArray(BenchmarkArgSpec, BenchmarkArgSpec),
     /// Invoke a function with an array and two scalar inputs
     ArrayScalarScalar(BenchmarkArgSpec, BenchmarkArgSpec, BenchmarkArgSpec),
+    /// Invoke a ternary function with a scalar, an array, and a scalar input
+    ScalarArrayScalar(BenchmarkArgSpec, BenchmarkArgSpec, BenchmarkArgSpec),
     /// Invoke a ternary function with two arrays and a scalar
     ArrayArrayScalar(BenchmarkArgSpec, BenchmarkArgSpec, BenchmarkArgSpec),
     /// Invoke a ternary function with three arrays
@@ -206,7 +226,8 @@ impl BenchmarkArgs {
             | BenchmarkArgs::ArrayArrayArrayArray(_, _, _, _) => self.specs(),
             BenchmarkArgs::ScalarArray(_, col)
             | BenchmarkArgs::ArrayScalar(col, _)
-            | BenchmarkArgs::ArrayScalarScalar(col, _, _) => {
+            | BenchmarkArgs::ArrayScalarScalar(col, _, _)
+            | BenchmarkArgs::ScalarArrayScalar(_, col, _) => {
                 vec![col.clone()]
             }
         };
@@ -216,7 +237,8 @@ impl BenchmarkArgs {
             | BenchmarkArgs::ArrayArrayScalar(_, _, col) => {
                 vec![col.clone()]
             }
-            BenchmarkArgs::ArrayScalarScalar(_, col0, col1) => {
+            BenchmarkArgs::ArrayScalarScalar(_, col0, col1)
+            | BenchmarkArgs::ScalarArrayScalar(col0, _, col1) => {
                 vec![col0.clone(), col1.clone()]
             }
             _ => vec![],
@@ -251,6 +273,7 @@ impl BenchmarkArgs {
                 vec![col0.clone(), col1.clone()]
             }
             BenchmarkArgs::ArrayScalarScalar(col0, col1, col2)
+            | BenchmarkArgs::ScalarArrayScalar(col0, col1, col2)
             | BenchmarkArgs::ArrayArrayScalar(col0, col1, col2)
             | BenchmarkArgs::ArrayArrayArray(col0, col1, col2) => {
                 vec![col0.clone(), col1.clone(), col2.clone()]
@@ -531,7 +554,21 @@ impl BenchmarkData {
 
     /// Invoke a scalar function on this data
     pub fn invoke_scalar(&self, udf: &ScalarUDF) -> Result<()> {
-        let tester = ScalarUdfTester::new(udf.clone(), self.config.sedona_types().clone());
+        self.invoke_scalar_with_crs_engine(udf, None)
+    }
+
+    /// Invoke a scalar function on this data, injecting a [CrsEngine] into the
+    /// tester so reprojecting functions (e.g. `ST_Transform`) resolve a real
+    /// engine instead of the erroring default.
+    pub fn invoke_scalar_with_crs_engine(
+        &self,
+        udf: &ScalarUDF,
+        crs_engine: Option<Arc<dyn CrsEngine + Send + Sync>>,
+    ) -> Result<()> {
+        let mut tester = ScalarUdfTester::new(udf.clone(), self.config.sedona_types().clone());
+        if let Some(crs_engine) = crs_engine {
+            tester = tester.with_crs_engine(crs_engine);
+        }
 
         match self.config {
             BenchmarkArgs::Array(_) => {
@@ -566,6 +603,17 @@ impl BenchmarkData {
                         scalar0.clone(),
                         scalar1.clone(),
                     )?;
+                }
+            }
+            BenchmarkArgs::ScalarArrayScalar(_, _, _) => {
+                let scalar0 = &self.scalars[0];
+                let scalar1 = &self.scalars[1];
+                for i in 0..self.num_batches {
+                    tester.invoke(vec![
+                        ColumnarValue::Scalar(scalar0.clone()),
+                        ColumnarValue::Array(self.arrays[0][i].clone()),
+                        ColumnarValue::Scalar(scalar1.clone()),
+                    ])?;
                 }
             }
             BenchmarkArgs::ArrayArrayScalar(_, _, _) => {
@@ -970,8 +1018,7 @@ mod test {
         let rasters = RasterStructArray::try_new(raster_array).unwrap();
         assert_eq!(rasters.len(), ROWS_PER_BATCH);
         let raster = rasters.get(0).unwrap();
-        let metadata = raster.metadata();
-        assert_eq!(metadata.width(), 10);
-        assert_eq!(metadata.height(), 5);
+        assert_eq!(raster.width().unwrap(), 10);
+        assert_eq!(raster.height().unwrap(), 5);
     }
 }

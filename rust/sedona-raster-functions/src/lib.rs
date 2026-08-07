@@ -18,6 +18,7 @@
 pub mod crs_utils;
 mod executor;
 pub use executor::RasterExecutor;
+pub mod footprint;
 pub mod register;
 pub mod rs_band_accessors;
 pub mod rs_bandpath;
@@ -41,4 +42,6 @@ pub mod rs_slice;
 pub mod rs_spatial_predicates;
 pub mod rs_srid;
 pub mod rs_value;
+pub mod rs_values;
 pub mod rs_worldcoordinate;
+mod sampling;

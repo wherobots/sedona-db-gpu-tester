@@ -29,6 +29,7 @@ use arrow_schema::{ffi::FFI_ArrowSchema, Schema, SchemaRef};
 use datafusion_common::{exec_err, Result, Statistics};
 use datafusion_execution::TaskContext;
 use datafusion_physical_plan::{
+    displayable,
     execution_plan::{Boundedness, CardinalityEffect, EmissionType},
     metrics::{CustomMetricValue, Metric, MetricValue, MetricsSet},
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -36,21 +37,23 @@ use datafusion_physical_plan::{
 };
 use sedona_common::{sedona_internal_datafusion_err, sedona_internal_err};
 use serde::{Deserialize, Serialize};
-use tokio::runtime::Runtime;
 
 use crate::extension::{SedonaCError, SedonaCExecutionPlan, SedonaCExecutionPlanArgs};
+use crate::runtime::RuntimeHandle;
 use crate::set_ffi_error;
 use crate::streaming::{ffi_stream_to_sendable, CancelChecker, StreamingRecordBatchReader};
-use crate::utils::{cstr_from_ptr_or_empty, get_plan_property, get_plan_string_property, ERRNO_OK};
+use crate::utils::{
+    cstr_from_ptr_or_empty, get_plan_property, get_plan_string_property, PropertyValue, ERRNO_OK,
+};
 
 /// Wrapper around an [ExecutionPlan] that can be exported across FFI.
 ///
-/// Holds an `Arc<Runtime>` to ensure the runtime stays alive for the lifetime
-/// of the exported plan.
+/// Holds an `Arc<RuntimeHandle>` to ensure the runtime stays alive for the
+/// lifetime of the exported plan.
 pub struct ExportedExecutionPlan {
     plan: Arc<dyn ExecutionPlan>,
     task_context: Arc<TaskContext>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<RuntimeHandle>,
 }
 
 impl Debug for ExportedExecutionPlan {
@@ -64,12 +67,12 @@ impl Debug for ExportedExecutionPlan {
 impl ExportedExecutionPlan {
     /// Create a new ExportedExecutionPlan from an ExecutionPlan.
     ///
-    /// Takes an `Arc<Runtime>` to ensure the runtime stays alive for the lifetime
-    /// of the exported plan, preventing "Worker thread terminated" errors.
+    /// Takes an `Arc<RuntimeHandle>` to ensure the runtime stays alive for the
+    /// lifetime of the exported plan, preventing "Worker thread terminated" errors.
     pub fn new(
         plan: Arc<dyn ExecutionPlan>,
         task_context: Arc<TaskContext>,
-        runtime: Arc<Runtime>,
+        runtime: Arc<RuntimeHandle>,
     ) -> Self {
         Self {
             plan,
@@ -91,36 +94,9 @@ impl ExportedExecutionPlan {
                 })
             }
             "debug_string" => Ok(format!("{:?}", self.plan)),
-            "display_default" => {
-                use std::fmt::Write;
-                let mut s = String::new();
-                let _ = write!(
-                    s,
-                    "{}",
-                    DisplayAsWrapper(&self.plan, DisplayFormatType::Default)
-                );
-                Ok(s)
-            }
-            "display_verbose" => {
-                use std::fmt::Write;
-                let mut s = String::new();
-                let _ = write!(
-                    s,
-                    "{}",
-                    DisplayAsWrapper(&self.plan, DisplayFormatType::Verbose)
-                );
-                Ok(s)
-            }
-            "display_tree_render" => {
-                use std::fmt::Write;
-                let mut s = String::new();
-                let _ = write!(
-                    s,
-                    "{}",
-                    DisplayAsWrapper(&self.plan, DisplayFormatType::TreeRender)
-                );
-                Ok(s)
-            }
+            "display_default" => Ok(displayable(self.plan.as_ref()).indent(false).to_string()),
+            "display_verbose" => Ok(displayable(self.plan.as_ref()).indent(true).to_string()),
+            "display_tree_render" => Ok(displayable(self.plan.as_ref()).tree_render().to_string()),
             "name" => Ok(self.plan.name().to_string()),
             "cardinality_effect" => {
                 let effect = match self.plan.cardinality_effect() {
@@ -241,12 +217,7 @@ unsafe extern "C" fn c_exec_plan_get_property(
 
     match plan.get_property(&property_str) {
         Ok(value) => {
-            // Return the string as a single-element string array
-            use arrow_array::{builder::StringBuilder, Array};
-            let mut builder = StringBuilder::new();
-            builder.append_value(&value);
-            let array = builder.finish();
-            let ffi_array = arrow_array::ffi::FFI_ArrowArray::new(&array.to_data());
+            let ffi_array = PropertyValue::String(value).into_ffi_array();
             std::ptr::write(out, ffi_array);
             ERRNO_OK
         }
@@ -412,17 +383,17 @@ impl ImportedSedonaCExec {
 
 impl DisplayAs for ImportedSedonaCExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let property = match t {
-            DisplayFormatType::Default => "display_default",
-            DisplayFormatType::Verbose => "display_verbose",
-            DisplayFormatType::TreeRender => "display_tree_render",
+        let (property, sep) = match t {
+            DisplayFormatType::Default => ("display_default", ": "),
+            DisplayFormatType::Verbose => ("display_verbose", ": "),
+            DisplayFormatType::TreeRender => ("display_tree_render", "\n"),
         };
 
         // Always show the wrapper name, with the inner plan's display info
         if let Ok(display_str) = get_plan_string_property(&self.inner, property) {
-            write!(f, "ImportedSedonaCExec: {}", display_str)
+            write!(f, "ImportedSedonaCExec{sep}{display_str}")
         } else {
-            write!(f, "ImportedSedonaCExec")
+            write!(f, "ImportedSedonaCExec (error computing display)")
         }
     }
 }
@@ -678,15 +649,6 @@ impl PlanPropertiesArgs {
     }
 }
 
-/// Helper wrapper to format an ExecutionPlan with a specific DisplayFormatType.
-struct DisplayAsWrapper<'a>(&'a Arc<dyn ExecutionPlan>, DisplayFormatType);
-
-impl std::fmt::Display for DisplayAsWrapper<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt_as(self.1, f)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,19 +758,19 @@ mod tests {
         }
     }
 
-    /// Create a test runtime wrapped in Arc.
-    fn test_runtime() -> Arc<Runtime> {
-        Arc::new(
+    /// Create a test runtime wrapped in a background-shutdown handle.
+    fn test_runtime() -> Arc<RuntimeHandle> {
+        Arc::new(RuntimeHandle::new(
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap(),
-        )
+        ))
     }
 
     /// Helper to set up an imported plan from a DummyExec through FFI roundtrip.
     /// Returns the runtime to keep it alive for the duration of the test.
-    fn setup_imported_plan() -> (ImportedSedonaCExec, Arc<TaskContext>, Arc<Runtime>) {
+    fn setup_imported_plan() -> (ImportedSedonaCExec, Arc<TaskContext>, Arc<RuntimeHandle>) {
         let dummy = Arc::new(DummyExec::new());
         let runtime = test_runtime();
         let task_ctx = Arc::new(TaskContext::default());
@@ -824,7 +786,7 @@ mod tests {
         emission_type: EmissionType,
         boundedness: Boundedness,
         supports_limit_pushdown: bool,
-    ) -> (ImportedSedonaCExec, Arc<TaskContext>, Arc<Runtime>) {
+    ) -> (ImportedSedonaCExec, Arc<TaskContext>, Arc<RuntimeHandle>) {
         let dummy = Arc::new(DummyExec::with_properties(
             emission_type,
             boundedness,
@@ -935,18 +897,26 @@ mod tests {
         // ImportedSedonaCExec shows itself with the inner plan's display
         assert_eq!(
             format!("{}", DisplayAsFormat(&imported, DisplayFormatType::Default)),
-            "ImportedSedonaCExec: DummyExec: default format"
+            "ImportedSedonaCExec: DummyExec: default format\n"
         );
         assert_eq!(
             format!("{}", DisplayAsFormat(&imported, DisplayFormatType::Verbose)),
-            "ImportedSedonaCExec: DummyExec: verbose format with schema"
+            "ImportedSedonaCExec: DummyExec: verbose format with schema\n"
         );
         assert_eq!(
             format!(
                 "{}",
                 DisplayAsFormat(&imported, DisplayFormatType::TreeRender)
             ),
-            "ImportedSedonaCExec: DummyExec: tree render format"
+            "\
+ImportedSedonaCExec
+┌───────────────────────────┐
+│         DummyExec         │
+│    --------------------   │
+│   DummyExec: tree render  │
+│           format          │
+└───────────────────────────┘
+"
         );
     }
 

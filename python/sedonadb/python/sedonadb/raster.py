@@ -22,7 +22,7 @@ from typing import List, Optional, TYPE_CHECKING, Tuple, Any, Iterable
 import geoarrow.types as gat
 import pyarrow as pa
 
-from sedonadb._lib import raster_type
+from sedonadb._lib import geotransform_from_bbox, raster_type
 
 if TYPE_CHECKING:
     import numpy as np
@@ -97,6 +97,8 @@ class Raster:
         crs: Any = None,
         nodata: Any = None,
         transform: Optional[Iterable[float]] = None,
+        bbox: Optional[Iterable[float]] = None,
+        registration: Optional[str] = None,
     ) -> "Raster":
         """Create an in-database raster from a NumPy array, holding pixels inline.
 
@@ -116,7 +118,14 @@ class Raster:
             nodata: Optional nodata sentinel, packed in the array's dtype.
             transform: Optional GDAL-order geotransform
                 `[origin_x, scale_x, skew_x, origin_y, skew_y, scale_y]`;
-                defaults to a north-up identity.
+                defaults to a north-up identity. Mutually exclusive with `bbox`.
+            bbox: Optional spatial bounding box `[xmin, ymin, xmax, ymax]` to
+                derive a north-up geotransform from, using the array's trailing
+                `(y, x)` shape. Mutually exclusive with `transform`.
+            registration: How `bbox` maps to the grid, either `"pixel"` (the
+                default: the bbox is the grid's outer edge) or `"node"` (the bbox
+                endpoints are the centers of the border cells). Only meaningful
+                together with `bbox`.
 
         Returns:
             A new Raster instance with a single in-database band.
@@ -138,6 +147,14 @@ class Raster:
         dtype = str(array.dtype)
         if dtype not in BAND_DATA_TYPE_IDS:
             raise ValueError(f"Unsupported raster dtype: {dtype}")
+
+        if bbox is not None:
+            if transform is not None:
+                raise ValueError("bbox and transform are mutually exclusive")
+            # The trailing (y, x) axes are the spatial pair; the bbox->transform
+            # math lives in Rust (geotransform_from_bbox_and_spatial_shape).
+            height, width = shape[-2], shape[-1]
+            transform = geotransform_from_bbox(list(bbox), height, width, registration)
 
         return _build_raster(
             dim_names,
@@ -200,6 +217,30 @@ class Raster:
         bands_array = self._array.field("bands").flatten()
         return [Band(bands_array, i) for i in range(len(bands_array))]
 
+    def to_numpy(self) -> "np.ndarray":
+        """Convert this raster's bands to a single `(band, ...)` numpy array.
+
+        A single-band raster returns a view of the band's buffer, zero-copy
+        when `Band.to_numpy` is. Stacking a multiband raster allocates a new
+        contiguous array and copies each band into it, because every band
+        lives in its own buffer. All bands must share one shape and dtype;
+        mixed-dtype rasters raise rather than silently promoting.
+        """
+        import numpy as np
+
+        bands = self.bands
+        if not bands:
+            raise ValueError("Raster has no bands")
+        dtypes = {band.data_type for band in bands}
+        if len(dtypes) > 1:
+            raise ValueError(
+                f"Bands have mixed data types {sorted(dtypes)}; "
+                "convert them individually with Band.to_numpy()"
+            )
+        if len(bands) == 1:
+            return np.expand_dims(bands[0].to_numpy(), 0)
+        return np.stack([band.to_numpy() for band in bands])
+
     def __repr__(self) -> str:
         """Return a string representation of this raster."""
         return f"<Raster {self.width}x{self.height}, {len(self.bands)} band(s)>"
@@ -252,6 +293,19 @@ class Band:
         """The pixel data type name (e.g., 'uint8', 'float32')."""
         type_id = self._py_field("data_type")
         return BAND_DATA_TYPES[type_id].lower()
+
+    @property
+    def nodata(self):
+        """The band's nodata sentinel unpacked in the band's dtype, or None.
+
+        Integer bands return an int (exact for the full Int64/UInt64 range);
+        floating bands return a float.
+        """
+        raw = self._py_field("nodata")
+        if raw is None:
+            return None
+        type_id = self._py_field("data_type")
+        return struct.unpack("<" + BAND_DATA_TYPE_STRUCT_CHARS[type_id], raw)[0]
 
     @property
     def source_data(self) -> memoryview:
