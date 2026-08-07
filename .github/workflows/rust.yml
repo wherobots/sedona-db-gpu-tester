@@ -53,7 +53,7 @@ jobs:
         name: ["clippy", "docs", "test", "check", "build", "fmt"]
 
     name: "${{ matrix.name }}"
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     env:
       CARGO_INCREMENTAL: 0
       # Reduce debug info to save disk space

@@ -51,7 +51,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        os: [depot-ubuntu-24.04]
     name: "python ${{ matrix.os }}"
     runs-on: ${{ matrix.os }}
     env:
