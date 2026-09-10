@@ -20,7 +20,7 @@
 //! and is the entry point for all view-machinery operations
 //! (validation, identity check, visible-shape derivation, composition).
 
-use arrow_schema::ArrowError;
+use crate::error::RasterError;
 
 /// One per-dimension entry of a band's logical view. Describes how a
 /// visible axis maps onto an axis of the underlying source buffer.
@@ -65,7 +65,7 @@ impl ViewEntries {
     /// Wrap a pre-built vector of entries and validate it against
     /// `source_shape` in one step — [`Self::new`] followed by
     /// [`Self::validate`].
-    pub fn try_new(inner: Vec<ViewEntry>, source_shape: &[i64]) -> Result<Self, ArrowError> {
+    pub fn try_new(inner: Vec<ViewEntry>, source_shape: &[i64]) -> Result<Self, RasterError> {
         let entries = Self::new(inner);
         entries.validate(source_shape)?;
         Ok(entries)
@@ -141,10 +141,10 @@ impl ViewEntries {
     /// - When `steps > 0`: `start ∈ [0, source_shape[source_axis])`,
     ///   and when `step != 0` the last addressed element
     ///   `start + (steps - 1) * step` is also in that range.
-    pub fn validate(&self, source_shape: &[i64]) -> Result<(), ArrowError> {
+    pub fn validate(&self, source_shape: &[i64]) -> Result<(), RasterError> {
         let ndim = source_shape.len();
         if self.0.len() != ndim {
-            return Err(ArrowError::InvalidArgumentError(format!(
+            return Err(RasterError::Invalid(format!(
                 "view length ({}) must equal source_shape length ({ndim})",
                 self.0.len()
             )));
@@ -152,14 +152,14 @@ impl ViewEntries {
         let mut seen = vec![false; ndim];
         for (k, v) in self.0.iter().enumerate() {
             if v.source_axis < 0 || (v.source_axis as usize) >= ndim {
-                return Err(ArrowError::InvalidArgumentError(format!(
+                return Err(RasterError::Invalid(format!(
                     "view[{k}].source_axis = {} is out of range [0, {ndim})",
                     v.source_axis
                 )));
             }
             let sa = v.source_axis as usize;
             if seen[sa] {
-                return Err(ArrowError::InvalidArgumentError(format!(
+                return Err(RasterError::Invalid(format!(
                     "view source_axis values must be a permutation of 0..{ndim}; \
                      axis {sa} appears more than once"
                 )));
@@ -167,13 +167,13 @@ impl ViewEntries {
             seen[sa] = true;
 
             if v.steps < 0 {
-                return Err(ArrowError::InvalidArgumentError(format!(
+                return Err(RasterError::Invalid(format!(
                     "view[{k}].steps = {} must be >= 0",
                     v.steps
                 )));
             }
             if source_shape[sa] < 0 {
-                return Err(ArrowError::InvalidArgumentError(format!(
+                return Err(RasterError::Invalid(format!(
                     "source_shape[{sa}] = {} must be >= 0",
                     source_shape[sa]
                 )));
@@ -181,7 +181,7 @@ impl ViewEntries {
             if v.steps > 0 {
                 let s = source_shape[sa];
                 if v.start < 0 || v.start >= s {
-                    return Err(ArrowError::InvalidArgumentError(format!(
+                    return Err(RasterError::Invalid(format!(
                         "view[{k}].start = {} is out of range [0, {s}) for source axis {sa}",
                         v.start
                     )));
@@ -195,14 +195,14 @@ impl ViewEntries {
                         .checked_mul(v.step)
                         .and_then(|d| v.start.checked_add(d))
                         .ok_or_else(|| {
-                            ArrowError::InvalidArgumentError(format!(
+                            RasterError::Invalid(format!(
                                 "view[{k}] last-element index overflows i64 for \
                                  start={}, step={}, steps={} on source axis {sa}",
                                 v.start, v.step, v.steps
                             ))
                         })?;
                     if last < 0 || last >= s {
-                        return Err(ArrowError::InvalidArgumentError(format!(
+                        return Err(RasterError::Invalid(format!(
                             "view[{k}] addresses element {last} which is out of range \
                              [0, {s}) for source axis {sa}"
                         )));
@@ -230,15 +230,21 @@ impl ViewEntries {
     ///   - `out.step         = next.step * self.step`
     ///   - `out.steps        = next.steps`
     ///
+    /// Each `next` entry is additionally bounded against the parent's *visible*
+    /// extent (`self[next.source_axis].steps`), not just the underlying source:
+    /// a delta may not address an element outside the window `self` already
+    /// exposes, which would re-expose bytes the parent view had sliced away.
+    ///
     /// Uses checked arithmetic at every step. The caller must
     /// [`validate`] the result against the source shape before use.
     ///
     /// [`validate`]: Self::validate
-    pub fn compose(&self, next: &Self) -> Result<Self, ArrowError> {
-        let mut out = Vec::with_capacity(next.0.len());
-        for (k, next_entry) in next.0.iter().enumerate() {
+    pub fn compose(&self, next: impl AsRef<[ViewEntry]>) -> Result<Self, RasterError> {
+        let next = next.as_ref();
+        let mut out = Vec::with_capacity(next.len());
+        for (k, next_entry) in next.iter().enumerate() {
             if next_entry.source_axis < 0 || (next_entry.source_axis as usize) >= self.0.len() {
-                return Err(ArrowError::InvalidArgumentError(format!(
+                return Err(RasterError::Invalid(format!(
                     "compose: next[{k}].source_axis ({}) is out of range \
                      for input with {} visible axes",
                     next_entry.source_axis,
@@ -246,22 +252,59 @@ impl ViewEntries {
                 )));
             }
             let input = &self.0[next_entry.source_axis as usize];
+
+            // Bound the delta against the PARENT's visible extent. `next_entry`
+            // indexes the parent's visible axis `next_entry.source_axis`, which
+            // exposes exactly `input.steps` elements; a delta reaching past that
+            // window would re-expose bytes the parent had sliced away. Mirror
+            // `validate`'s start / last-element bounds, but against `input.steps`
+            // (the parent's visible length) rather than the raw source size.
+            if next_entry.steps > 0 {
+                let visible_len = input.steps;
+                if next_entry.start < 0 || next_entry.start >= visible_len {
+                    return Err(RasterError::Invalid(format!(
+                        "compose: next[{k}].start ({}) is out of range [0, {visible_len}) \
+                         for the parent's visible axis {}",
+                        next_entry.start, next_entry.source_axis
+                    )));
+                }
+                if next_entry.step != 0 {
+                    let last = (next_entry.steps - 1)
+                        .checked_mul(next_entry.step)
+                        .and_then(|d| next_entry.start.checked_add(d))
+                        .ok_or_else(|| {
+                            RasterError::Invalid(format!(
+                                "compose: next[{k}] last-element index overflows i64 \
+                                 (start={}, step={}, steps={})",
+                                next_entry.start, next_entry.step, next_entry.steps
+                            ))
+                        })?;
+                    if last < 0 || last >= visible_len {
+                        return Err(RasterError::Invalid(format!(
+                            "compose: next[{k}] addresses element {last}, out of range \
+                             [0, {visible_len}) for the parent's visible axis {}",
+                            next_entry.source_axis
+                        )));
+                    }
+                }
+            }
+
             let step = next_entry.step.checked_mul(input.step).ok_or_else(|| {
-                ArrowError::InvalidArgumentError(format!(
+                RasterError::Invalid(format!(
                     "compose: step product overflows i64 at axis {k} \
                      (next.step={}, input.step={})",
                     next_entry.step, input.step
                 ))
             })?;
             let start_offset = next_entry.start.checked_mul(input.step).ok_or_else(|| {
-                ArrowError::InvalidArgumentError(format!(
+                RasterError::Invalid(format!(
                     "compose: next.start * input.step overflows i64 at axis {k} \
                      (next.start={}, input.step={})",
                     next_entry.start, input.step
                 ))
             })?;
             let start = input.start.checked_add(start_offset).ok_or_else(|| {
-                ArrowError::InvalidArgumentError(format!(
+                RasterError::Invalid(format!(
                     "compose: composed start overflows i64 at axis {k} \
                      (input.start={}, offset={})",
                     input.start, start_offset
@@ -600,5 +643,27 @@ mod tests {
             err.to_string().contains("step product overflows"),
             "got {err}"
         );
+    }
+
+    #[test]
+    fn compose_rejects_delta_escaping_parent_visible_window() {
+        // Parent exposes source[0..4] (steps=4) of an 8-long source. A delta
+        // that reads 8 elements would reach source indices 4..8 — bytes the
+        // parent sliced away. Composition must reject it even though those
+        // indices are valid in the raw source.
+        let parent = entries(&[ve(0, 0, 1, 4)]);
+        let escaping = entries(&[ve(0, 0, 1, 8)]);
+        let err = parent.compose(&escaping).unwrap_err();
+        assert!(err.to_string().contains("visible axis"), "got {err}");
+    }
+
+    #[test]
+    fn compose_accepts_delta_within_parent_visible_window() {
+        // The same parent, with a delta that exactly fills the 4-element
+        // window, composes cleanly and stays inside the parent's extent.
+        let parent = entries(&[ve(0, 0, 1, 4)]);
+        let fitting = entries(&[ve(0, 0, 1, 4)]);
+        let composed = parent.compose(&fitting).unwrap();
+        assert_eq!(composed.as_slice(), &[ve(0, 0, 1, 4)]);
     }
 }

@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_schema::ArrowError;
+use arrow_buffer::Buffer;
 use sedona_schema::raster::BandDataType;
 
-use crate::builder::{RasterBuilder, StartBandArgs};
-use crate::view_entries::{ViewEntries, ViewEntry};
+use crate::band_builder::BandWriter;
+use crate::builder::StartBandArgs;
+use crate::error::RasterError;
+use crate::view_entries::ViewEntries;
 
 /// Recognized spatial dimension-name pairs, in band C-order: the slower-
 /// varying Y-like (row) axis first, the faster-varying X-like (column) axis
@@ -95,9 +97,9 @@ impl<'a> NdBuffer<'a> {
     /// (<https://github.com/apache/sedona-db/issues/899>). Never copies or
     /// allocates — a strided layout returns an error, it is not materialized
     /// here.
-    pub fn as_contiguous(&self) -> Result<&'a [u8], ArrowError> {
+    pub fn as_contiguous(&self) -> Result<&'a [u8], RasterError> {
         if !self.is_contiguous() {
-            return Err(ArrowError::InvalidArgumentError(format!(
+            return Err(RasterError::Invalid(format!(
                 "band view is not contiguous (shape {:?}, strides {:?}); \
                  materialize it with RS_EnsureContiguous before contiguous \
                  byte access — see https://github.com/apache/sedona-db/issues/899",
@@ -110,7 +112,7 @@ impl<'a> NdBuffer<'a> {
         let buffer: &'a [u8] = self.buffer;
         match start.checked_add(len) {
             Some(end) if end <= buffer.len() => Ok(&buffer[start..end]),
-            _ => Err(ArrowError::ExternalError(Box::new(
+            _ => Err(RasterError::External(Box::new(
                 sedona_common::sedona_internal_datafusion_err!(
                     "contiguous region [{start}, {start}+{len}) is out of bounds \
                      for buffer of length {}",
@@ -139,12 +141,12 @@ impl<'a> NdBuffer<'a> {
 ///
 /// This is the shared convention consumers use to recover the source path and
 /// band from a band's `outdb_uri()`.
-pub fn split_outdb_band_fragment(uri: &str) -> Result<(String, u32), ArrowError> {
+pub fn split_outdb_band_fragment(uri: &str) -> Result<(String, u32), RasterError> {
     if let Some((prefix, fragment)) = uri.rsplit_once('#') {
         if let Some(band_str) = fragment.strip_prefix("band=") {
             return match band_str.parse::<u32>() {
                 Ok(band) if band >= 1 => Ok((prefix.to_string(), band)),
-                _ => Err(ArrowError::InvalidArgumentError(format!(
+                _ => Err(RasterError::Invalid(format!(
                     "Invalid band index in outdb URI fragment '#band={band_str}': expected a positive integer in 1..=u32::MAX"
                 ))),
             };
@@ -162,12 +164,12 @@ pub trait RasterRef {
     /// Number of bands/variables
     fn num_bands(&self) -> usize;
 
-    /// Access a band by 0-based index. Returns an `ArrowError` when the
+    /// Access a band by 0-based index. Returns a `RasterError` when the
     /// index is out of range or when the underlying schema is malformed
     /// (unknown data-type discriminant, corrupt view, etc.). The latter
     /// cases route through `sedona_common::sedona_internal_datafusion_err!`
     /// so they carry the standardised "SedonaDB internal error" framing.
-    fn band(&self, index: usize) -> Result<Box<dyn BandRef + '_>, ArrowError>;
+    fn band(&self, index: usize) -> Result<Box<dyn BandRef + '_>, RasterError>;
 
     /// Band name (e.g., Zarr variable name). None for unnamed bands.
     fn band_name(&self, index: usize) -> Option<&str>;
@@ -245,21 +247,19 @@ pub trait RasterRef {
     /// Width in pixels — size of the X spatial dimension from the top-level
     /// `spatial_shape`. Errors if `spatial_shape` is empty, which is an
     /// invariant violation rather than a legitimate "no value" state.
-    fn width(&self) -> Result<i64, ArrowError> {
+    fn width(&self) -> Result<i64, RasterError> {
         let shape = self.spatial_shape();
         shape.first().copied().ok_or_else(|| {
-            ArrowError::InvalidArgumentError(
-                "raster has no width (spatial_shape is empty)".to_string(),
-            )
+            RasterError::Invalid("raster has no width (spatial_shape is empty)".to_string())
         })
     }
 
     /// Height in pixels — size of the Y spatial dimension from the top-level
     /// `spatial_shape`. Errors if `spatial_shape` has fewer than two entries.
-    fn height(&self) -> Result<i64, ArrowError> {
+    fn height(&self) -> Result<i64, RasterError> {
         let shape = self.spatial_shape();
         shape.get(1).copied().ok_or_else(|| {
-            ArrowError::InvalidArgumentError(format!(
+            RasterError::Invalid(format!(
                 "raster has no height (spatial_shape has {} entries, need >= 2)",
                 shape.len()
             ))
@@ -268,38 +268,80 @@ pub trait RasterRef {
 
     /// Look up a band by name. Returns an error if no band has that
     /// name or if the matching band is malformed.
-    fn band_by_name(&self, name: &str) -> Result<Box<dyn BandRef + '_>, ArrowError> {
+    fn band_by_name(&self, name: &str) -> Result<Box<dyn BandRef + '_>, RasterError> {
         let i = (0..self.num_bands())
             .find(|&i| self.band_name(i) == Some(name))
-            .ok_or_else(|| {
-                ArrowError::InvalidArgumentError(format!("Band with name '{name}' not found"))
-            })?;
+            .ok_or_else(|| RasterError::Invalid(format!("Band with name '{name}' not found")))?;
         self.band(i)
     }
 }
 
-/// Field overrides for [`BandRef::copy_into`]. Each field defaults to `None`,
-/// meaning "inherit from the source band". `name` has no source on a `BandRef`
-/// (band names live at the raster level), so it defaults to unnamed.
+/// Trinary override for a [`BandOverrides`] field: `Keep` inherits the
+/// source band's value, `Clear` sets the field to absent (`None`), and
+/// `Set(T)` sets it to `T`. `Keep` is the default, so `..Default::default()`
+/// on `BandOverrides` inherits everything.
+///
+/// The three-way distinction matters for clearable fields (nodata, outdb
+/// hints, the view): with a plain `Option` there is no way to say "drop the
+/// source's value" as distinct from "inherit it". `RS_SetBandNoDataValue`
+/// relies on this to clear a band's nodata on a `NULL` argument rather than
+/// nulling the whole raster row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Override<T> {
+    /// Inherit the source band's value.
+    #[default]
+    Keep,
+    /// Set the field to absent (`None`).
+    Clear,
+    /// Set the field to this value.
+    Set(T),
+}
+
+/// Field overrides for [`BandRef::copy_into`]. Each field defaults to
+/// [`Override::Keep`], meaning "inherit from the source band".
 #[derive(Default)]
 pub struct BandOverrides<'a> {
-    /// Name for the derived band (the source has none to inherit).
-    pub name: Option<&'a str>,
-    /// Override the dimension names; `None` inherits the source's.
+    /// Override the band name. `Keep` inherits the source's via
+    /// [`BandRef::name`], `Clear` yields an unnamed band, `Set(n)` names it.
+    pub name: Override<&'a str>,
+    /// Override the dimension names; `None` inherits the source's. Unlike the
+    /// other fields this stays a plain `Option`: every band always has dim
+    /// names, so there is no "absent" state for `Clear` to express.
     pub dim_names: Option<&'a [&'a str]>,
-    /// Override the nodata value; `None` inherits the source's.
-    pub nodata: Option<&'a [u8]>,
-    /// Override the OutDb URI; `None` inherits the source's.
-    pub outdb_uri: Option<&'a str>,
-    /// Override the OutDb format; `None` inherits the source's.
-    pub outdb_format: Option<&'a str>,
-    /// View to apply to the derived band, expressed in the **source's visible
-    /// coordinates**. [`BandRef::copy_into`] composes it onto the source's own
-    /// view for you — you don't manage that composition and don't need to know
-    /// whether the source already carries a view. `None` inherits the source's
-    /// view unchanged. (A non-identity result isn't persistable yet and
-    /// `copy_into` rejects it; see <https://github.com/apache/sedona-db/issues/897>.)
-    pub view: Option<&'a [ViewEntry]>,
+    /// Override the nodata value. `Keep` inherits the source's, `Clear` drops
+    /// it (the derived band has no nodata), `Set(b)` sets it to `b`.
+    pub nodata: Override<&'a [u8]>,
+    /// Override the OutDb URI. `Keep` inherits, `Clear` drops it, `Set(u)` sets
+    /// it.
+    pub outdb_uri: Override<&'a str>,
+    /// Override the OutDb format. `Keep` inherits, `Clear` drops it, `Set(f)`
+    /// sets it.
+    pub outdb_format: Override<&'a str>,
+    /// View for the derived band. [`BandRef::copy_into`] **never composes** it:
+    /// - `Keep` inherits the source's view unchanged.
+    /// - `Clear` gives the derived band the canonical identity view — the bytes
+    ///   already reflect any prior view, so no view is applied.
+    /// - `Set(v)` makes the derived band's view exactly `v`, interpreted
+    ///   against the source's `raw_source_shape`.
+    ///
+    /// Composition is the caller's job: to slice the source's *visible*
+    /// coordinates, pass `Set(&source.view().compose(next)?)` yourself. A
+    /// non-identity result is persisted on the derived band (as a slice,
+    /// broadcast, permutation, or reverse) and decoded back by the reader; the
+    /// underlying bytes are carried over unchanged.
+    pub view: Override<&'a ViewEntries>,
+    /// Override the source shape the derived band's bytes are laid out in;
+    /// `None` inherits the source's [`BandRef::raw_source_shape`]. Pair it
+    /// with a `view` override (and normally a `data` override) when the bytes
+    /// describe a different extent than the source's — e.g. a loader that
+    /// returned only the visible region, under an identity view over it.
+    pub source_shape: Option<&'a [i64]>,
+    /// Override the derived band's bytes. `Keep` carries the source's data
+    /// over (zero-copy where the implementation supports it, see
+    /// [`BandRef::append_data_into`]); `Set(b)` shares `b` zero-copy as the
+    /// derived band's data; `Clear` writes empty data, i.e. an OutDb-style
+    /// band whose bytes live behind `outdb_uri`.
+    pub data: Override<&'a Buffer>,
 }
 
 /// Trait for accessing a single band/variable within an N-D raster.
@@ -341,7 +383,7 @@ pub trait BandRef {
     /// Per-visible-dimension view entries describing how the band's
     /// visible axes map onto its `source_shape`. `view().len() == ndim()`.
     /// See `ViewEntry` for per-entry semantics.
-    fn view(&self) -> &[ViewEntry];
+    fn view(&self) -> &ViewEntries;
 
     /// Size of a named dimension (None if doesn't exist)
     fn dim_size(&self, name: &str) -> Option<i64> {
@@ -373,6 +415,15 @@ pub trait BandRef {
 
     /// Data type for all elements in this band
     fn data_type(&self) -> BandDataType;
+
+    /// Band name (e.g. a Zarr variable name). None for unnamed bands.
+    ///
+    /// The band-level counterpart to [`RasterRef::band_name`], which indexes
+    /// the same value from the raster. Required rather than defaulted: a
+    /// backend that silently returned `None` here would drop names on every
+    /// derived band, which is precisely the failure this accessor exists to
+    /// prevent.
+    fn name(&self) -> Option<&str>;
 
     /// Nodata value as raw bytes (None if not set)
     fn nodata(&self) -> Option<&[u8]>;
@@ -416,7 +467,7 @@ pub trait BandRef {
     /// `offset` are computed by composing the view with the source's
     /// natural C-order byte strides. Strides may be zero (broadcast) or
     /// negative (reverse iteration).
-    fn nd_buffer(&self) -> Result<NdBuffer<'_>, ArrowError>;
+    fn nd_buffer(&self) -> Result<NdBuffer<'_>, RasterError>;
 
     /// Nodata value interpreted as f64.
     ///
@@ -431,7 +482,7 @@ pub trait BandRef {
     /// value. Use `nodata()` directly to recover the exact bytes when full
     /// integer precision matters (e.g. when nodata is the type's extreme
     /// value like `0xFF…FF`).
-    fn nodata_as_f64(&self) -> Result<Option<f64>, ArrowError> {
+    fn nodata_as_f64(&self) -> Result<Option<f64>, RasterError> {
         let bytes = match self.nodata() {
             Some(b) => b,
             None => return Ok(None),
@@ -447,48 +498,96 @@ pub trait BandRef {
     /// data transfer is zero-copy when the implementation supports it (see
     /// [`Self::append_data_into`]).
     ///
-    /// The derived band's view is the source's own view with any
-    /// `overrides.view` **composed on top for you**: express an override in the
-    /// source's *visible* coordinates and `copy_into` composes it against the
-    /// source's view — callers never manage that composition and don't need to
-    /// know whether the source already carries one. `overrides.view = None`
-    /// inherits the source's view unchanged.
+    /// `copy_into` **never composes** the view. `overrides.view` resolves as:
+    /// - [`Override::Keep`] inherits the source's view unchanged.
+    /// - [`Override::Clear`] gives the derived band the canonical identity view
+    ///   over the source shape — the bytes already reflect any prior view, so
+    ///   no view is applied.
+    /// - [`Override::Set(v)`](Override::Set) makes the derived band's view
+    ///   exactly `v`. To slice the source's *visible* coordinates the caller
+    ///   composes first: `view: Override::Set(&source.view().compose(&next)?)`.
     ///
     /// The composition + persistence is delegated to
-    /// [`RasterBuilder::start_band`]. Today that stores views only as
-    /// the canonical identity null sentinel, so a non-identity effective view
-    /// is rejected rather than copying mislocated bytes; in practice the source
-    /// is identity-viewed and any override must compose back to the identity.
-    /// View persistence is tracked in
-    /// <https://github.com/apache/sedona-db/issues/897>.
+    /// [`BandWriter::start_band`]: an identity effective view is
+    /// stored as the canonical null sentinel, and a non-identity one (a slice,
+    /// broadcast, permutation, or reverse) is persisted explicitly and decoded
+    /// back by the reader. The source bytes are carried over unchanged — the
+    /// view relocates the visible window over them, it does not repack them.
+    ///
+    /// `builder` is a [`BandWriter`] rather than a concrete
+    /// [`crate::builder::RasterBuilder`] so a derived band can be written
+    /// into a bare [`crate::band_builder::BandArrayBuilder`] (no enclosing
+    /// raster) too — `RasterBuilder` implements the trait by delegating to
+    /// its own internal `BandArrayBuilder` plus its own per-raster
+    /// bookkeeping, so calling this with a `&mut RasterBuilder` behaves
+    /// exactly as before.
     fn copy_into(
         &self,
-        builder: &mut RasterBuilder,
+        builder: &mut dyn BandWriter,
         overrides: BandOverrides<'_>,
-    ) -> Result<(), ArrowError> {
+    ) -> Result<(), RasterError> {
         let inherited_dims = self.dim_names();
         let dim_names: Vec<&str> = match overrides.dim_names {
             Some(d) => d.to_vec(),
             None => inherited_dims,
         };
-        let source_shape = self.raw_source_shape().to_vec();
-        // Compose the caller's override (if any) onto the source's own view, so
-        // the override is interpreted in the source's visible space and the
-        // caller doesn't have to. `None` keeps the source view unchanged.
-        let source_view = ViewEntries::new(self.view().to_vec());
-        let effective_view = match overrides.view {
-            Some(v) => source_view.compose(&ViewEntries::new(v.to_vec()))?,
-            None => source_view,
+        let source_shape = match overrides.source_shape {
+            Some(shape) => shape.to_vec(),
+            None => self.raw_source_shape().to_vec(),
+        };
+        // The view is used as-is — never composed onto the source's own view.
+        // `Clear` applies the canonical identity (the bytes already reflect any
+        // prior view); `Set(v)` uses `v` verbatim; `Keep` carries the source's
+        // view forward. Callers who want to compose do so themselves.
+        let effective_view: ViewEntries = match overrides.view {
+            Override::Keep => self.view().clone(),
+            Override::Clear => ViewEntries::identity_for_shape(&source_shape),
+            Override::Set(v) => v.clone(),
+        };
+        let name = match overrides.name {
+            Override::Keep => self.name(),
+            Override::Clear => None,
+            Override::Set(n) => Some(n),
+        };
+        let nodata = match overrides.nodata {
+            Override::Keep => self.nodata(),
+            Override::Clear => None,
+            Override::Set(b) => Some(b),
+        };
+        let outdb_uri = match overrides.outdb_uri {
+            Override::Keep => self.outdb_uri(),
+            Override::Clear => None,
+            Override::Set(u) => Some(u),
+        };
+        let outdb_format = match overrides.outdb_format {
+            Override::Keep => self.outdb_format(),
+            Override::Clear => None,
+            Override::Set(f) => Some(f),
         };
         builder.start_band(StartBandArgs {
-            name: overrides.name,
-            view: Some(effective_view.as_slice()),
-            nodata: overrides.nodata.or_else(|| self.nodata()),
-            outdb_uri: overrides.outdb_uri.or_else(|| self.outdb_uri()),
-            outdb_format: overrides.outdb_format.or_else(|| self.outdb_format()),
+            name,
+            view: Some(&effective_view),
+            nodata,
+            outdb_uri,
+            outdb_format,
             ..StartBandArgs::new(&dim_names, &source_shape, self.data_type())
         })?;
-        self.append_data_into(builder)
+        match overrides.data {
+            Override::Keep => self.append_data_into(builder),
+            Override::Clear => {
+                builder.band_data_writer().append_value([]);
+                Ok(())
+            }
+            Override::Set(buffer) => {
+                let len = u32::try_from(buffer.len()).map_err(|_| {
+                    RasterError::Invalid(format!(
+                        "band data of {} bytes exceeds the BinaryView length limit",
+                        buffer.len()
+                    ))
+                })?;
+                builder.append_band_data_buffer(buffer, 0, len)
+            }
+        }
     }
 
     /// Append `self`'s band data as the current band's single `data` value.
@@ -496,10 +595,10 @@ pub trait BandRef {
     /// The default copies the visible source bytes via `append_value`. Arrow-
     /// backed implementations override this to share the source row's backing
     /// `Buffer` zero-copy (a refcount bump via
-    /// [`RasterBuilder::append_band_data_from`]), keeping the buffer plumbing
+    /// [`BandWriter::append_band_data_from`]), keeping the buffer plumbing
     /// encapsulated rather than exposing a raw `Buffer` accessor. Call after the
     /// band's schema has been written (e.g. by [`Self::copy_into`]).
-    fn append_data_into(&self, builder: &mut RasterBuilder) -> Result<(), ArrowError> {
+    fn append_data_into(&self, builder: &mut dyn BandWriter) -> Result<(), RasterError> {
         if self.is_indb() {
             let ndb = self.nd_buffer()?;
             builder.band_data_writer().append_value(ndb.buffer);
@@ -515,11 +614,11 @@ pub trait BandRef {
 /// The bytes are expected to be in little-endian order and exactly match the
 /// byte size of the data type. Internal helper for the lossless wrapper;
 /// non-i64/u64 callers reach for `nodata_bytes_to_f64_lossless` instead.
-fn nodata_bytes_to_f64(bytes: &[u8], dt: &BandDataType) -> Result<f64, ArrowError> {
+fn nodata_bytes_to_f64(bytes: &[u8], dt: &BandDataType) -> Result<f64, RasterError> {
     macro_rules! read_le {
         ($t:ty, $n:expr) => {{
             let arr: [u8; $n] = bytes.try_into().map_err(|_| {
-                ArrowError::InvalidArgumentError(format!(
+                RasterError::Invalid(format!(
                     "Invalid nodata byte length for {:?}: expected {}, got {}",
                     dt,
                     $n,
@@ -533,7 +632,7 @@ fn nodata_bytes_to_f64(bytes: &[u8], dt: &BandDataType) -> Result<f64, ArrowErro
     match dt {
         BandDataType::UInt8 => {
             if bytes.len() != 1 {
-                return Err(ArrowError::InvalidArgumentError(format!(
+                return Err(RasterError::Invalid(format!(
                     "Invalid nodata byte length for UInt8: expected 1, got {}",
                     bytes.len()
                 )));
@@ -542,7 +641,7 @@ fn nodata_bytes_to_f64(bytes: &[u8], dt: &BandDataType) -> Result<f64, ArrowErro
         }
         BandDataType::Int8 => {
             if bytes.len() != 1 {
-                return Err(ArrowError::InvalidArgumentError(format!(
+                return Err(RasterError::Invalid(format!(
                     "Invalid nodata byte length for Int8: expected 1, got {}",
                     bytes.len()
                 )));
@@ -568,18 +667,18 @@ fn nodata_bytes_to_f64(bytes: &[u8], dt: &BandDataType) -> Result<f64, ArrowErro
 /// pixel == nodata) should prefer this over the lossy variant — a rounded
 /// `0xFFFF_FFFF_FFFF_FFFE` sentinel can silently collide with a real
 /// pixel value.
-pub fn nodata_bytes_to_f64_lossless(bytes: &[u8], dt: &BandDataType) -> Result<f64, ArrowError> {
+pub fn nodata_bytes_to_f64_lossless(bytes: &[u8], dt: &BandDataType) -> Result<f64, RasterError> {
     match dt {
         BandDataType::UInt64 => {
             let arr: [u8; 8] = bytes.try_into().map_err(|_| {
-                ArrowError::InvalidArgumentError(format!(
+                RasterError::Invalid(format!(
                     "Invalid nodata byte length for UInt64: expected 8, got {}",
                     bytes.len()
                 ))
             })?;
             let v = u64::from_le_bytes(arr);
             if v > (1u64 << 53) {
-                return Err(ArrowError::InvalidArgumentError(format!(
+                return Err(RasterError::Invalid(format!(
                     "UInt64 nodata value {v} cannot be represented exactly as f64 \
                      (magnitude > 2^53); use the raw nodata bytes instead"
                 )));
@@ -588,14 +687,14 @@ pub fn nodata_bytes_to_f64_lossless(bytes: &[u8], dt: &BandDataType) -> Result<f
         }
         BandDataType::Int64 => {
             let arr: [u8; 8] = bytes.try_into().map_err(|_| {
-                ArrowError::InvalidArgumentError(format!(
+                RasterError::Invalid(format!(
                     "Invalid nodata byte length for Int64: expected 8, got {}",
                     bytes.len()
                 ))
             })?;
             let v = i64::from_le_bytes(arr);
             if v.unsigned_abs() > (1u64 << 53) {
-                return Err(ArrowError::InvalidArgumentError(format!(
+                return Err(RasterError::Invalid(format!(
                     "Int64 nodata value {v} cannot be represented exactly as f64 \
                      (magnitude > 2^53); use the raw nodata bytes instead"
                 )));
@@ -614,10 +713,10 @@ pub fn nodata_bytes_to_f64_lossless(bytes: &[u8], dt: &BandDataType) -> Result<f
 /// integer beyond 2^53 (which can't have arrived losslessly through `f64`).
 /// `Float32` is the one lossy case allowed — it rounds to the nearest `f32`, as
 /// any f64 → f32 narrowing does.
-pub fn nodata_f64_to_bytes(value: f64, dt: &BandDataType) -> Result<Vec<u8>, ArrowError> {
-    fn check_integer(value: f64, min: f64, max: f64, dt: &BandDataType) -> Result<(), ArrowError> {
+pub fn nodata_f64_to_bytes(value: f64, dt: &BandDataType) -> Result<Vec<u8>, RasterError> {
+    fn check_integer(value: f64, min: f64, max: f64, dt: &BandDataType) -> Result<(), RasterError> {
         if value.fract() != 0.0 || value < min || value > max {
-            return Err(ArrowError::InvalidArgumentError(format!(
+            return Err(RasterError::Invalid(format!(
                 "nodata value {value} is not a valid {dt:?} value"
             )));
         }
@@ -668,6 +767,8 @@ pub fn nodata_f64_to_bytes(value: f64, dt: &BandDataType) -> Result<Vec<u8>, Arr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builder::RasterBuilder;
+    use crate::view_entries::ViewEntry;
 
     #[test]
     fn test_nodata_bytes_to_f64_uint8() {
@@ -822,7 +923,7 @@ mod tests {
         dim_names: Vec<String>,
         source_shape: Vec<i64>,
         shape: Vec<i64>,
-        view: Vec<ViewEntry>,
+        view: ViewEntries,
     }
 
     impl BandRef for StubBand {
@@ -838,16 +939,19 @@ mod tests {
         fn raw_source_shape(&self) -> &[i64] {
             &self.source_shape
         }
-        fn view(&self) -> &[ViewEntry] {
+        fn view(&self) -> &ViewEntries {
             &self.view
         }
         fn data_type(&self) -> BandDataType {
             BandDataType::UInt8
         }
+        fn name(&self) -> Option<&str> {
+            None
+        }
         fn nodata(&self) -> Option<&[u8]> {
             None
         }
-        fn nd_buffer(&self) -> Result<NdBuffer<'_>, ArrowError> {
+        fn nd_buffer(&self) -> Result<NdBuffer<'_>, RasterError> {
             unimplemented!("not used in is_spatial_2d tests")
         }
         fn is_indb(&self) -> bool {
@@ -861,7 +965,7 @@ mod tests {
             dim_names: dims.iter().map(|s| (*s).to_string()).collect(),
             source_shape: source_shape.to_vec(),
             shape,
-            view: view.to_vec(),
+            view: ViewEntries::new(view.to_vec()),
         }
     }
 
@@ -872,37 +976,219 @@ mod tests {
     }
 
     #[test]
-    fn copy_into_rejects_non_identity_source_view() {
-        // A sliced source view (step 2 on the outer axis) composes to a
-        // non-identity effective view; copy_into can't persist it yet, so it
-        // must error rather than copy mislocated bytes.
-        let src = band(&["y", "x"], &[4, 5], &[ve(0, 0, 2, 2), ve(1, 0, 1, 5)]);
+    fn copy_into_persists_non_identity_source_view() {
+        // A source band that already carries a non-identity view (an every-
+        // other slice over an 8-element axis) is copied with default overrides:
+        // the effective view is the source's own slice, and copy_into persists
+        // it and carries the source bytes over. Read back, the derived band
+        // exposes the same slice — visible values [1, 3, 5].
+        use crate::array::RasterStructArray;
+        let transform = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+
+        // Source: source_shape [8], data [0..8], view (start=1, step=2, steps=3).
+        let mut ib = RasterBuilder::new(1);
+        ib.start_raster_nd(&transform, &["x"], &[3], None).unwrap();
+        ib.start_band(StartBandArgs {
+            view: Some(&ViewEntries::new(vec![ve(0, 1, 2, 3)])),
+            ..StartBandArgs::new(&["x"], &[8], BandDataType::UInt8)
+        })
+        .unwrap();
+        ib.band_data_writer()
+            .append_value((0u8..8).collect::<Vec<u8>>());
+        ib.finish_band().unwrap();
+        ib.finish_raster().unwrap();
+        let in_array = ib.finish().unwrap();
+        let in_rasters = RasterStructArray::try_new(&in_array).unwrap();
+        let in_raster = in_rasters.get(0).unwrap();
+        let in_band = in_raster.band(0).unwrap();
+
         let mut ob = RasterBuilder::new(1);
-        let err = src
+        ob.start_raster_nd(&transform, &["x"], &[3], None).unwrap();
+        in_band
             .copy_into(&mut ob, BandOverrides::default())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("non-identity"), "unexpected error: {err}");
+            .unwrap();
+        ob.finish_band().unwrap();
+        ob.finish_raster().unwrap();
+        let out_array = ob.finish().unwrap();
+        let out_rasters = RasterStructArray::try_new(&out_array).unwrap();
+        let out_raster = out_rasters.get(0).unwrap();
+        let out_band = out_raster.band(0).unwrap();
+
+        assert_eq!(out_band.view().as_slice(), &[ve(0, 1, 2, 3)]);
+        assert_eq!(out_band.shape(), &[3]);
+        assert_eq!(out_band.raw_source_shape(), &[8]);
+        let buf = out_band.nd_buffer().unwrap();
+        assert_eq!(buf.strides, &[2]);
+        assert_eq!(buf.offset, 1);
+        // Strided → not contiguous; the visible bytes must be [1, 3, 5].
+        assert!(!buf.is_contiguous());
+        let visited: Vec<u8> = (0..buf.shape[0])
+            .map(|i| buf.buffer[(buf.offset as i64 + i * buf.strides[0]) as usize])
+            .collect();
+        assert_eq!(visited, vec![1, 3, 5]);
+    }
+
+    /// Build a single-band raster whose sole band has source_shape `[8]`, the
+    /// contiguous bytes `0..8`, and a *non-identity* every-other slice view
+    /// (`start=1, step=2, steps=3` → visible `[1, 3, 5]`). Shared by the
+    /// `copy_into` view-override tests, which each derive a band from it and
+    /// inspect how `overrides.view` reshapes the result.
+    fn source_with_non_identity_view() -> arrow_array::StructArray {
+        let transform = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+        let mut ib = RasterBuilder::new(1);
+        ib.start_raster_nd(&transform, &["x"], &[3], None).unwrap();
+        let view = ViewEntries::new(vec![ve(0, 1, 2, 3)]);
+        ib.start_band(StartBandArgs {
+            name: None,
+            view: Some(&view),
+            ..StartBandArgs::new(&["x"], &[8], BandDataType::UInt8)
+        })
+        .unwrap();
+        ib.band_data_writer()
+            .append_value((0u8..8).collect::<Vec<u8>>());
+        ib.finish_band().unwrap();
+        ib.finish_raster().unwrap();
+        ib.finish().unwrap()
     }
 
     #[test]
-    fn copy_into_rejects_non_identity_override_view() {
-        // Identity source, but the caller's override slices it (step 2); the
-        // composed effective view is non-identity and can't be persisted yet.
-        let src = band(&["y", "x"], &[4, 5], &[ve(0, 0, 1, 4), ve(1, 0, 1, 5)]);
-        let override_view = [ve(0, 0, 2, 2), ve(1, 0, 1, 5)];
+    fn copy_into_set_view_uses_it_as_is() {
+        // `Set` is used verbatim against the source's raw_source_shape — it is
+        // NOT composed onto the source's own view. Source view is
+        // (start=1, step=2, steps=3); the override picks (start=1, step=1,
+        // steps=3) → visible [1, 2, 3]. Had copy_into composed the override
+        // onto the source view it would instead yield [3, 5, 7].
+        use crate::array::RasterStructArray;
+        let transform = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+        let in_array = source_with_non_identity_view();
+        let in_rasters = RasterStructArray::try_new(&in_array).unwrap();
+        let in_raster = in_rasters.get(0).unwrap();
+        let in_band = in_raster.band(0).unwrap();
+
+        let override_view = ViewEntries::new(vec![ve(0, 1, 1, 3)]);
         let mut ob = RasterBuilder::new(1);
-        let err = src
+        ob.start_raster_nd(&transform, &["x"], &[3], None).unwrap();
+        in_band
             .copy_into(
                 &mut ob,
                 BandOverrides {
-                    view: Some(&override_view),
+                    view: Override::Set(&override_view),
                     ..Default::default()
                 },
             )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("non-identity"), "unexpected error: {err}");
+            .unwrap();
+        ob.finish_band().unwrap();
+        ob.finish_raster().unwrap();
+        let out_array = ob.finish().unwrap();
+        let out_rasters = RasterStructArray::try_new(&out_array).unwrap();
+        let out_raster = out_rasters.get(0).unwrap();
+        let out_band = out_raster.band(0).unwrap();
+
+        // The derived view is exactly the override, over the source shape.
+        assert_eq!(out_band.view().as_slice(), &[ve(0, 1, 1, 3)]);
+        assert_eq!(out_band.shape(), &[3]);
+        assert_eq!(out_band.raw_source_shape(), &[8]);
+        let buf = out_band.nd_buffer().unwrap();
+        assert_eq!(buf.strides, &[1]);
+        assert_eq!(buf.offset, 1);
+        let visited: Vec<u8> = (0..buf.shape[0])
+            .map(|i| buf.buffer[(buf.offset as i64 + i * buf.strides[0]) as usize])
+            .collect();
+        assert_eq!(visited, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn copy_into_caller_composed_view() {
+        // Composition is the caller's job: to slice the source's *visible*
+        // coordinates, the caller composes against the source view itself and
+        // passes the result as `Set`. Here `next` takes the first two visible
+        // elements of the source ([1, 3, 5] → [1, 3]); composing it onto the
+        // source view (start=1, step=2, steps=3) yields (start=1, step=2,
+        // steps=2), which copy_into persists verbatim.
+        use crate::array::RasterStructArray;
+        let transform = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+        let in_array = source_with_non_identity_view();
+        let in_rasters = RasterStructArray::try_new(&in_array).unwrap();
+        let in_raster = in_rasters.get(0).unwrap();
+        let in_band = in_raster.band(0).unwrap();
+
+        let next = ViewEntries::new(vec![ve(0, 0, 1, 2)]);
+        let composed = in_band.view().compose(&next).unwrap();
+        assert_eq!(composed.as_slice(), &[ve(0, 1, 2, 2)]);
+
+        let mut ob = RasterBuilder::new(1);
+        ob.start_raster_nd(&transform, &["x"], &[2], None).unwrap();
+        in_band
+            .copy_into(
+                &mut ob,
+                BandOverrides {
+                    view: Override::Set(&composed),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ob.finish_band().unwrap();
+        ob.finish_raster().unwrap();
+        let out_array = ob.finish().unwrap();
+        let out_rasters = RasterStructArray::try_new(&out_array).unwrap();
+        let out_raster = out_rasters.get(0).unwrap();
+        let out_band = out_raster.band(0).unwrap();
+
+        assert_eq!(out_band.view().as_slice(), &[ve(0, 1, 2, 2)]);
+        assert_eq!(out_band.shape(), &[2]);
+        assert_eq!(out_band.raw_source_shape(), &[8]);
+        let buf = out_band.nd_buffer().unwrap();
+        assert_eq!(buf.strides, &[2]);
+        assert_eq!(buf.offset, 1);
+        assert!(!buf.is_contiguous());
+        let visited: Vec<u8> = (0..buf.shape[0])
+            .map(|i| buf.buffer[(buf.offset as i64 + i * buf.strides[0]) as usize])
+            .collect();
+        assert_eq!(visited, vec![1, 3]);
+    }
+
+    #[test]
+    fn copy_into_clear_view_resets_to_identity() {
+        // `Clear` drops the source's non-identity view: the derived band carries
+        // the canonical identity view over the source shape, and the underlying
+        // bytes (0..8) are carried over unchanged and readable contiguously.
+        use crate::array::RasterStructArray;
+        let transform = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+        let in_array = source_with_non_identity_view();
+        let in_rasters = RasterStructArray::try_new(&in_array).unwrap();
+        let in_raster = in_rasters.get(0).unwrap();
+        let in_band = in_raster.band(0).unwrap();
+        // Sanity: the source really does carry the non-identity slice.
+        assert_eq!(in_band.view().as_slice(), &[ve(0, 1, 2, 3)]);
+
+        let mut ob = RasterBuilder::new(1);
+        ob.start_raster_nd(&transform, &["x"], &[8], None).unwrap();
+        in_band
+            .copy_into(
+                &mut ob,
+                BandOverrides {
+                    view: Override::Clear,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        ob.finish_band().unwrap();
+        ob.finish_raster().unwrap();
+        let out_array = ob.finish().unwrap();
+        let out_rasters = RasterStructArray::try_new(&out_array).unwrap();
+        let out_raster = out_rasters.get(0).unwrap();
+        let out_band = out_raster.band(0).unwrap();
+
+        // Identity view over the source shape; visible == source.
+        assert_eq!(out_band.view().as_slice(), &[ve(0, 0, 1, 8)]);
+        assert_eq!(out_band.shape(), &[8]);
+        assert_eq!(out_band.raw_source_shape(), &[8]);
+        let buf = out_band.nd_buffer().unwrap();
+        assert!(buf.is_contiguous());
+        assert_eq!(
+            buf.as_contiguous().unwrap(),
+            (0u8..8).collect::<Vec<u8>>().as_slice()
+        );
     }
 
     #[test]

@@ -38,9 +38,11 @@ async-trait = { workspace = true }
 datafusion-common = { workspace = true }
 sedona-common = { workspace = true }
 sedona-schema = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 sedona-testing = { workspace = true }
 approx = { workspace = true }
+arrow-data = { workspace = true }
 arrow-ipc = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

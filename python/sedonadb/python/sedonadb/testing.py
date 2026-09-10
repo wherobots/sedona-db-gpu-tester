@@ -23,6 +23,11 @@ from typing import TYPE_CHECKING, Any, List, Tuple
 import geoarrow.pyarrow as ga
 import pyarrow as pa
 
+from sedonadb.raster_testing import (
+    RANDOM_GRID_BANDS,
+    RANDOM_GRID_HEIGHT,
+    RANDOM_GRID_WIDTH,
+)
 from sedonadb.utility import register_pyarrow_extension_types
 
 register_pyarrow_extension_types()
@@ -174,6 +179,77 @@ class DBEngine:
 
     def create_table_arrow(self, name, obj) -> "DBEngine":
         """Copy an Arrow readable into an engine's native table format"""
+        raise NotImplementedError()
+
+    def create_raster_view(self, name, path) -> "DBEngine":
+        """Register a one-row view `name` with a raster column `rast` read from
+        the GeoTIFF at `path`.
+
+        The single dialect-specific shim in the raster parity suite: each engine
+        ingests the file its own way (SedonaDB via `RS_FromPath`, Sedona Spark
+        via `RS_FromGeoTiff` over a `binaryFile` read), so the query under test
+        stays one shared SQL string that references `rast`.
+        """
+        raise NotImplementedError()
+
+    def create_random_raster_view(
+        self,
+        name,
+        path,
+        *,
+        dtype="uint8",
+        bands=RANDOM_GRID_BANDS,
+        height=RANDOM_GRID_HEIGHT,
+        width=RANDOM_GRID_WIDTH,
+        bbox=None,
+        gdal_transform=None,
+        nodata=None,
+        plants=None,
+    ) -> "DBEngine":
+        """Write a random GeoTIFF at `path` and register it as view `name`
+        (see `create_raster_view`).
+
+        The raster is exactly `DecodedRaster.random(...)` with the same
+        arguments, so a test can anchor with that constructor and the fixture
+        cannot drift from the expectation. The grid defaults to
+        `RANDOM_GRID_BBOX` on the 7x6 grid (2x3 pixels; override with `bbox`
+        or, for grids a bbox cannot express, a raw GDAL `gdal_transform` —
+        at most one). It is small and north-up/CRS-less so nothing reprojects
+        and results stay bit-comparable across engines, and the pixels are
+        seeded, so registering the same `path` on several engines rewrites
+        identical bytes and every engine sees the same raster.
+        """
+        from sedonadb.raster_testing import DecodedRaster
+
+        DecodedRaster.random(
+            dtype,
+            bands=bands,
+            height=height,
+            width=width,
+            bbox=bbox,
+            gdal_transform=gdal_transform,
+            nodata=nodata,
+            plants=plants,
+        ).write_geotiff(path)
+        return self.create_raster_view(name, path)
+
+    def decode_raster_result(self, sql):
+        """Run `sql` (which selects a single raster column) and decode the result
+        raster to a `sedonadb.raster_testing.DecodedRaster` — pixels, geotransform,
+        and per-band nodata — for cross-engine comparison. `None` if the raster is
+        NULL. Each engine decodes its own way (SedonaDB reads the native raster
+        column; Sedona Spark transports it out as GeoTIFF bytes).
+        """
+        raise NotImplementedError()
+
+    def result_has_raster(self, sql) -> bool:
+        """Whether `sql` produces a raster column on this engine.
+
+        Answered from the engine's lazy result schema — nothing executes.
+        This is what lets `compare` pick between the tuple comparison and the
+        decoded-raster comparison without assuming a particular engine as the
+        subject.
+        """
         raise NotImplementedError()
 
     def execute_and_collect(self, query):
@@ -374,6 +450,28 @@ class SedonaDB(DBEngine):
     def create_table_arrow(self, name, obj) -> "SedonaDB":
         self.con.create_data_frame(obj).to_view(name, overwrite=True)
         return self
+
+    def create_raster_view(self, name, path) -> "SedonaDB":
+        self.con.sql(f"SELECT RS_FromPath('{path}') AS rast").to_view(
+            name, overwrite=True
+        )
+        return self
+
+    def decode_raster_result(self, sql):
+        from sedonadb.raster_testing import decode_raster
+
+        # RS_FromPath yields an OutDb (lazy) raster, so materialize the result
+        # before reading its pixels; Sedona Spark's RS_FromGeoTiff loads eagerly,
+        # so this keeps the two engines comparing the same bytes.
+        loaded = f"SELECT RS_EnsureLoaded(c) AS c FROM ({sql}) AS sub(c)"
+        table = self.execute_and_collect(loaded)
+        return decode_raster(table.column(0)[0])
+
+    def result_has_raster(self, sql) -> bool:
+        schema = pa.schema(self.con.sql(sql).schema)
+        return any(
+            getattr(t, "extension_name", None) == "sedona.raster" for t in schema.types
+        )
 
     def execute_and_collect(self, query) -> "sedonadb.dataframe.DataFrame":
         # Use to_arrow_table() to maintain ordering of the input table
@@ -903,6 +1001,62 @@ class ArrowSQLCache:
             f.writelines(self._header_lines)
             yaml.dump(doc, f, default_flow_style=False, sort_keys=True)
         self._dirty = False
+
+
+def compare(sql, *engines, expected=None):
+    """Assert every engine returns the same result for one shared SQL string.
+
+    The cross-engine parity assertion. The first engine is the subject — its
+    result is the "got" side of every failure message — and each further
+    engine's result is an expected side, so with more than two engines the
+    subject is checked against every reference (which, by transitivity, means
+    they all agree).
+
+    Table-shaped results are compared in `result_to_tuples` form, the
+    representation built for verifying results between engines: Arrow
+    stringifies values identically on every side, NULL stays `None`, and NaN
+    becomes the string ``"nan"`` (bare float equality would lose it). A result
+    with a raster column is instead decoded on every engine
+    (`decode_raster_result`) and compared with
+    `sedonadb.raster_testing.assert_decoded_equal`; every engine agreeing the
+    raster is NULL also counts as agreement. The dispatch asks the subject's
+    `result_has_raster`, answered from its lazy result schema, so any engine
+    that implements the raster hooks can be the subject.
+
+    `expected` (optional) anchors the comparison to a known value: the subject
+    is asserted against it first, and the references are then anchored
+    transitively. Engines agreeing with each other is not proof that any of
+    them is right — every engine returning the same wrong thing (say, a no-op
+    where an operation was meant to happen) passes the parity claim — so pass
+    an anchor whenever the expected result is easy to state. For table results
+    `expected` is anything `assert_result` accepts (a float, a list of
+    `result_to_tuples` rows, a pandas frame, ...); for raster results it is a
+    `sedonadb.raster_testing.DecodedRaster`.
+    """
+    if len(engines) < 2:
+        raise ValueError("compare() needs at least two engines")
+    subject, references = engines[0], engines[1:]
+
+    if subject.result_has_raster(sql):
+        from sedonadb.raster_testing import assert_decoded_equal
+
+        got = subject.decode_raster_result(sql)
+        if expected is not None:
+            assert_decoded_equal(got, expected, context=sql)
+        for reference in references:
+            reference_raster = reference.decode_raster_result(sql)
+            if got is None and reference_raster is None:
+                continue
+            assert_decoded_equal(got, reference_raster, context=sql)
+    else:
+        result = subject.execute_and_collect(sql)
+        if expected is not None:
+            subject.assert_result(result, expected)
+        for reference in references:
+            reference_tuples = reference.result_to_tuples(
+                reference.execute_and_collect(sql)
+            )
+            subject.assert_result(result, reference_tuples)
 
 
 def geom_or_null(arg, srid=None):

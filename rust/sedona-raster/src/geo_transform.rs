@@ -34,7 +34,7 @@
 //!
 //! [`RasterRef::transform`]: crate::traits::RasterRef::transform
 
-use arrow_schema::ArrowError;
+use crate::error::RasterError;
 
 /// An affine geo-transform: six coefficients mapping pixel/line to projection coordinates.
 ///
@@ -59,9 +59,16 @@ pub trait GeoTransformEx {
 
     /// Invert this geo-transform, returning the inverse coefficients for
     /// computing (geo_x, geo_y) -> (x, y) transformations.
-    fn invert(&self) -> Result<GeoTransform, ArrowError>;
+    fn invert(&self) -> Result<GeoTransform, RasterError>;
 
     /// Rotation angle (radians) implied by the coefficients.
+    ///
+    /// Sedona Spark's `RS_Rotation` formula: `acos(scaleX / hypot(scaleX,
+    /// skewY))`, negated when `skewY > 0` — the (clockwise-positive) angle of
+    /// the grid's column-axis direction `(scaleX, skewY)`, which decomposes a
+    /// rigid rotation correctly for any pixel shape. The previous
+    /// `atan2(-skewX, scaleX)` mixed the row axis's skew into the answer and
+    /// misreported rigid rotations of non-square pixels (and shear).
     fn rotation(&self) -> f64;
 
     /// x-coordinate of the upper-left corner of the upper-left pixel (`[0]`).
@@ -88,7 +95,7 @@ impl GeoTransformEx for [f64] {
     }
 
     /// Pure-Rust equivalent of GDAL's `GDALInvGeoTransform`.
-    fn invert(&self) -> Result<GeoTransform, ArrowError> {
+    fn invert(&self) -> Result<GeoTransform, RasterError> {
         let gt = self;
 
         // Fast path: no rotation/skew — avoid determinant and precision issues.
@@ -111,7 +118,7 @@ impl GeoTransformEx for [f64] {
             .max(gt[4].abs().max(gt[5].abs()));
 
         if det.abs() <= 1e-10 * magnitude * magnitude {
-            return Err(ArrowError::InvalidArgumentError(
+            return Err(RasterError::Invalid(
                 "Geo transform is uninvertible".to_string(),
             ));
         }
@@ -130,7 +137,14 @@ impl GeoTransformEx for [f64] {
 
     #[inline]
     fn rotation(&self) -> f64 {
-        (-self.skew_x()).atan2(self.scale_x())
+        // acos rather than atan2 of the same ratio so an axis-aligned grid
+        // reports +0.0 and a mirrored one +pi, matching Sedona Spark exactly.
+        let theta = (self.scale_x() / self.scale_x().hypot(self.skew_y())).acos();
+        if self.skew_y() > 0.0 {
+            -theta
+        } else {
+            theta
+        }
     }
 
     #[inline]
@@ -180,18 +194,18 @@ pub fn geotransform_from_bbox_and_spatial_shape(
     height: u64,
     width: u64,
     registration: Option<&str>,
-) -> Result<GeoTransform, ArrowError> {
+) -> Result<GeoTransform, RasterError> {
     let [xmin, ymin, xmax, ymax] = bbox;
     // Reject a degenerate or inverted bbox: a zero span gives a non-invertible
     // (zero-scale) transform and a negative span isn't north-up.
     if !(xmax > xmin && ymax > ymin) {
-        return Err(ArrowError::InvalidArgumentError(format!(
+        return Err(RasterError::Invalid(format!(
             "bbox must have xmin < xmax and ymin < ymax; got [{xmin}, {ymin}, {xmax}, {ymax}]"
         )));
     }
     // A real raster axis is at least 1 cell.
     if height == 0 || width == 0 {
-        return Err(ArrowError::InvalidArgumentError(
+        return Err(RasterError::Invalid(
             "raster spatial dimensions must be non-zero to derive a transform from a bbox".into(),
         ));
     }
@@ -213,7 +227,7 @@ pub fn geotransform_from_bbox_and_spatial_shape(
         // a cell beyond — the corner sits half a cell outside the bbox.
         "node" => {
             if width < 2.0 || height < 2.0 {
-                return Err(ArrowError::InvalidArgumentError(
+                return Err(RasterError::Invalid(
                     "node-registered grid must be at least 2 cells in each spatial dimension"
                         .into(),
                 ));
@@ -223,7 +237,7 @@ pub fn geotransform_from_bbox_and_spatial_shape(
             (scale_x, scale_y, xmin - scale_x / 2.0, ymax - scale_y / 2.0)
         }
         other => {
-            return Err(ArrowError::InvalidArgumentError(format!(
+            return Err(RasterError::Invalid(format!(
                 "registration must be \"pixel\" or \"node\"; got {other:?}"
             )))
         }
@@ -236,7 +250,7 @@ pub fn geotransform_from_bbox_and_spatial_shape(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
-    use std::f64::consts::{FRAC_1_SQRT_2, PI};
+    use std::f64::consts::PI;
 
     #[test]
     fn test_apply_no_rotation() {
@@ -323,32 +337,35 @@ mod tests {
 
     #[test]
     fn test_rotation() {
-        // 0 degrees.
+        // Axis-aligned -> exactly +0.0 (acos yields the positive zero Sedona
+        // Spark reports; the previous atan2 spelling returned -0.0).
         let gt: GeoTransform = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
         assert_eq!(gt.rotation(), 0.0);
+        assert!(gt.rotation().is_sign_positive());
 
-        // pi/2.
-        let gt: GeoTransform = [0.0, 0.0, -1.0, 0.0, 1.0, 0.0];
-        assert_relative_eq!(gt.rotation(), PI / 2.0, epsilon = 1e-6);
+        // A rigid rotation by theta of a north-up grid with pixel (px, py):
+        // (scale_x, skew_x, skew_y, scale_y) = (px*cos, py*sin, px*sin,
+        // -py*cos); reads back as -theta, for any pixel shape.
+        let (sin, cos) = (PI / 6.0).sin_cos();
+        let gt: GeoTransform = [0.0, cos, sin, 0.0, sin, -cos];
+        assert_relative_eq!(gt.rotation(), -PI / 6.0, epsilon = 1e-12);
+        let gt: GeoTransform = [0.0, cos, -sin, 0.0, -sin, -cos];
+        assert_relative_eq!(gt.rotation(), PI / 6.0, epsilon = 1e-12);
+        let gt: GeoTransform = [0.0, 2.0 * cos, 3.0 * sin, 0.0, 2.0 * sin, -3.0 * cos];
+        assert_relative_eq!(gt.rotation(), -PI / 6.0, epsilon = 1e-12);
 
-        // pi/4.
-        let gt: GeoTransform = [
-            0.0,
-            FRAC_1_SQRT_2,
-            -FRAC_1_SQRT_2,
-            0.0,
-            FRAC_1_SQRT_2,
-            FRAC_1_SQRT_2,
-        ];
-        assert_relative_eq!(gt.rotation(), PI / 4.0, epsilon = 1e-6);
+        // Under shear the angle follows the column-axis direction
+        // (scale_x, skew_y) — Sedona Spark's convention.
+        let gt: GeoTransform = [0.0, 0.2, 0.06, 0.0, 0.08, -0.3];
+        assert_relative_eq!(
+            gt.rotation(),
+            -(0.2f64 / 0.2f64.hypot(0.08)).acos(),
+            epsilon = 1e-15
+        );
 
-        // pi/3.
-        let gt: GeoTransform = [0.0, 0.5, -0.866025, 0.0, 0.866025, 0.5];
-        assert_relative_eq!(gt.rotation(), PI / 3.0, epsilon = 1e-6);
-
-        // pi.
+        // A mirrored grid (scale_x < 0) reports +pi.
         let gt: GeoTransform = [0.0, -1.0, 0.0, 0.0, 0.0, -1.0];
-        assert_relative_eq!(gt.rotation(), -PI, epsilon = 1e-6);
+        assert_relative_eq!(gt.rotation(), PI, epsilon = 1e-12);
     }
 
     #[test]

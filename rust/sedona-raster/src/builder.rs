@@ -16,21 +16,19 @@
 // under the License.
 
 use arrow_array::{
-    builder::{
-        ArrayBuilder, BinaryBuilder, BinaryViewBuilder, BooleanBuilder, Float64Builder,
-        Int64Builder, StringBuilder, StringViewBuilder, UInt32Builder,
-    },
+    builder::{BinaryViewBuilder, BooleanBuilder, Float64Builder, Int64Builder, StringViewBuilder},
     Array, ArrayRef, BinaryViewArray, ListArray, StructArray,
 };
-use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{ArrowError, DataType};
-use std::collections::HashMap;
+use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+use arrow_schema::DataType;
 use std::sync::Arc;
 
 use sedona_schema::raster::{BandDataType, RasterSchema};
 
-use crate::traits::{BandOverrides, RasterRef};
-use crate::view_entries::{ViewEntries, ViewEntry};
+use crate::band_builder::{BandArrayBuilder, BandWriter};
+use crate::error::RasterError;
+use crate::traits::{BandOverrides, BandRef, Override, RasterRef};
+use crate::view_entries::ViewEntries;
 
 /// Raster-level metadata overrides for [`RasterBuilder::start_raster_from`] and
 /// [`RasterBuilder::copy_raster_from`]. A `None` field inherits the source
@@ -40,11 +38,6 @@ pub struct RasterOverrides {
     /// Override the 6-element GDAL geotransform; `None` inherits the source's.
     pub transform: Option<[f64; 6]>,
 }
-
-/// Maximum byte length of an inline `BinaryViewArray` view. Views this short
-/// store their bytes in the 16-byte view itself; longer views reference a data
-/// block by `(buffer_index, offset)`. Fixed by the Arrow columnar format spec.
-const MAX_INLINE_VIEW_LEN: u32 = 12;
 
 /// Builder for constructing raster arrays with zero-copy band data writing
 ///
@@ -92,29 +85,11 @@ pub struct RasterBuilder {
     spatial_shape_values: Int64Builder,
     spatial_shape_offsets: Vec<i32>,
 
-    // Band fields (flattened across all bands)
-    band_name: StringBuilder,
-    band_dim_names_values: StringBuilder,
-    band_dim_names_offsets: Vec<i32>,
-    band_shape_values: Int64Builder,
-    band_shape_offsets: Vec<i32>,
-    band_datatype: UInt32Builder,
-    band_nodata: BinaryBuilder,
-    // VIEW field — one entry per visible dimension per band. Stored as four
-    // parallel Int64 columns + a List offset vector; assembled into a
-    // `ListArray<StructArray<Int64,Int64,Int64,Int64>>` in `finish()`.
-    band_view_source_axis_values: Int64Builder,
-    band_view_start_values: Int64Builder,
-    band_view_step_values: Int64Builder,
-    band_view_steps_values: Int64Builder,
-    band_view_offsets: Vec<i32>,
-    // Per-band validity for the view list. `false` means the row is null —
-    // the canonical representation of an identity view. `true` means the row
-    // carries an explicit view in the four parallel value builders.
-    band_view_validity: Vec<bool>,
-    band_outdb_uri: StringBuilder,
-    band_outdb_format: StringViewBuilder,
-    band_data: BinaryViewBuilder,
+    // The flat, per-band columns — see [`BandArrayBuilder`]. Everything
+    // below is raster-envelope bookkeeping layered on top of it: grouping
+    // its rows into a per-raster list, and validating them against each
+    // raster's spatial grid.
+    bands: BandArrayBuilder,
 
     // List structure tracking
     band_offsets: Vec<i32>,  // Track where each raster's bands start/end
@@ -130,15 +105,6 @@ pub struct RasterBuilder {
     current_spatial_shape: Vec<i64>,
     current_raster_bands: Vec<(Vec<String>, Vec<i64>)>,
 
-    // Track band_data count at the start of each band for finish_band validation
-    band_data_count_at_start: usize,
-
-    // Zero-copy band-data dedup: maps an already-appended source `Buffer`'s
-    // data pointer to its block index in `band_data`, so the same backing
-    // buffer (e.g. many bands sharing one source column block) is attached
-    // once and referenced by multiple views. See `append_band_data_buffer`.
-    band_data_blocks: HashMap<usize, u32>,
-
     raster_validity: BooleanBuilder,
 }
 
@@ -151,7 +117,7 @@ pub struct StartBandArgs<'a> {
     pub source_shape: &'a [i64],
     /// Per-axis window of offsets/steps over `source_shape`. `None` is the
     /// canonical identity view (the whole source buffer in C order).
-    pub view: Option<&'a [ViewEntry]>,
+    pub view: Option<&'a ViewEntries>,
     pub data_type: BandDataType,
     pub nodata: Option<&'a [u8]>,
     pub outdb_uri: Option<&'a str>,
@@ -177,6 +143,22 @@ impl<'a> StartBandArgs<'a> {
     }
 }
 
+/// Arguments to [`RasterBuilder::with_view`]. Mirrors
+/// [`StartBandArgs`] minus the two fields `with_view` derives from
+/// `input` (`source_shape` from `input.raw_source_shape()`, `data_type` from
+/// `input.data_type()`) — accepting those from the caller would let them
+/// contradict `input`. `view` here is a *delta* composed against
+/// `input.view()`, not the absolute view stored on the band.
+pub struct WithViewArgs<'a> {
+    pub name: Option<&'a str>,
+    pub dim_names: &'a [&'a str],
+    pub input: &'a dyn BandRef,
+    pub view: &'a ViewEntries,
+    pub nodata: Option<&'a [u8]>,
+    pub outdb_uri: Option<&'a str>,
+    pub outdb_format: Option<&'a str>,
+}
+
 impl RasterBuilder {
     /// Create a new raster builder with the specified capacity.
     pub fn new(capacity: usize) -> Self {
@@ -189,22 +171,7 @@ impl RasterBuilder {
             spatial_shape_values: Int64Builder::with_capacity(capacity * 2),
             spatial_shape_offsets: vec![0],
 
-            band_name: StringBuilder::with_capacity(capacity, capacity),
-            band_dim_names_values: StringBuilder::with_capacity(capacity * 2, capacity * 4),
-            band_dim_names_offsets: vec![0],
-            band_shape_values: Int64Builder::with_capacity(capacity * 2),
-            band_shape_offsets: vec![0],
-            band_datatype: UInt32Builder::with_capacity(capacity),
-            band_nodata: BinaryBuilder::with_capacity(capacity, capacity),
-            band_view_source_axis_values: Int64Builder::with_capacity(capacity * 2),
-            band_view_start_values: Int64Builder::with_capacity(capacity * 2),
-            band_view_step_values: Int64Builder::with_capacity(capacity * 2),
-            band_view_steps_values: Int64Builder::with_capacity(capacity * 2),
-            band_view_offsets: vec![0],
-            band_view_validity: Vec::with_capacity(capacity),
-            band_outdb_uri: StringBuilder::with_capacity(capacity, capacity),
-            band_outdb_format: StringViewBuilder::with_capacity(capacity),
-            band_data: BinaryViewBuilder::with_capacity(capacity),
+            bands: BandArrayBuilder::new(capacity),
 
             band_offsets: vec![0],
             current_band_count: 0,
@@ -214,9 +181,6 @@ impl RasterBuilder {
             current_spatial_dims: Vec::new(),
             current_spatial_shape: Vec::new(),
             current_raster_bands: Vec::new(),
-
-            band_data_count_at_start: 0,
-            band_data_blocks: HashMap::new(),
 
             raster_validity: BooleanBuilder::with_capacity(capacity),
         }
@@ -237,9 +201,9 @@ impl RasterBuilder {
         spatial_dims: &[&str],
         spatial_shape: &[i64],
         crs: Option<&str>,
-    ) -> Result<(), ArrowError> {
+    ) -> Result<(), RasterError> {
         if spatial_dims.len() != spatial_shape.len() {
-            return Err(ArrowError::InvalidArgumentError(format!(
+            return Err(RasterError::Invalid(format!(
                 "spatial_dims.len() ({}) must equal spatial_shape.len() ({})",
                 spatial_dims.len(),
                 spatial_shape.len()
@@ -296,11 +260,11 @@ impl RasterBuilder {
         &mut self,
         source: &dyn RasterRef,
         overrides: RasterOverrides,
-    ) -> Result<(), ArrowError> {
+    ) -> Result<(), RasterError> {
         let transform: [f64; 6] = match overrides.transform {
             Some(transform) => transform,
             None => source.transform().try_into().map_err(|_| {
-                ArrowError::InvalidArgumentError("raster transform is not 6 elements".to_string())
+                RasterError::Invalid("raster transform is not 6 elements".to_string())
             })?,
         };
         let spatial_dims = source.spatial_dims();
@@ -321,7 +285,7 @@ impl RasterBuilder {
         &mut self,
         source: &dyn RasterRef,
         overrides: RasterOverrides,
-    ) -> Result<(), ArrowError> {
+    ) -> Result<(), RasterError> {
         self.start_raster_from(source, overrides)?;
         for band_idx in 0..source.num_bands() {
             source
@@ -349,7 +313,7 @@ impl RasterBuilder {
         skew_x: f64,
         skew_y: f64,
         crs: Option<&str>,
-    ) -> Result<(), ArrowError> {
+    ) -> Result<(), RasterError> {
         let transform = [origin_x, scale_x, skew_x, origin_y, skew_y, scale_y];
         self.start_raster_nd(&transform, &["x", "y"], &[width, height], crs)?;
         self.current_width = width;
@@ -368,123 +332,92 @@ impl RasterBuilder {
     /// `view` is a per-axis window of offsets/steps over `source_shape`.
     /// `None` is the canonical identity view — the whole source buffer in C
     /// order — encoded as the identity null sentinel. A `Some` view is
-    /// validated against `source_shape`; the band schema stores a view only as
-    /// that identity null sentinel, so an identity `Some` view is stored the
-    /// same as `None` and a non-identity view is rejected. View persistence is
-    /// tracked in <https://github.com/apache/sedona-db/issues/897>.
-    pub fn start_band(&mut self, args: StartBandArgs<'_>) -> Result<(), ArrowError> {
-        let StartBandArgs {
+    /// validated against `source_shape`; an identity `Some` view is stored the
+    /// same as `None` (the null sentinel), while a non-identity view (a slice,
+    /// broadcast, permutation, or reverse) is persisted explicitly into the
+    /// band's four parallel view columns. In that case the `shape` column holds
+    /// the *source* shape and the visible shape is derived from the view on
+    /// read; the source bytes are carried over unchanged.
+    pub fn start_band(&mut self, args: StartBandArgs<'_>) -> Result<(), RasterError> {
+        self.start_band_and_record(args)?;
+        Ok(())
+    }
+
+    /// Shared by the inherent [`Self::start_band`] (used directly by ~20
+    /// call sites across the raster function crates, which don't need the
+    /// recorded `(dim_names, visible_shape)`) and `impl BandWriter for
+    /// RasterBuilder` (used by [`BandRef::copy_into`](crate::traits::
+    /// BandRef::copy_into), which does need it — see [`BandWriter::
+    /// start_band`]). Both delegate here rather than to each other, so
+    /// there's no same-type self-call to disambiguate between the inherent
+    /// method and the trait impl of the same name.
+    fn start_band_and_record(
+        &mut self,
+        args: StartBandArgs<'_>,
+    ) -> Result<(Vec<String>, Vec<i64>), RasterError> {
+        let (dim_names, shape) = self.bands.start_band(args)?;
+        self.current_band_count += 1;
+        self.current_raster_bands
+            .push((dim_names.clone(), shape.clone()));
+        Ok((dim_names, shape))
+    }
+
+    /// Build a band that is a new view into an existing band.
+    ///
+    /// The output band stores a view that is the composition of `input`'s
+    /// existing view with the supplied `view`. The supplied `view`'s
+    /// `source_axis` entries refer to `input`'s *visible* axes, not its
+    /// source axes — composition with `input.view()` translates them, so the
+    /// caller expresses the slice in the coordinates it sees.
+    ///
+    /// `dim_names` names the output's *visible* axes (`len() == view.len()`).
+    ///
+    /// Storage:
+    /// - **InDb input** → output is InDb. The input's source bytes are carried
+    ///   over via [`BandRef::append_data_into`] (zero-copy when the impl shares
+    ///   its backing `Buffer`); the composed view addresses the visible region
+    ///   within them.
+    /// - **OutDb input** → output is OutDb. The data column stays empty and the
+    ///   input's `outdb_uri` / `outdb_format` are inherited (unless overridden);
+    ///   the composed view lives alongside the same external pointer and loading
+    ///   is deferred to whoever reads the visible bytes.
+    ///
+    /// Identity-input shortcut: when `input` carries the identity view, the
+    /// composed view equals `view` verbatim.
+    pub fn with_view(&mut self, args: WithViewArgs) -> Result<(), RasterError> {
+        let WithViewArgs {
             name,
             dim_names,
-            source_shape,
+            input,
             view,
-            data_type,
             nodata,
             outdb_uri,
             outdb_format,
         } = args;
-
-        // A caller-supplied view is validated against source_shape. The schema
-        // stores views only as the identity null sentinel today, so a
-        // non-identity view can't round-trip — reject it up front, before any
-        // column append, rather than persisting mislocated bytes.
-        if let Some(view) = view {
-            let ndim = dim_names.len();
-            if ndim == 0 {
-                return Err(ArrowError::InvalidArgumentError(
-                    "start_band: 0-dimensional bands are not supported".into(),
-                ));
-            }
-            if source_shape.len() != ndim || view.len() != ndim {
-                return Err(ArrowError::InvalidArgumentError(format!(
-                    "start_band: dim_names ({}), source_shape ({}), and view ({}) \
-                     must all have the same length",
-                    ndim,
-                    source_shape.len(),
-                    view.len()
-                )));
-            }
-            let view_entries = ViewEntries::new(view.to_vec());
-            view_entries.validate(source_shape)?;
-            if !view_entries.is_identity(source_shape) {
-                return Err(ArrowError::InvalidArgumentError(
-                    "start_band: persisting a non-identity band view is not yet \
-                     supported (see https://github.com/apache/sedona-db/issues/897); \
-                     materialize the band (e.g. via RS_EnsureContiguous) first"
-                        .into(),
-                ));
-            }
-        }
-
-        if dim_names.is_empty() {
-            return Err(ArrowError::InvalidArgumentError(
-                "start_band: 0-dimensional bands are not supported".into(),
-            ));
-        }
-        if dim_names.len() != source_shape.len() {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "start_band: dim_names ({}) and shape ({}) must have the same length",
-                dim_names.len(),
-                source_shape.len(),
-            )));
-        }
-        // Name
-        match name {
-            Some(n) => self.band_name.append_value(n),
-            None => self.band_name.append_null(),
-        }
-
-        // Dim names
-        for dn in dim_names {
-            self.band_dim_names_values.append_value(dn);
-        }
-        let next = *self.band_dim_names_offsets.last().unwrap() + dim_names.len() as i32;
-        self.band_dim_names_offsets.push(next);
-
-        // Shape
-        for &s in source_shape {
-            self.band_shape_values.append_value(s);
-        }
-        let next = *self.band_shape_offsets.last().unwrap() + source_shape.len() as i32;
-        self.band_shape_offsets.push(next);
-
-        // Data type
-        self.band_datatype.append_value(data_type as u32);
-
-        // Nodata
-        match nodata {
-            Some(nodata_bytes) => self.band_nodata.append_value(nodata_bytes),
-            None => self.band_nodata.append_null(),
-        }
-
-        // VIEW: canonical identity is encoded as a null list entry — no
-        // values appended, offset unchanged, validity bit cleared.
-        let next = *self.band_view_offsets.last().unwrap();
-        self.band_view_offsets.push(next);
-        self.band_view_validity.push(false);
-
-        // OutDb URI
-        match outdb_uri {
-            Some(uri) => self.band_outdb_uri.append_value(uri),
-            None => self.band_outdb_uri.append_null(),
-        }
-
-        // OutDb format
-        match outdb_format {
-            Some(format) => self.band_outdb_format.append_value(format),
-            None => self.band_outdb_format.append_null(),
-        }
-
-        self.current_band_count += 1;
-        self.band_data_count_at_start = self.band_data.len();
-
-        // Record this band's dims/shape for strict validation at finish_raster.
-        self.current_raster_bands.push((
-            dim_names.iter().map(|s| s.to_string()).collect(),
-            source_shape.to_vec(),
-        ));
-
-        Ok(())
+        // `copy_into` never composes the view, so compose the delta here:
+        // `view` addresses `input`'s *visible* axes, and composing it onto
+        // `input.view()` yields the absolute source-space view that `copy_into`
+        // persists verbatim (`Override::Set`). `compose` also bounds the delta
+        // against the parent's visible window, so a slice can't re-expose bytes
+        // the input had already sliced away.
+        let composed = input.view().compose(view)?;
+        // Everything the caller leaves unset inherits from the source via
+        // `Override::Keep`, including `nodata` — the source's sentinel must
+        // carry over rather than being dropped. An explicit caller value
+        // becomes `Override::Set`.
+        input.copy_into(
+            self,
+            BandOverrides {
+                name: name.map_or(Override::Keep, Override::Set),
+                dim_names: Some(dim_names),
+                nodata: nodata.map_or(Override::Keep, Override::Set),
+                outdb_uri: outdb_uri.map_or(Override::Keep, Override::Set),
+                outdb_format: outdb_format.map_or(Override::Keep, Override::Set),
+                source_shape: None,
+                view: Override::Set(&composed),
+                data: Override::Keep,
+            },
+        )
     }
 
     /// Convenience: start a 2D band with `dim_names=["y","x"]` and `shape=[height, width]`.
@@ -495,9 +428,9 @@ impl RasterBuilder {
         &mut self,
         data_type: BandDataType,
         nodata: Option<&[u8]>,
-    ) -> Result<(), ArrowError> {
+    ) -> Result<(), RasterError> {
         if self.current_width == 0 && self.current_height == 0 {
-            return Err(ArrowError::InvalidArgumentError(
+            return Err(RasterError::Invalid(
                 "start_band_2d requires prior start_raster_2d (width and height are 0)".into(),
             ));
         }
@@ -513,23 +446,13 @@ impl RasterBuilder {
 
     /// Get direct access to the BinaryViewBuilder for writing the current band's data.
     pub fn band_data_writer(&mut self) -> &mut BinaryViewBuilder {
-        &mut self.band_data
+        self.bands.band_data_writer()
     }
 
     /// Append the current band's data as a **zero-copy** view into an existing
-    /// Arrow [`Buffer`], rather than copying bytes via `append_value`.
-    ///
-    /// `buffer` is attached to the output `BinaryViewArray` as a shared data
-    /// block (a refcount bump, never a copy) and a single view row referencing
-    /// `[offset, offset + len)` is appended. Buffers are de-duplicated by data
-    /// pointer, so handing the same backing buffer for many bands attaches it
-    /// once and points every view at it.
-    ///
-    /// Bytes at or under the inline threshold ([`MAX_INLINE_VIEW_LEN`]) are
-    /// stored inline (a tiny copy) instead, since the `BinaryViewArray` layout
-    /// requires such views to be inline and a block-referencing view of that
-    /// size is non-canonical (it fails array validation on roundtrip). Band
-    /// data is realistically always larger, so this is the degenerate path.
+    /// Arrow [`Buffer`], rather than copying bytes via `append_value`. See
+    /// [`crate::band_builder::BandArrayBuilder::append_band_data_buffer`] for
+    /// the full documentation — identical logic, delegated.
     ///
     /// Counts as the one data value for the current band (see [`finish_band`]).
     ///
@@ -539,29 +462,15 @@ impl RasterBuilder {
         buffer: &Buffer,
         offset: u32,
         len: u32,
-    ) -> Result<(), ArrowError> {
-        if len <= MAX_INLINE_VIEW_LEN {
-            self.band_data
-                .append_value(&buffer.as_slice()[offset as usize..(offset + len) as usize]);
-            return Ok(());
-        }
-        let block = match self.band_data_blocks.get(&(buffer.as_ptr() as usize)) {
-            Some(&idx) => idx,
-            None => {
-                // `clone` bumps the buffer's refcount; the bytes are not copied.
-                let idx = self.band_data.append_block(buffer.clone());
-                self.band_data_blocks.insert(buffer.as_ptr() as usize, idx);
-                idx
-            }
-        };
-        self.band_data.try_append_view(block, offset, len)
+    ) -> Result<(), RasterError> {
+        self.bands.append_band_data_buffer(buffer, offset, len)
     }
 
     /// Append the current band's data by copying row `row` of `src` through —
     /// zero-copy when the row's bytes are block-backed (shares the backing
     /// `Buffer` via [`append_band_data_buffer`]), with a small copy only for
-    /// inline views (≤ [`MAX_INLINE_VIEW_LEN`] bytes, which live in the view
-    /// itself and have no backing buffer).
+    /// inline views (which live in the view itself and have no backing
+    /// buffer).
     ///
     /// Counts as the one data value for the current band (see [`finish_band`]).
     ///
@@ -570,41 +479,15 @@ impl RasterBuilder {
         &mut self,
         src: &BinaryViewArray,
         row: usize,
-    ) -> Result<(), ArrowError> {
-        // Arrow BYTE_VIEW layout (u128, little-endian fields), fixed by the
-        // columnar format spec:
-        //   bits   0..32  length
-        //   bits  32..64  prefix
-        //   bits  64..96  buffer_index
-        //   bits  96..128 offset
-        // A view of `length <= MAX_INLINE_VIEW_LEN` stores its bytes inline and
-        // has no backing buffer to share.
-        let view = src.views()[row];
-        let len = view as u32;
-        if len <= MAX_INLINE_VIEW_LEN {
-            self.band_data.append_value(src.value(row));
-            Ok(())
-        } else {
-            let buffer_index = (view >> 64) as u32;
-            let offset = (view >> 96) as u32;
-            self.append_band_data_buffer(&src.data_buffers()[buffer_index as usize], offset, len)
-        }
+    ) -> Result<(), RasterError> {
+        self.bands.append_band_data_from(src, row)
     }
 
     /// Finish writing the current band.
     ///
     /// Validates that exactly one data value was appended since `start_band()`.
-    pub fn finish_band(&mut self) -> Result<(), ArrowError> {
-        let current_count = self.band_data.len();
-        if current_count != self.band_data_count_at_start + 1 {
-            return Err(ArrowError::InvalidArgumentError(
-                format!(
-                    "Expected exactly one band data value per band, but got {} appended since start_band()",
-                    current_count - self.band_data_count_at_start
-                ),
-            ));
-        }
-        Ok(())
+    pub fn finish_band(&mut self) -> Result<(), RasterError> {
+        self.bands.finish_band()
     }
 
     /// Finish all bands for the current raster.
@@ -612,14 +495,14 @@ impl RasterBuilder {
     /// Strictly validates every band added since `start_raster_nd`: each name in
     /// the top-level `spatial_dims` must appear in the band's own `dim_names`
     /// with a size matching the corresponding entry in `spatial_shape`.
-    pub fn finish_raster(&mut self) -> Result<(), ArrowError> {
+    pub fn finish_raster(&mut self) -> Result<(), RasterError> {
         for (band_idx, (band_dims, band_shape)) in self.current_raster_bands.iter().enumerate() {
             for (spatial_idx, spatial_dim) in self.current_spatial_dims.iter().enumerate() {
                 let pos = band_dims
                     .iter()
                     .position(|d| d == spatial_dim)
                     .ok_or_else(|| {
-                        ArrowError::InvalidArgumentError(format!(
+                        RasterError::Invalid(format!(
                             "Band {band_idx} is missing spatial dimension {spatial_dim:?} \
                          (band dim_names = {band_dims:?})"
                         ))
@@ -627,7 +510,7 @@ impl RasterBuilder {
                 let expected = self.current_spatial_shape[spatial_idx];
                 let actual = band_shape[pos];
                 if actual != expected {
-                    return Err(ArrowError::InvalidArgumentError(format!(
+                    return Err(RasterError::Invalid(format!(
                         "Band {band_idx} dimension {spatial_dim:?} has size {actual}, \
                          expected {expected} from top-level spatial_shape"
                     )));
@@ -645,7 +528,7 @@ impl RasterBuilder {
     }
 
     /// Append a null raster.
-    pub fn append_null(&mut self) -> Result<(), ArrowError> {
+    pub fn append_null(&mut self) -> Result<(), RasterError> {
         // Transform: append 6 zeros
         for _ in 0..6 {
             self.transform_values.append_value(0.0);
@@ -673,12 +556,12 @@ impl RasterBuilder {
     }
 
     /// Finish building and return the constructed StructArray.
-    pub fn finish(mut self) -> Result<StructArray, ArrowError> {
+    pub fn finish(mut self) -> Result<StructArray, RasterError> {
         // Build transform list
         let transform_values = self.transform_values.finish();
         let transform_offsets = OffsetBuffer::new(ScalarBuffer::from(self.transform_offsets));
         let DataType::List(transform_field) = RasterSchema::transform_type() else {
-            return Err(ArrowError::SchemaError(
+            return Err(RasterError::Invalid(
                 "Expected list type for transform".to_string(),
             ));
         };
@@ -693,7 +576,7 @@ impl RasterBuilder {
         let spatial_dims_values = self.spatial_dims_values.finish();
         let spatial_dims_offsets = OffsetBuffer::new(ScalarBuffer::from(self.spatial_dims_offsets));
         let DataType::List(spatial_dims_field) = RasterSchema::spatial_dims_type() else {
-            return Err(ArrowError::SchemaError(
+            return Err(RasterError::Invalid(
                 "Expected list type for spatial_dims".to_string(),
             ));
         };
@@ -709,7 +592,7 @@ impl RasterBuilder {
         let spatial_shape_offsets =
             OffsetBuffer::new(ScalarBuffer::from(self.spatial_shape_offsets));
         let DataType::List(spatial_shape_field) = RasterSchema::spatial_shape_type() else {
-            return Err(ArrowError::SchemaError(
+            return Err(RasterError::Invalid(
                 "Expected list type for spatial_shape".to_string(),
             ));
         };
@@ -720,99 +603,14 @@ impl RasterBuilder {
             None,
         );
 
-        // Build band dim_names nested list
-        let dim_names_values = self.band_dim_names_values.finish();
-        let dim_names_offsets = OffsetBuffer::new(ScalarBuffer::from(self.band_dim_names_offsets));
-        let DataType::List(dim_names_field) = RasterSchema::dim_names_type() else {
-            return Err(ArrowError::SchemaError(
-                "Expected list type for dim_names".to_string(),
-            ));
-        };
-        let dim_names_list = ListArray::new(
-            dim_names_field,
-            dim_names_offsets,
-            Arc::new(dim_names_values),
-            None,
-        );
-
-        // Build band source_shape nested list
-        let source_shape_values = self.band_shape_values.finish();
-        let source_shape_offsets = OffsetBuffer::new(ScalarBuffer::from(self.band_shape_offsets));
-        let DataType::List(source_shape_field) = RasterSchema::source_shape_type() else {
-            return Err(ArrowError::SchemaError(
-                "Expected list type for source_shape".to_string(),
-            ));
-        };
-        let source_shape_list = ListArray::new(
-            source_shape_field,
-            source_shape_offsets,
-            Arc::new(source_shape_values),
-            None,
-        );
-
-        // Build band view nested list (List<Struct<Int64×4>>).
-        let view_source_axis = self.band_view_source_axis_values.finish();
-        let view_start = self.band_view_start_values.finish();
-        let view_step = self.band_view_step_values.finish();
-        let view_steps = self.band_view_steps_values.finish();
-        let view_offsets = OffsetBuffer::new(ScalarBuffer::from(self.band_view_offsets));
-        let DataType::List(view_list_field) = RasterSchema::view_type() else {
-            return Err(ArrowError::SchemaError(
-                "Expected list type for view".to_string(),
-            ));
-        };
-        let DataType::Struct(view_struct_fields) = view_list_field.data_type().clone() else {
-            return Err(ArrowError::SchemaError(
-                "Expected struct type inside view list".to_string(),
-            ));
-        };
-        let view_struct = StructArray::new(
-            view_struct_fields,
-            vec![
-                Arc::new(view_source_axis) as ArrayRef,
-                Arc::new(view_start) as ArrayRef,
-                Arc::new(view_step) as ArrayRef,
-                Arc::new(view_steps) as ArrayRef,
-            ],
-            None,
-        );
-        let view_nulls = if self.band_view_validity.iter().all(|&b| b) {
-            None
-        } else {
-            Some(NullBuffer::from_iter(
-                self.band_view_validity.iter().copied(),
-            ))
-        };
-        let view_list = ListArray::new(
-            view_list_field,
-            view_offsets,
-            Arc::new(view_struct),
-            view_nulls,
-        );
-
-        // Build band struct
-        let DataType::Struct(band_fields) = RasterSchema::band_type() else {
-            return Err(ArrowError::SchemaError(
-                "Expected struct type for band".to_string(),
-            ));
-        };
-
-        let band_arrays: Vec<ArrayRef> = vec![
-            Arc::new(self.band_name.finish()),
-            Arc::new(dim_names_list),
-            Arc::new(source_shape_list),
-            Arc::new(self.band_datatype.finish()),
-            Arc::new(self.band_nodata.finish()),
-            Arc::new(view_list),
-            Arc::new(self.band_outdb_uri.finish()),
-            Arc::new(self.band_outdb_format.finish()),
-            Arc::new(self.band_data.finish()),
-        ];
-        let band_struct = StructArray::new(band_fields, band_arrays, None);
+        // Build the flat band struct — delegated to `BandArrayBuilder`,
+        // which owns all the per-band columns (name, dim_names, shape,
+        // datatype, nodata, view, outdb_uri/format, data).
+        let band_struct = self.bands.finish()?;
 
         // Build bands list
         let DataType::List(bands_field) = RasterSchema::bands_type() else {
-            return Err(ArrowError::SchemaError(
+            return Err(RasterError::Invalid(
                 "Expected list type for bands".to_string(),
             ));
         };
@@ -837,16 +635,66 @@ impl RasterBuilder {
     }
 }
 
+/// Lets [`BandRef::copy_into`](crate::traits::BandRef::copy_into) and
+/// [`BandRef::append_data_into`](crate::traits::BandRef::append_data_into)
+/// target a `RasterBuilder` directly, same as before this trait existed:
+/// `start_band` here does the *same* per-raster bookkeeping as the inherent
+/// [`RasterBuilder::start_band`] (both delegate to
+/// [`Self::start_band_and_record`]) — deriving a band via `copy_into` into a
+/// `RasterBuilder` is still validated against that raster's spatial grid at
+/// `finish_raster`, exactly as it was when `copy_into` was hardcoded to this
+/// type.
+impl BandWriter for RasterBuilder {
+    fn start_band(
+        &mut self,
+        args: StartBandArgs<'_>,
+    ) -> Result<(Vec<String>, Vec<i64>), RasterError> {
+        self.start_band_and_record(args)
+    }
+
+    fn band_data_writer(&mut self) -> &mut BinaryViewBuilder {
+        self.bands.band_data_writer()
+    }
+
+    fn append_band_data_from(
+        &mut self,
+        src: &BinaryViewArray,
+        row: usize,
+    ) -> Result<(), RasterError> {
+        self.bands.append_band_data_from(src, row)
+    }
+
+    fn append_band_data_buffer(
+        &mut self,
+        buffer: &Buffer,
+        offset: u32,
+        len: u32,
+    ) -> Result<(), RasterError> {
+        self.bands.append_band_data_buffer(buffer, offset, len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::array::RasterStructArray;
     use crate::traits::RasterRef;
+    use crate::view_entries::ViewEntry;
     use arrow_array::RecordBatch;
     use arrow_ipc::reader::StreamReader;
     use arrow_ipc::writer::StreamWriter;
     use arrow_schema::Schema;
     use std::io::Cursor;
+
+    /// Terse [`ViewEntry`] constructor for the view-persistence tests.
+    fn ve(source_axis: i64, start: i64, step: i64, steps: i64) -> ViewEntry {
+        ViewEntry {
+            source_axis,
+            start,
+            step,
+            steps,
+        }
+    }
 
     #[test]
     fn test_iterator_basic_functionality() {
@@ -1052,6 +900,7 @@ mod tests {
         // Source: a CRS, a nodata sentinel, and pixel values to preserve.
         let source = RasterSpec::d2(2, 1)
             .band_values(&[1u8, 2])
+            .name("temperature")
             .nodata(9u8)
             .crs(Some("OGC:CRS84"))
             .build();
@@ -1068,9 +917,11 @@ mod tests {
             .unwrap();
         let out: ArrayRef = Arc::new(builder.finish().unwrap());
 
-        // Only the transform changed; CRS, nodata, and pixels carried over.
+        // Only the transform changed; CRS, nodata, band name, and pixels
+        // carried over.
         let expected = RasterSpec::d2(2, 1)
             .band_values(&[1u8, 2])
+            .name("temperature")
             .nodata(9u8)
             .crs(Some("OGC:CRS84"))
             .transform([100.0, 2.0, 0.0, 200.0, 0.0, -3.0]);
@@ -1190,11 +1041,16 @@ mod tests {
 
     #[test]
     fn test_outdb_metadata_fields() {
-        // Test creating raster with OutDb reference metadata
+        // Test creating raster with OutDb reference metadata.
+        //
+        // 10x10 UInt8 = 100 visible bytes, matching the InDb data buffer
+        // written below. `RasterRef::band()` now verifies the data column is
+        // long enough to cover the visible region, so the dimensions and the
+        // byte count must agree.
         let mut builder = RasterBuilder::new(10);
 
         builder
-            .start_raster_2d(1024, 1024, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, None)
+            .start_raster_2d(10, 10, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, None)
             .unwrap();
 
         // Test InDb band (should have null OutDb fields)
@@ -1210,7 +1066,7 @@ mod tests {
         builder
             .start_band(StartBandArgs {
                 outdb_uri: Some("s3://mybucket/satellite_image.tif#band=2"),
-                ..StartBandArgs::new(&["y", "x"], &[1024, 1024], BandDataType::Float32)
+                ..StartBandArgs::new(&["y", "x"], &[10, 10], BandDataType::Float32)
             })
             .unwrap();
         // For OutDbRef, data field could be empty or contain metadata/thumbnail
@@ -1831,6 +1687,518 @@ mod tests {
         assert_eq!(buf.as_contiguous().unwrap(), pixels.as_slice());
     }
 
+    // ---- Non-identity view persistence: construct → finish → read back ----
+
+    /// Build a single-raster, single-band `UInt8` array carrying an explicit
+    /// `view` over `source_shape`, with `data` as the band's raw bytes. Uses
+    /// empty top-level spatial dims so `finish_raster` imposes no spatial-shape
+    /// constraint on the (arbitrary) view being exercised.
+    fn build_viewed_u8(
+        source_shape: &[i64],
+        dim_names: &[&str],
+        view: &ViewEntries,
+        data: Vec<u8>,
+    ) -> StructArray {
+        let mut b = RasterBuilder::new(1);
+        b.start_raster_nd(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0], &[], &[], None)
+            .unwrap();
+        b.start_band(StartBandArgs {
+            view: Some(view),
+            ..StartBandArgs::new(dim_names, source_shape, BandDataType::UInt8)
+        })
+        .unwrap();
+        b.band_data_writer().append_value(data);
+        b.finish_band().unwrap();
+        b.finish_raster().unwrap();
+        b.finish().unwrap()
+    }
+
+    /// Walk an `NdBuffer`'s visible region in C-order and collect the single
+    /// `UInt8` byte at each visited position. The byte address is hand-computed
+    /// from the buffer's own shape/strides/offset, so it verifies exactly the
+    /// layout the reader composed — independent of `as_contiguous`, which
+    /// refuses strided views. Compare its output against a hand-computed
+    /// expectation, never against the buffer itself.
+    fn gather_u8(buf: &crate::traits::NdBuffer) -> Vec<u8> {
+        assert_eq!(buf.data_type, BandDataType::UInt8);
+        let n: i64 = buf.shape.iter().product();
+        let mut out = Vec::with_capacity(n.max(0) as usize);
+        let mut idx = vec![0i64; buf.shape.len()];
+        for _ in 0..n {
+            let mut pos = buf.offset as i64;
+            for (k, &i) in idx.iter().enumerate() {
+                pos += i * buf.strides[k];
+            }
+            out.push(buf.buffer[pos as usize]);
+            // Increment the multi-index in C-order (last axis fastest).
+            for k in (0..buf.shape.len()).rev() {
+                idx[k] += 1;
+                if idx[k] < buf.shape[k] {
+                    break;
+                }
+                idx[k] = 0;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn view_identity_via_start_band_is_null_and_borrows() {
+        // An identity view passed through start_band as an explicit `Some` view
+        // is stored as the canonical null sentinel (not an explicit row), so it
+        // is indistinguishable from the `None` path: null view row, same
+        // visible shape/strides, zero-copy borrow.
+        use arrow_array::Array;
+        let view = ViewEntries::new(vec![ve(0, 0, 1, 2), ve(1, 0, 1, 3)]);
+        let pixels: Vec<u8> = (0..6).collect();
+        let array = build_viewed_u8(&[2, 3], &["y", "x"], &view, pixels.clone());
+
+        let bands_struct = array
+            .column(sedona_schema::raster::raster_indices::BANDS)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let view_list = bands_struct
+            .column(sedona_schema::raster::band_indices::VIEW)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(
+            view_list.is_null(0),
+            "identity view must serialise as a null view row even via an explicit start_band view"
+        );
+
+        let rasters = RasterStructArray::try_new(&array).unwrap();
+        let r = rasters.get(0).unwrap();
+        let band = r.band(0).unwrap();
+        assert_eq!(band.shape(), &[2, 3]);
+        let buf = band.nd_buffer().unwrap();
+        assert_eq!(buf.strides, &[3, 1]);
+        assert_eq!(buf.offset, 0);
+        assert!(buf.is_contiguous());
+        assert_eq!(buf.as_contiguous().unwrap(), pixels.as_slice());
+        assert_eq!(gather_u8(&buf), pixels);
+    }
+
+    #[test]
+    fn view_slice_outer_axis_is_contiguous() {
+        // Slice the outer axis of a 3x3 source to its first 2 rows. The view is
+        // non-identity, but its byte strides are still C-order packed from
+        // offset 0, so the region is contiguous and borrows the source prefix
+        // zero-copy.
+        let data: Vec<u8> = (0..9).collect();
+        let view = ViewEntries::new(vec![ve(0, 0, 1, 2), ve(1, 0, 1, 3)]);
+        let array = build_viewed_u8(&[3, 3], &["y", "x"], &view, data.clone());
+        let rasters = RasterStructArray::try_new(&array).unwrap();
+        let r = rasters.get(0).unwrap();
+        let band = r.band(0).unwrap();
+
+        assert_eq!(band.shape(), &[2, 3]);
+        assert_eq!(band.raw_source_shape(), &[3, 3]);
+        let buf = band.nd_buffer().unwrap();
+        assert_eq!(buf.strides, &[3, 1]);
+        assert_eq!(buf.offset, 0);
+        assert!(buf.is_contiguous());
+        assert_eq!(buf.as_contiguous().unwrap(), &data[0..6]);
+        assert_eq!(gather_u8(&buf), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn view_slice_strided_reads_expected_values() {
+        // Every-other slice of an 8-element source: start=1, step=2, steps=3
+        // addresses source indices 1, 3, 5.
+        let data: Vec<u8> = (0..8).collect();
+        let array = build_viewed_u8(&[8], &["x"], &ViewEntries::new(vec![ve(0, 1, 2, 3)]), data);
+        let rasters = RasterStructArray::try_new(&array).unwrap();
+        let r = rasters.get(0).unwrap();
+        let band = r.band(0).unwrap();
+
+        assert_eq!(band.shape(), &[3]);
+        let buf = band.nd_buffer().unwrap();
+        assert_eq!(buf.shape, &[3]);
+        assert_eq!(buf.strides, &[2]);
+        assert_eq!(buf.offset, 1);
+        // Strided → not C-order packed, so as_contiguous rejects it.
+        assert!(!buf.is_contiguous());
+        assert!(buf.as_contiguous().is_err());
+        assert_eq!(gather_u8(&buf), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn view_broadcast_zero_stride_repeats_source_row() {
+        // 2D broadcast: source shape [1, 3], the view broadcasts axis 0 four
+        // times (step 0) so every visible row equals the source's single row.
+        let view = ViewEntries::new(vec![ve(0, 0, 0, 4), ve(1, 0, 1, 3)]);
+        let array = build_viewed_u8(&[1, 3], &["row", "col"], &view, vec![10u8, 20, 30]);
+        let rasters = RasterStructArray::try_new(&array).unwrap();
+        let r = rasters.get(0).unwrap();
+        let band = r.band(0).unwrap();
+
+        assert_eq!(band.shape(), &[4, 3]);
+        let buf = band.nd_buffer().unwrap();
+        assert_eq!(buf.shape, &[4, 3]);
+        assert_eq!(buf.strides, &[0, 1]);
+        assert_eq!(buf.offset, 0);
+        // Zero stride is not packed → non-contiguous, rejected.
+        assert!(!buf.is_contiguous());
+        assert!(buf.as_contiguous().is_err());
+        assert_eq!(
+            gather_u8(&buf),
+            vec![10, 20, 30, 10, 20, 30, 10, 20, 30, 10, 20, 30]
+        );
+    }
+
+    #[test]
+    fn view_axis_permutation_and_slice_reads_expected_values() {
+        // 2D source [Y=4, X=3], data = 0..12 row-major. The view permutes to
+        // visible order [X, Y] and slices Y from start=1, step=2, steps=2.
+        //   byte_strides = [step_X * src_stride_X, step_Y * src_stride_Y]
+        //                = [1 * 1, 2 * 3] = [1, 6]
+        //   byte_offset  = start_X * src_stride_X + start_Y * src_stride_Y
+        //                = 0 * 1 + 1 * 3 = 3
+        // Visible[i, j] (i over X 0..3, j over Y {1,3}) sits at source byte
+        // 3 + i + 6j → C-order gather = [3, 9, 4, 10, 5, 11].
+        let data: Vec<u8> = (0..12).collect();
+        let view = ViewEntries::new(vec![ve(1, 0, 1, 3), ve(0, 1, 2, 2)]);
+        let array = build_viewed_u8(&[4, 3], &["x", "y"], &view, data);
+        let rasters = RasterStructArray::try_new(&array).unwrap();
+        let r = rasters.get(0).unwrap();
+        let band = r.band(0).unwrap();
+
+        assert_eq!(band.shape(), &[3, 2]);
+        let buf = band.nd_buffer().unwrap();
+        assert_eq!(buf.shape, &[3, 2]);
+        assert_eq!(buf.strides, &[1, 6]);
+        assert_eq!(buf.offset, 3);
+        assert!(!buf.is_contiguous());
+        assert!(buf.as_contiguous().is_err());
+        assert_eq!(gather_u8(&buf), vec![3, 9, 4, 10, 5, 11]);
+    }
+
+    #[test]
+    fn view_reverse_negative_step_reads_expected_values() {
+        // 1D source [0..8]; start=6, step=-2, steps=3 walks backwards picking
+        // every other element: source indices 6, 4, 2.
+        let data: Vec<u8> = (0..8).collect();
+        let array = build_viewed_u8(&[8], &["x"], &ViewEntries::new(vec![ve(0, 6, -2, 3)]), data);
+        let rasters = RasterStructArray::try_new(&array).unwrap();
+        let r = rasters.get(0).unwrap();
+        let band = r.band(0).unwrap();
+
+        assert_eq!(band.shape(), &[3]);
+        let buf = band.nd_buffer().unwrap();
+        assert_eq!(buf.shape, &[3]);
+        assert_eq!(buf.strides, &[-2]);
+        assert_eq!(buf.offset, 6);
+        // Negative stride is not packed → non-contiguous, rejected.
+        assert!(!buf.is_contiguous());
+        assert!(buf.as_contiguous().is_err());
+        assert_eq!(gather_u8(&buf), vec![6, 4, 2]);
+    }
+
+    #[test]
+    fn view_multidim_with_zero_axis_borrows_empty() {
+        // A zero-extent middle axis addresses no bytes: the visible region is
+        // empty, trivially contiguous, and as_contiguous borrows an empty slice.
+        let view = ViewEntries::new(vec![ve(0, 0, 1, 3), ve(1, 0, 1, 0), ve(2, 0, 1, 5)]);
+        let array = build_viewed_u8(&[3, 4, 5], &["a", "b", "c"], &view, vec![0u8; 60]);
+        let rasters = RasterStructArray::try_new(&array).unwrap();
+        let r = rasters.get(0).unwrap();
+        let band = r.band(0).unwrap();
+
+        assert_eq!(band.shape(), &[3, 0, 5]);
+        let buf = band.nd_buffer().unwrap();
+        assert_eq!(buf.shape, &[3, 0, 5]);
+        assert!(buf.is_contiguous());
+        assert!(buf.as_contiguous().unwrap().is_empty());
+    }
+
+    #[test]
+    fn start_band_explicit_view_rejects_zero_dim() {
+        // An explicit `Some` view must apply the same 0-D guard as the identity
+        // path — accepting empty dim_names would otherwise bypass it via the
+        // explicit view path.
+        let mut builder = RasterBuilder::new(1);
+        builder
+            .start_raster_nd(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0], &[], &[], None)
+            .unwrap();
+        let err = builder
+            .start_band(StartBandArgs {
+                view: Some(&ViewEntries::new(vec![])),
+                ..StartBandArgs::new(&[], &[], BandDataType::UInt8)
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("0-dimensional"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn start_band_explicit_view_rejects_step_overrun() {
+        // start=1, step=2, steps=4 addresses element 1 + (4-1)*2 = 7, out of
+        // range for a source axis of size 7 — validation must reject it before
+        // any column is written.
+        let mut builder = RasterBuilder::new(1);
+        builder
+            .start_raster_nd(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0], &[], &[], None)
+            .unwrap();
+        let err = builder
+            .start_band(StartBandArgs {
+                view: Some(&ViewEntries::new(vec![ve(0, 1, 2, 4)])),
+                ..StartBandArgs::new(&["x"], &[7], BandDataType::UInt8)
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ---- with_view: public "create a new view into an existing band" ----
+
+    /// Build a 1-D UInt8 raster with `source_shape=[8]` and bytes `[0..8]`.
+    /// Identity-view; used as input to the with_view tests.
+    fn build_1d_identity_raster() -> StructArray {
+        let mut b = RasterBuilder::new(1);
+        b.start_raster_nd(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0], &["x"], &[8], None)
+            .unwrap();
+        b.start_band(StartBandArgs::new(&["x"], &[8], BandDataType::UInt8))
+            .unwrap();
+        b.band_data_writer()
+            .append_value((0u8..8).collect::<Vec<u8>>());
+        b.finish_band().unwrap();
+        b.finish_raster().unwrap();
+        b.finish().unwrap()
+    }
+
+    #[test]
+    fn with_view_over_identity_input_produces_expected_visible_bytes() {
+        // Input is identity over [0..8]. with_view layers a slice
+        // (start=1, step=2, steps=3) producing visible bytes [1, 3, 5].
+        let input_array = build_1d_identity_raster();
+        let input_rasters = RasterStructArray::try_new(&input_array).unwrap();
+        let input_raster = input_rasters.get(0).unwrap();
+        let input_band = input_raster.band(0).unwrap();
+
+        let mut b = RasterBuilder::new(1);
+        b.start_raster_nd(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0], &["x"], &[3], None)
+            .unwrap();
+        b.with_view(WithViewArgs {
+            name: None,
+            dim_names: &["x"],
+            input: input_band.as_ref(),
+            view: &ViewEntries::new(vec![ve(0, 1, 2, 3)]),
+            nodata: None,
+            outdb_uri: None,
+            outdb_format: None,
+        })
+        .unwrap();
+        b.finish_band().unwrap();
+        b.finish_raster().unwrap();
+        let out_array = b.finish().unwrap();
+
+        let out_rasters = RasterStructArray::try_new(&out_array).unwrap();
+        let out_raster = out_rasters.get(0).unwrap();
+        let out_band = out_raster.band(0).unwrap();
+        assert_eq!(out_band.shape(), &[3]);
+        // The output's source_shape is inherited from the input.
+        assert_eq!(out_band.raw_source_shape(), &[8]);
+        let buf = out_band.nd_buffer().unwrap();
+        assert_eq!(buf.strides, &[2]);
+        assert_eq!(buf.offset, 1);
+        assert!(!buf.is_contiguous());
+        assert_eq!(gather_u8(&buf), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn with_view_chained_composes_into_single_view() {
+        // Round 1: with_view layers (start=1, step=2, steps=4) → visible bytes
+        //          [1, 3, 5, 7] over source [0..8].
+        // Round 2: with_view on that, layering (start=1, step=1, steps=2) →
+        //          visible bytes [3, 5] (input visible indices 1 and 2).
+        // compose collapses the chain into one source-space view; the read
+        // back must reference the ORIGINAL 8-byte source.
+        let input_array = build_1d_identity_raster();
+        let input_rasters = RasterStructArray::try_new(&input_array).unwrap();
+        let input_raster = input_rasters.get(0).unwrap();
+        let input_band = input_raster.band(0).unwrap();
+
+        // Round 1.
+        let mut b1 = RasterBuilder::new(1);
+        b1.start_raster_nd(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0], &["x"], &[4], None)
+            .unwrap();
+        b1.with_view(WithViewArgs {
+            name: None,
+            dim_names: &["x"],
+            input: input_band.as_ref(),
+            view: &ViewEntries::new(vec![ve(0, 1, 2, 4)]),
+            nodata: None,
+            outdb_uri: None,
+            outdb_format: None,
+        })
+        .unwrap();
+        b1.finish_band().unwrap();
+        b1.finish_raster().unwrap();
+        let mid_array = b1.finish().unwrap();
+
+        let mid_rasters = RasterStructArray::try_new(&mid_array).unwrap();
+        let mid_raster = mid_rasters.get(0).unwrap();
+        let mid_band = mid_raster.band(0).unwrap();
+        assert_eq!(mid_band.shape(), &[4]);
+        assert_eq!(gather_u8(&mid_band.nd_buffer().unwrap()), vec![1, 3, 5, 7]);
+
+        // Round 2: with_view applied on the view-bearing mid_band.
+        let mut b2 = RasterBuilder::new(1);
+        b2.start_raster_nd(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0], &["x"], &[2], None)
+            .unwrap();
+        b2.with_view(WithViewArgs {
+            name: None,
+            dim_names: &["x"],
+            input: mid_band.as_ref(),
+            view: &ViewEntries::new(vec![ve(0, 1, 1, 2)]),
+            nodata: None,
+            outdb_uri: None,
+            outdb_format: None,
+        })
+        .unwrap();
+        b2.finish_band().unwrap();
+        b2.finish_raster().unwrap();
+        let final_array = b2.finish().unwrap();
+
+        let final_rasters = RasterStructArray::try_new(&final_array).unwrap();
+        let final_raster = final_rasters.get(0).unwrap();
+        let final_band = final_raster.band(0).unwrap();
+        assert_eq!(final_band.shape(), &[2]);
+        // The composed view still references the original 8-byte source.
+        assert_eq!(final_band.raw_source_shape(), &[8]);
+        let final_buf = final_band.nd_buffer().unwrap();
+        assert_eq!(final_buf.strides, &[2]);
+        assert_eq!(final_buf.offset, 3);
+        assert!(!final_buf.is_contiguous());
+        assert_eq!(gather_u8(&final_buf), vec![3, 5]);
+    }
+
+    #[test]
+    fn with_view_on_outdb_input_produces_outdb_output_with_composed_view() {
+        // Viewing an OutDb band doesn't need the source bytes — the output band
+        // is itself OutDb, pointing at the same external resource via an
+        // inherited outdb_uri, with the composed view describing the slice.
+        let mut b = RasterBuilder::new(1);
+        b.start_raster_nd(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0], &["x"], &[8], None)
+            .unwrap();
+        b.start_band(StartBandArgs {
+            outdb_uri: Some("s3://bucket/file.tif#band=1"),
+            outdb_format: Some("geotiff"),
+            ..StartBandArgs::new(&["x"], &[8], BandDataType::UInt8)
+        })
+        .unwrap();
+        b.band_data_writer().append_value([0u8; 0]); // empty → OutDb
+        b.finish_band().unwrap();
+        b.finish_raster().unwrap();
+        let input_array = b.finish().unwrap();
+
+        let input_rasters = RasterStructArray::try_new(&input_array).unwrap();
+        let input_raster = input_rasters.get(0).unwrap();
+        let input_band = input_raster.band(0).unwrap();
+        assert!(!input_band.is_indb(), "fixture must be OutDb");
+
+        let mut b2 = RasterBuilder::new(1);
+        b2.start_raster_nd(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0], &["x"], &[3], None)
+            .unwrap();
+        b2.with_view(WithViewArgs {
+            name: None,
+            dim_names: &["x"],
+            input: input_band.as_ref(),
+            view: &ViewEntries::new(vec![ve(0, 1, 2, 3)]),
+            nodata: None,
+            outdb_uri: None,
+            outdb_format: None,
+        })
+        .unwrap();
+        b2.finish_band().unwrap();
+        b2.finish_raster().unwrap();
+        let out_array = b2.finish().unwrap();
+
+        let out_rasters = RasterStructArray::try_new(&out_array).unwrap();
+        let out_raster = out_rasters.get(0).unwrap();
+        let out_band = out_raster.band(0).unwrap();
+
+        assert!(
+            !out_band.is_indb(),
+            "output of OutDb-input with_view must be OutDb"
+        );
+        assert_eq!(out_band.outdb_uri(), Some("s3://bucket/file.tif#band=1"));
+        assert_eq!(out_band.outdb_format(), Some("geotiff"));
+        // Input had identity view, so composed == supplied view verbatim.
+        assert_eq!(out_band.view().as_slice(), &[ve(0, 1, 2, 3)]);
+        assert_eq!(out_band.raw_source_shape(), &[8]);
+        assert_eq!(out_band.shape(), &[3]);
+    }
+
+    #[test]
+    fn with_view_inherits_source_nodata() {
+        // Viewing a band must not drop its nodata sentinel. The earlier
+        // implementation forwarded the caller's `nodata` (None here) verbatim
+        // and never inherited the source's, so former-nodata pixels silently
+        // became valid. Delegating through `copy_into` inherits it.
+        let transform = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+        let mut ib = RasterBuilder::new(1);
+        ib.start_raster_nd(&transform, &["x"], &[4], None).unwrap();
+        ib.start_band(StartBandArgs {
+            name: Some("orig"),
+            nodata: Some(&[255u8]),
+            ..StartBandArgs::new(&["x"], &[4], BandDataType::UInt8)
+        })
+        .unwrap();
+        ib.band_data_writer().append_value(vec![1u8, 2, 3, 4]);
+        ib.finish_band().unwrap();
+        ib.finish_raster().unwrap();
+        let in_array = ib.finish().unwrap();
+        let in_rasters = RasterStructArray::try_new(&in_array).unwrap();
+        let in_raster = in_rasters.get(0).unwrap();
+        let in_band = in_raster.band(0).unwrap();
+        assert_eq!(
+            in_band.nodata(),
+            Some(&[255u8][..]),
+            "fixture must carry nodata"
+        );
+
+        // A non-identity view (every other element) with no explicit nodata
+        // override — the source's [255] must carry over to the derived band.
+        let mut ob = RasterBuilder::new(1);
+        ob.start_raster_nd(&transform, &["x"], &[2], None).unwrap();
+        ob.with_view(WithViewArgs {
+            name: None,
+            dim_names: &["x"],
+            input: in_band.as_ref(),
+            view: &ViewEntries::new(vec![ve(0, 0, 2, 2)]),
+            nodata: None,
+            outdb_uri: None,
+            outdb_format: None,
+        })
+        .unwrap();
+        ob.finish_band().unwrap();
+        ob.finish_raster().unwrap();
+        let out_array = ob.finish().unwrap();
+        let out_rasters = RasterStructArray::try_new(&out_array).unwrap();
+        let out_raster = out_rasters.get(0).unwrap();
+        let out_band = out_raster.band(0).unwrap();
+
+        assert_eq!(
+            out_band.nodata(),
+            Some(&[255u8][..]),
+            "with_view must inherit the source band's nodata"
+        );
+        // The view is still applied: visible bytes are the every-other slice.
+        assert_eq!(out_band.shape(), &[2]);
+        assert_eq!(gather_u8(&out_band.nd_buffer().unwrap()), vec![1, 3]);
+    }
+
     #[test]
     fn test_view_field_is_null_for_identity_band() {
         // Schema invariant: identity views are stored as null list rows so
@@ -1909,10 +2277,13 @@ mod tests {
         // null view row, and the null must survive an Arrow IPC round-trip.
         // If a future change accidentally writes a non-null empty list
         // instead, downstream readers (DuckDB, PyArrow, sedona-py) will
-        // disagree about whether the view is identity.
+        // disagree about whether the view is identity. A second raster carries
+        // an explicit non-identity view to confirm the non-null row (and the
+        // visible shape it decodes to) also survives the round-trip.
 
-        let mut builder = RasterBuilder::new(1);
+        let mut builder = RasterBuilder::new(2);
         let transform = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+        // Raster 0: identity-view band → null view row.
         builder
             .start_raster_nd(&transform, &["x", "y"], &[3, 2], None)
             .unwrap();
@@ -1924,6 +2295,21 @@ mod tests {
             ))
             .unwrap();
         builder.band_data_writer().append_value(vec![0u8; 6]);
+        builder.finish_band().unwrap();
+        builder.finish_raster().unwrap();
+        // Raster 1: explicit non-identity view → non-null view row.
+        builder
+            .start_raster_nd(&transform, &["x"], &[3], None)
+            .unwrap();
+        builder
+            .start_band(StartBandArgs {
+                view: Some(&ViewEntries::new(vec![ve(0, 1, 2, 3)])),
+                ..StartBandArgs::new(&["x"], &[8], BandDataType::UInt8)
+            })
+            .unwrap();
+        builder
+            .band_data_writer()
+            .append_value(vec![0u8, 1, 2, 3, 4, 5, 6, 7]);
         builder.finish_band().unwrap();
         builder.finish_raster().unwrap();
 
@@ -1967,15 +2353,21 @@ mod tests {
             .as_any()
             .downcast_ref::<ListArray>()
             .unwrap();
-        assert_eq!(view_list.len(), 1);
+        assert_eq!(view_list.len(), 2);
         assert!(
             view_list.is_null(0),
             "identity-view band must remain a null view row after IPC round-trip"
+        );
+        assert!(
+            !view_list.is_null(1),
+            "explicit-view band must remain non-null after IPC round-trip"
         );
 
         let rasters = RasterStructArray::try_new(restored_struct).unwrap();
         let r0 = rasters.get(0).unwrap();
         assert_eq!(r0.band(0).unwrap().shape(), &[2, 3]);
+        let r1 = rasters.get(1).unwrap();
+        assert_eq!(r1.band(0).unwrap().shape(), &[3]);
     }
 
     /// Navigate an output raster `StructArray` to its bands' `data`

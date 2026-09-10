@@ -77,7 +77,7 @@ fn main() {
 
 fn parse_cmake_linker_flags(binary_dir: &Path) {
     // e.g., libabsl_base.a
-    let re_lib = Regex::new("^(lib|)([^.]+).*?(LIB|lib|a|dylib|so|dll)$").unwrap();
+    let re_lib = Regex::new("^(lib|)([^.]+).*?(LIB|lib|a|dylib|so|dll)(?:\\..*)?$").unwrap();
     // e.g., -L/path/to/lib (CMake doesn't usually output this, preferrig instead
     // to pass the full path to the library)
     let re_linker_dir = Regex::new("^-L(.*)").unwrap();
@@ -192,12 +192,14 @@ fn read_file_maybe_utf16(path: &PathBuf) -> String {
         // Skip the BOM and convert the rest
         let u16_bytes = &linker_flags_bytes[2..];
         let u16_vec: Vec<u16> = u16_bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| {
                 if is_le {
-                    u16::from_le_bytes([chunk[0], chunk[1]])
+                    u16::from_le_bytes(*chunk)
                 } else {
-                    u16::from_be_bytes([chunk[0], chunk[1]])
+                    u16::from_be_bytes(*chunk)
                 }
             })
             .collect();

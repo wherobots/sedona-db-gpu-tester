@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::{any::Any, collections::HashMap, fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use arrow_schema::{DataType, FieldRef};
 use datafusion_common::config::ConfigOptions;
@@ -227,6 +227,21 @@ impl SedonaScalarUDF {
         &self.metadata
     }
 
+    /// The kernels (overload implementations) this UDF dispatches to.
+    ///
+    /// Exposed so a UDF's kernels can be exported across the
+    /// `sedona-extension` FFI boundary (e.g. handed to an out-of-tree
+    /// plugin as capsules).
+    pub fn kernels(&self) -> &[ScalarKernelRef] {
+        &self.kernels
+    }
+
+    /// Replace this UDF's kernels while preserving its name, volatility,
+    /// aliases, and metadata.
+    pub fn with_kernels(self, kernels: Vec<ScalarKernelRef>) -> Self {
+        Self { kernels, ..self }
+    }
+
     /// Create a SedonaScalarUDF from a single kernel
     ///
     /// This constructor creates a [Volatility::Immutable] function with no documentation
@@ -275,10 +290,6 @@ impl SedonaScalarUDF {
 }
 
 impl ScalarUDFImpl for SedonaScalarUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         &self.name
     }

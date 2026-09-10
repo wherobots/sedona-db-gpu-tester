@@ -28,6 +28,7 @@ on:
       - 'rust/**'
       - 'c/**'
       - 'python/**'
+      - 'integration/spark-parity/**'
   push:
     branches:
       - main
@@ -128,6 +129,12 @@ jobs:
         run: |
           pip install -e "python/sedonadb-zarr/[test]" -vv
 
+      # Depends on sedonadb and sedonadb-expr, so this must come after both are
+      # installed from source (otherwise pip would resolve them from PyPI).
+      - name: Install sedonadb-geopandas
+        run: |
+          pip install -e "python/sedonadb-geopandas/[test]" -vv
+
       - name: Download minimal geoarrow-data assets
         run: |
           python submodules/download-assets.py "*water-junc*" "*water-point*"
@@ -144,42 +151,6 @@ jobs:
           cd python/sedonadb
           python -m pytest -vv
 
-      - uses: actions/setup-java@v5.6.0
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Cache Sedona Spark jars
-        uses: actions/cache@v6
-        with:
-          # Matches SEDONADB_SPARK_IVY_DIR below, which SedonaSpark passes to
-          # spark.jars.ivy so Ivy resolves the jars into a fixed directory
-          # regardless of the Ivy version's default.
-          path: ${{ github.workspace }}/.spark-ivy
-          # Derived from raster_testing.py (which pins the Sedona/Spark
-          # versions) so a version bump invalidates the cache automatically;
-          # restore-keys still restores prior jars so unrelated edits don't
-          # force a re-download.
-          key: sedona-spark-jars-${{ runner.os }}-${{ hashFiles('python/sedonadb/python/sedonadb/raster_testing.py') }}
-          restore-keys: |
-            sedona-spark-jars-${{ runner.os }}-
-
-      - name: Run Sedona Spark raster parity tests
-        # Observe-first: report failures without failing the job while the
-        # Spark lane proves itself stable.
-        continue-on-error: true
-        env:
-          SEDONADB_RUN_SPARK_TESTS: "true"
-          SEDONADB_SPARK_IVY_DIR: ${{ github.workspace }}/.spark-ivy
-        run: |
-          # Pin pyspark to the Spark line of the pinned Sedona artifact
-          # (SEDONA_SPARK_VERSION in raster_testing.py): a newer Spark can
-          # resolve the jars but fail at SedonaContext.create when function
-          # registration semantics change between Spark minors.
-          pip install "pyspark==4.0.*" apache-sedona
-          cd python/sedonadb
-          python -m pytest tests/functions -q -k "sedonaspark" -rX
-
       - name: Run doctests (sedonadb)
         run: |
           cd python/sedonadb
@@ -188,6 +159,45 @@ jobs:
       - name: Run tests (sedonadb-expr)
         run: |
           cd python/sedonadb-expr
+          python -m pytest -vv
+
+      - name: Run tests (sedonadb-geopandas)
+        run: |
+          cd python/sedonadb-geopandas
+          python -m pytest -vv
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Sedona Spark test dependencies
+        run: |
+          # Pinned to the newest Spark minor Sedona publishes a shaded
+          # artifact for (1.9.1 ships 4.0 and 4.1), so CI runs one known
+          # combination. An unpinned install pulled pyspark 4.2.0, whose
+          # function registry rejects the fallback 4.1 jar at
+          # SedonaContext.create. Bump when Sedona ships an artifact for a
+          # newer Spark line.
+          pip install "pyspark==4.1.*" apache-sedona
+
+      - name: Cache Sedona Spark jars
+        uses: actions/cache@v6
+        with:
+          # Matches SEDONADB_SPARK_IVY_DIR below, which SedonaSpark passes to
+          # spark.jars.ivy so Ivy resolves the jars into a fixed directory
+          # regardless of the Ivy version's default.
+          path: ~/.ivy2-spark-parity
+          # testing_spark.py pins SEDONA_SPARK_VERSION and
+          # GEOTOOLS_WRAPPER_VERSION, so the cache invalidates exactly when
+          # the jar pins change.
+          key: spark-parity-jars-${{ runner.os }}-${{ hashFiles('python/sedonadb/python/sedonadb/testing_spark.py') }}
+
+      - name: Run tests (spark-parity)
+        env:
+          SEDONADB_SPARK_IVY_DIR: /home/runner/.ivy2-spark-parity
+        run: |
+          cd integration/spark-parity
           python -m pytest -vv
 
       - name: Shutdown docker compose services

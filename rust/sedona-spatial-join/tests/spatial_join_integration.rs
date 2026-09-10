@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{Array, Float64Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -154,6 +154,12 @@ fn setup_context(options: Option<SpatialJoinOptions>, batch_size: usize) -> Resu
     let mut session_config = SessionConfig::from_env()?
         .with_information_schema(true)
         .with_batch_size(batch_size);
+    // Work around https://github.com/apache/datafusion/issues/24933:
+    // physical scalar subqueries discard Arrow field metadata.
+    session_config
+        .options_mut()
+        .optimizer
+        .enable_physical_uncorrelated_scalar_subquery = false;
     session_config = session_config.with_option_extension(SedonaOptions::default());
     let mut state_builder = SessionStateBuilder::new();
     if let Some(options) = options {
@@ -191,21 +197,20 @@ fn setup_context(options: Option<SpatialJoinOptions>, batch_size: usize) -> Resu
 #[derive(Debug)]
 struct StatsOverrideTableProvider {
     inner: Arc<dyn TableProvider>,
-    stats: Statistics,
+    stats: Arc<Statistics>,
 }
 
 impl StatsOverrideTableProvider {
     fn new(inner: Arc<dyn TableProvider>, stats: Statistics) -> Self {
-        Self { inner, stats }
+        Self {
+            inner,
+            stats: Arc::new(stats),
+        }
     }
 }
 
 #[async_trait]
 impl TableProvider for StatsOverrideTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.inner.schema()
     }
@@ -229,12 +234,12 @@ impl TableProvider for StatsOverrideTableProvider {
 #[derive(Debug)]
 struct StatsOverrideExec {
     inner: Arc<dyn ExecutionPlan>,
-    stats: Statistics,
-    properties: PlanProperties,
+    stats: Arc<Statistics>,
+    properties: Arc<PlanProperties>,
 }
 
 impl StatsOverrideExec {
-    fn new(inner: Arc<dyn ExecutionPlan>, stats: Statistics) -> Self {
+    fn new(inner: Arc<dyn ExecutionPlan>, stats: Arc<Statistics>) -> Self {
         let properties = PlanProperties::new(
             inner.equivalence_properties().clone(),
             inner.output_partitioning().clone(),
@@ -244,7 +249,7 @@ impl StatsOverrideExec {
         Self {
             inner,
             stats,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -366,11 +371,7 @@ impl ExecutionPlan for StatsOverrideExec {
         "StatsOverrideExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -403,11 +404,7 @@ impl ExecutionPlan for StatsOverrideExec {
         self.inner.execute(partition, context)
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(self.stats.clone())
-    }
-
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         match partition {
             None => Ok(self.stats.clone()),
             Some(partition) => self.inner.partition_statistics(Some(partition)),
@@ -619,6 +616,62 @@ async fn test_spatial_join_with_filter() -> Result<()> {
     Ok(())
 }
 
+/// The spatial join should never emit empty batches. Scalar UDFs backed by C
+/// implementations reject zero-length array inputs, and some consumers of our
+/// Arrow output (e.g. lonboard) reject empty batches, so a selective join used
+/// to break any query applying a scalar function on top of its output.
+/// See https://github.com/apache/sedona-db/issues/1084
+#[tokio::test]
+async fn test_no_empty_batches_in_join_output() -> Result<()> {
+    let ((left_schema, left_partitions), (right_schema, right_partitions)) =
+        create_test_data_with_size_range((0.1, 10.0), WKB_GEOMETRY)?;
+
+    let ctx = setup_context(Some(SpatialJoinOptions::default()), 10)?;
+    let mem_table_left: Arc<dyn TableProvider> =
+        Arc::new(MemTable::try_new(left_schema, left_partitions)?);
+    let mem_table_right: Arc<dyn TableProvider> =
+        Arc::new(MemTable::try_new(right_schema, right_partitions)?);
+    ctx.register_table("L", mem_table_left)?;
+    ctx.register_table("R", mem_table_right)?;
+
+    // A join producing matches for some probe batches, and a very selective join
+    // producing no matches at all; neither should emit empty batches
+    for sql in [
+        "SELECT L.id, R.id FROM L JOIN R ON ST_Intersects(L.geometry, R.geometry)",
+        "SELECT L.id, R.id FROM L JOIN R ON ST_Intersects(L.geometry, R.geometry) AND L.dist > R.dist + 1e9",
+    ] {
+        let df = ctx.sql(sql).await?;
+        let plan = df.create_physical_plan().await?;
+        let spatial_join =
+            find_spatial_join_exec_arc(&plan)?.expect("plan should contain SpatialJoinExec");
+
+        for partition in 0..spatial_join.output_partitioning().partition_count() {
+            let stream = spatial_join.execute(partition, ctx.task_ctx())?;
+            let batches = datafusion_physical_plan::common::collect(stream).await?;
+            assert!(
+                batches.iter().all(|batch| batch.num_rows() > 0),
+                "Spatial join emitted an empty batch for partition {partition} of query {sql}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn find_spatial_join_exec_arc(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let mut found = None;
+    plan.apply(|node| {
+        if node.downcast_ref::<SpatialJoinExec>().is_some() {
+            found = Some(Arc::clone(node));
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(found)
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_spatial_join_swap_inputs_produces_same_plan(
@@ -780,6 +833,45 @@ async fn test_range_join_with_empty_partitions() -> Result<()> {
         .await?;
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_left_join_with_empty_left_side() -> Result<()> {
+    let ((left_schema, _), (right_schema, right_partitions)) = create_default_test_data()?;
+    let left_partitions = vec![vec![]];
+    let sql =
+        "SELECT L.id l_id, R.id r_id FROM L LEFT JOIN R ON ST_Intersects(L.geometry, R.geometry)";
+
+    // Keep the empty left relation on the indexed build side so this exercises the
+    // empty-index outer-join finalization path.
+    let options = SpatialJoinOptions {
+        spatial_join_reordering: false,
+        ..Default::default()
+    };
+    let actual = run_spatial_join_query(
+        &left_schema,
+        &right_schema,
+        left_partitions.clone(),
+        right_partitions.clone(),
+        Some(options),
+        30,
+        sql,
+    )
+    .await?;
+    let expected = run_spatial_join_query(
+        &left_schema,
+        &right_schema,
+        left_partitions,
+        right_partitions,
+        None,
+        30,
+        sql,
+    )
+    .await?;
+
+    assert_eq!(actual.num_rows(), 0);
+    assert_eq!(actual, expected);
     Ok(())
 }
 
@@ -1129,7 +1221,7 @@ async fn run_spatial_join_query(
 fn collect_spatial_join_exec(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<&SpatialJoinExec>> {
     let mut spatial_join_execs = Vec::new();
     plan.apply(|node| {
-        if let Some(spatial_join_exec) = node.as_any().downcast_ref::<SpatialJoinExec>() {
+        if let Some(spatial_join_exec) = node.downcast_ref::<SpatialJoinExec>() {
             spatial_join_execs.push(spatial_join_exec);
         }
         Ok(TreeNodeRecursion::Continue)
@@ -1198,7 +1290,7 @@ async fn test_mark_join(
     fn collect_nlj_exec(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<&NestedLoopJoinExec>> {
         let mut execs = Vec::new();
         plan.apply(|node| {
-            if let Some(exec) = node.as_any().downcast_ref::<NestedLoopJoinExec>() {
+            if let Some(exec) = node.downcast_ref::<NestedLoopJoinExec>() {
                 execs.push(exec);
             }
             Ok(TreeNodeRecursion::Continue)
@@ -1890,7 +1982,7 @@ async fn test_knn_join_mixed_filter_only_query_side_pushed_down() -> Result<()> 
 
 /// Check if there is a `FilterExec` node that is an ancestor of a `SpatialJoinExec`.
 fn has_filter_exec_above_spatial_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if plan.as_any().downcast_ref::<FilterExec>().is_some() {
+    if plan.downcast_ref::<FilterExec>().is_some() {
         // Check if any descendant of this FilterExec is a SpatialJoinExec
         for child in plan.children() {
             if contains_spatial_join_exec(child) {
@@ -1911,7 +2003,7 @@ fn has_filter_exec_above_spatial_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
 fn contains_spatial_join_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let mut found = false;
     plan.apply(|node| {
-        if node.as_any().downcast_ref::<SpatialJoinExec>().is_some() {
+        if node.downcast_ref::<SpatialJoinExec>().is_some() {
             found = true;
             return Ok(TreeNodeRecursion::Stop);
         }
@@ -1925,7 +2017,7 @@ fn contains_spatial_join_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
 fn subtree_contains_filter_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let mut found = false;
     plan.apply(|node| {
-        if node.as_any().downcast_ref::<FilterExec>().is_some() {
+        if node.downcast_ref::<FilterExec>().is_some() {
             found = true;
             return Ok(TreeNodeRecursion::Stop);
         }
@@ -1939,7 +2031,7 @@ fn subtree_contains_filter_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
 fn subtree_contains_probe_shuffle_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let mut found = false;
     plan.apply(|node| {
-        if node.as_any().downcast_ref::<ProbeShuffleExec>().is_some() {
+        if node.downcast_ref::<ProbeShuffleExec>().is_some() {
             found = true;
             return Ok(TreeNodeRecursion::Stop);
         }

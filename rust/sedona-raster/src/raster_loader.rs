@@ -37,7 +37,7 @@ use datafusion_common::config::{
 use datafusion_common::{config_err, Result as DFResult};
 use sedona_schema::raster::BandDataType;
 
-use crate::view_entries::ViewEntry;
+use crate::view_entries::ViewEntries;
 
 /// Everything a backend needs to materialise a single OutDb band's bytes.
 ///
@@ -70,7 +70,7 @@ pub struct RasterLoadRequest<'a> {
     /// may ignore it and return the full source (reporting the view
     /// unresolved), or honor it and return only the visible region; the
     /// returned [`RasterLoadResult`] says which.
-    pub view: &'a [ViewEntry],
+    pub view: &'a ViewEntries,
     /// Pixel type the band claims. The loader returns bytes encoding this
     /// type and errors if the source disagrees (e.g. file's dtype differs).
     pub data_type: BandDataType,
@@ -94,7 +94,7 @@ pub struct RasterLoadResult {
     pub source_shape: Vec<i64>,
     /// View to apply to `bytes` to obtain the visible region (identity when
     /// the loader already resolved the crop).
-    pub view: Vec<ViewEntry>,
+    pub view: ViewEntries,
 }
 
 impl RasterLoadResult {
@@ -104,7 +104,7 @@ impl RasterLoadResult {
         Self {
             bytes,
             source_shape: req.source_shape.to_vec(),
-            view: req.view.to_vec(),
+            view: req.view.clone(),
         }
     }
 }
@@ -292,8 +292,8 @@ impl ConfigField for RasterLoaderRegistryOption {
 
 /// `ConfigExtension` that stashes the per-session
 /// [`RasterLoaderRegistry`] inside a `ConfigOptions`. Registered into
-/// the session's `ConfigOptions` at `SedonaContext::new_from_context`
-/// time; consumed by the `RS_EnsureLoaded` async UDF at dispatch time
+/// the session's `ConfigOptions` during `SedonaContext` construction;
+/// consumed by the `RS_EnsureLoaded` async UDF at dispatch time
 /// via `args.config_options.extensions.get::<RasterLoaderConfig>()`.
 ///
 /// The PREFIX namespace is `sedona.raster_loader` — kept separate from
@@ -308,10 +308,7 @@ pub struct RasterLoaderConfig {
 
 impl RasterLoaderConfig {
     /// Build a config extension that closes over an existing shared
-    /// registry handle. Use this rather than `default()` when wiring
-    /// from `SedonaContext::new_from_context` so the context's mutable
-    /// `register_raster_loader` API writes to the same `RwLock` the
-    /// config extension exposes for reads.
+    /// registry handle.
     pub fn from_handle(registry: Arc<RwLock<RasterLoaderRegistry>>) -> Self {
         Self {
             registry: RasterLoaderRegistryOption::new(registry),
@@ -388,6 +385,7 @@ impl ExtensionOptions for RasterLoaderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view_entries::ViewEntries;
     use std::sync::Mutex;
 
     /// Minimal in-test loader: records the request and returns a buffer
@@ -522,7 +520,7 @@ mod tests {
             uri: "file:///tmp/foo.tif",
             dim_names: &["y", "x"],
             source_shape: &[3, 4],
-            view: &[],
+            view: &ViewEntries::identity_for_shape(&[3, 4]),
             data_type: BandDataType::UInt8,
         };
         let result = loader.load(&[&req]).await.unwrap();
@@ -546,7 +544,7 @@ mod tests {
             uri: "s3://bucket/cube.zarr",
             dim_names: &["t", "y", "x"],
             source_shape: &[2, 3, 4],
-            view: &[],
+            view: &ViewEntries::identity_for_shape(&[2, 3, 4]),
             data_type: BandDataType::Float32,
         };
         let loader = r.get(Some("zarr")).unwrap();

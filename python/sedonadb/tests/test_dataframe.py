@@ -25,7 +25,24 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 import sedonadb
+from sedonadb.dataframe import DataFrame
 from sedonadb.testing import skip_if_not_exists
+
+
+def test_dataframe_constructor_from_dataframe(con):
+    class DataFrameSubclass(DataFrame):
+        def __init__(self, df):
+            super().__init__(df)
+
+    df = con.sql("SELECT 1 AS value")
+    copied = DataFrame(df)
+    subclassed = DataFrameSubclass(df)
+
+    assert copied._ctx is df._ctx
+    assert copied._impl is df._impl
+    assert subclassed._ctx is df._ctx
+    assert subclassed._impl is df._impl
+    pd.testing.assert_frame_equal(subclassed.to_pandas(), df.to_pandas())
 
 
 def test_dataframe_from_dataframe(con):
@@ -168,6 +185,15 @@ def test_columns(con):
 
     pdf = df.to_pandas()
     assert set(df.columns) == set(pdf.columns)
+
+
+def test_select_struct_field_after_unnest_st_dump(con):
+    # Regression for https://github.com/apache/sedona-db/issues/1232.
+    multi = con.sql("SELECT ST_GeomFromText('MULTIPOINT (0 0, 1 1)') AS geometry")
+    dumped = multi.select(multi["geometry"].geo.dump().alias("dump")).unnest("dump")
+    result = dumped.select(dumped["dump"]["geom"].alias("geometry"))
+
+    assert result.to_arrow_table().num_rows == 2
 
 
 def test_schema_non_null_crs(con):

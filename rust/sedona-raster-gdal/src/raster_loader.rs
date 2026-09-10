@@ -54,7 +54,7 @@
 //! Registered against the per-session
 //! [`RasterLoaderRegistry`](sedona_raster::raster_loader::RasterLoaderRegistry)
 //! under the format key `"gdal"`. The `sedona` crate constructs a
-//! [`GdalLoader`] from `SedonaContext::new_from_context` and registers
+//! [`GdalLoader`] during `SedonaContext` construction and registers
 //! it during session bootstrap.
 
 use std::iter::zip;
@@ -373,6 +373,7 @@ mod tests {
     use super::*;
     use crate::gdal_common::with_gdal;
     use sedona_gdal::raster::types::Buffer as GdalBuffer;
+    use sedona_raster::view_entries::ViewEntries;
     use sedona_schema::raster::BandDataType;
     use tempfile::TempDir;
 
@@ -433,7 +434,7 @@ mod tests {
             uri: &uri,
             dim_names: &["y", "x"],
             source_shape: &[2, 3],
-            view: &[],
+            view: &ViewEntries::identity_for_shape(&[2, 3]),
             data_type: BandDataType::UInt8,
         };
 
@@ -453,7 +454,7 @@ mod tests {
             uri: &uri,
             dim_names: &["y", "x"],
             source_shape: &[2, 3],
-            view: &[],
+            view: &ViewEntries::identity_for_shape(&[2, 3]),
             data_type: BandDataType::UInt8,
         };
         let result = loader.load(&[&req]).await.unwrap();
@@ -467,7 +468,7 @@ mod tests {
             uri: "ignored",
             dim_names: &["t", "y", "x"],
             source_shape: &[2, 3, 4],
-            view: &[],
+            view: &ViewEntries::identity_for_shape(&[2, 3, 4]),
             data_type: BandDataType::UInt8,
         };
         let err = loader.load(&[&req]).await.unwrap_err();
@@ -484,7 +485,7 @@ mod tests {
             uri: "ignored",
             dim_names: &["x", "y"], // transposed — not a recognized (y, x) pair
             source_shape: &[2, 3],
-            view: &[],
+            view: &ViewEntries::identity_for_shape(&[2, 3]),
             data_type: BandDataType::UInt8,
         };
         let err = loader.load(&[&req]).await.unwrap_err();
@@ -505,7 +506,7 @@ mod tests {
             uri: &uri,
             dim_names: &["lat", "lon"],
             source_shape: &[2, 3],
-            view: &[],
+            view: &ViewEntries::identity_for_shape(&[2, 3]),
             data_type: BandDataType::UInt8,
         };
         // lat/lon is a recognized spatial pair, so the request is accepted and
@@ -525,7 +526,7 @@ mod tests {
             uri: &uri,
             dim_names: &["y", "x"],
             source_shape: &[2, 3],
-            view: &[], // File is UInt8 but we claim Int16 — should fail with a
+            view: &ViewEntries::identity_for_shape(&[2, 3]), // File is UInt8 but we claim Int16 — should fail with a
             // clear dtype-mismatch message, not garbled bytes.
             data_type: BandDataType::Int16,
         };
@@ -544,7 +545,7 @@ mod tests {
             uri: "/nonexistent/path/to/file.tif#band=1",
             dim_names: &["y", "x"],
             source_shape: &[2, 3],
-            view: &[],
+            view: &ViewEntries::identity_for_shape(&[2, 3]),
             data_type: BandDataType::UInt8,
         };
         let err = loader.load(&[&req]).await.unwrap_err();
@@ -564,7 +565,7 @@ mod tests {
             uri: &uri,
             dim_names: &["y", "x"],
             source_shape: &[2, 3],
-            view: &[],
+            view: &ViewEntries::identity_for_shape(&[2, 3]),
             data_type: BandDataType::UInt8,
         };
         let err = loader.load(&[&req]).await.unwrap_err();
@@ -588,7 +589,7 @@ mod tests {
             uri: "ignored",
             dim_names: &["y", "x"],
             source_shape: &[1 << 16, 1 << 16],
-            view: &[],
+            view: &ViewEntries::identity_for_shape(&[1 << 16, 1 << 16]),
             data_type: BandDataType::Float32,
         };
         let err = loader.load(&[&req]).await.unwrap_err();
@@ -612,7 +613,7 @@ mod tests {
             uri: &uri,
             dim_names: &["y", "x"],
             source_shape: &[64, 16],
-            view: &[],
+            view: &ViewEntries::identity_for_shape(&[64, 16]),
             data_type: BandDataType::UInt8,
         };
         let result = loader.load(&[&req]).await.unwrap();
@@ -645,5 +646,42 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gdal_loader_serves_a_batch_of_requests_in_request_order() {
+        // RS_EnsureLoaded issues every OutDb band of a batch in one call:
+        // results must come back one per request, in request order, and a
+        // file that appears twice is read twice without disturbing the
+        // others. Distinct shapes make any reordering observable.
+        let tmp = TempDir::new().unwrap();
+        let a = write_uint8_geotiff(&tmp, "a.tif"); // 2 × 3, pixels 0..6
+        let b = write_pattern_geotiff(&tmp, "b.tif", 4, 2); // 2 × 4, pixels 0..8
+        let a_uri = format!("{a}#band=1");
+        let b_uri = format!("{b}#band=1");
+        let view_a = ViewEntries::identity_for_shape(&[2, 3]);
+        let view_b = ViewEntries::identity_for_shape(&[2, 4]);
+        let req_a = RasterLoadRequest {
+            uri: &a_uri,
+            dim_names: &["y", "x"],
+            source_shape: &[2, 3],
+            view: &view_a,
+            data_type: BandDataType::UInt8,
+        };
+        let req_b = RasterLoadRequest {
+            uri: &b_uri,
+            dim_names: &["y", "x"],
+            source_shape: &[2, 4],
+            view: &view_b,
+            data_type: BandDataType::UInt8,
+        };
+
+        let loader = GdalLoader::new();
+        let results = loader.load(&[&req_a, &req_b, &req_a]).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].bytes.as_slice(), &[0u8, 1, 2, 3, 4, 5]);
+        assert_eq!(results[1].bytes.as_slice(), &[0u8, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(results[2].bytes.as_slice(), &[0u8, 1, 2, 3, 4, 5]);
+        assert_eq!(results[1].source_shape, vec![2, 4]);
     }
 }

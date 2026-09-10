@@ -16,9 +16,10 @@
 // under the License.
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{DataType, Field, Schema};
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::{exec_datafusion_err, DataFusionError, Result, ScalarValue};
-use datafusion_expr::Operator;
+use datafusion_expr::{Expr, Operator};
 use datafusion_physical_expr::{
     expressions::{BinaryExpr, Column, Literal},
     PhysicalExpr, ScalarFunctionExpr,
@@ -201,7 +202,7 @@ impl SpatialFilterFactory {
             Ok(spatial_filter)
         } else if let Some(spatial_filter) = self.try_from_distance_predicate(expr)? {
             Ok(spatial_filter)
-        } else if let Some(binary_expr) = expr.as_any().downcast_ref::<BinaryExpr>() {
+        } else if let Some(binary_expr) = expr.downcast_ref::<BinaryExpr>() {
             match binary_expr.op() {
                 Operator::And => Ok(SpatialFilter::And(
                     Box::new(self.try_from_expr(binary_expr.left())?),
@@ -214,7 +215,7 @@ impl SpatialFilterFactory {
                 // Not a binary expression we know about
                 _ => Ok(SpatialFilter::Unknown),
             }
-        } else if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
+        } else if let Some(literal) = expr.downcast_ref::<Literal>() {
             if let ScalarValue::Boolean(Some(value)) = literal.value() {
                 match value {
                     true => Ok(SpatialFilter::Unknown),
@@ -230,11 +231,21 @@ impl SpatialFilterFactory {
         }
     }
 
+    /// Construct a SpatialPredicate from a logical [Expr].
+    ///
+    /// Parses `expr` to extract known expressions we can evaluate against statistics.
+    /// Logical columns are resolved by name, so the index stored in the resulting
+    /// [Column] is always zero.
+    pub fn try_from_logical_expr(&self, expr: &Expr) -> Result<SpatialFilter> {
+        let physical_expr = logical_to_physical_expr(expr)?;
+        self.try_from_expr(&physical_expr)
+    }
+
     fn try_from_range_predicate(
         &self,
         expr: &Arc<dyn PhysicalExpr>,
     ) -> Result<Option<SpatialFilter>> {
-        let Some(scalar_fun) = expr.as_any().downcast_ref::<ScalarFunctionExpr>() else {
+        let Some(scalar_fun) = expr.downcast_ref::<ScalarFunctionExpr>() else {
             return Ok(None);
         };
 
@@ -488,6 +499,79 @@ impl SpatialFilterFactory {
     }
 }
 
+/// Convert the small logical-expression subset understood by the spatial filter
+/// parser to its physical counterparts. This keeps logical and physical parsing
+/// on the same implementation path.
+fn logical_to_physical_expr(expr: &Expr) -> Result<Arc<dyn PhysicalExpr>> {
+    match expr {
+        Expr::Column(column) => Ok(Arc::new(Column::new(&column.name, 0))),
+        Expr::Literal(value, metadata) => Ok(Arc::new(Literal::new_with_metadata(
+            value.clone(),
+            metadata.clone(),
+        ))),
+        Expr::BinaryExpr(binary) => Ok(Arc::new(BinaryExpr::new(
+            logical_to_physical_expr(&binary.left)?,
+            binary.op,
+            logical_to_physical_expr(&binary.right)?,
+        ))),
+        Expr::ScalarFunction(function) => {
+            let args = function
+                .args
+                .iter()
+                .map(logical_to_physical_expr)
+                .collect::<Result<Vec<_>>>()?;
+            let return_type = if function.func.name() == "st_distance" {
+                DataType::Float64
+            } else {
+                DataType::Boolean
+            };
+            Ok(Arc::new(ScalarFunctionExpr::new(
+                function.func.name(),
+                Arc::clone(&function.func),
+                args,
+                Arc::new(Field::new("", return_type, true)),
+                Arc::new(ConfigOptions::default()),
+            )))
+        }
+        // Preserve an unsupported node as a physical expression that the shared
+        // argument parser will classify as `Other`.
+        _ => Ok(Arc::new(UnknownSentinelExpr)),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct UnknownSentinelExpr;
+
+impl std::fmt::Display for UnknownSentinelExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UnknownSentinelExpr")
+    }
+}
+
+impl PhysicalExpr for UnknownSentinelExpr {
+    fn evaluate(
+        &self,
+        _batch: &arrow_array::RecordBatch,
+    ) -> Result<datafusion_expr::ColumnarValue> {
+        sedona_internal_err!("Unexpected call to evaluate()")
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(self)
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UnknownSentinelExpr")
+    }
+}
+
 /// Table GeoStatistics
 ///
 /// Enables providing a collection of GeoStatistics to [SpatialFilter::evaluate]
@@ -575,19 +659,19 @@ fn parse_args(args: &[Arc<dyn PhysicalExpr>]) -> Vec<ArgRef<'_>> {
 }
 
 fn parse_arg(arg: &Arc<dyn PhysicalExpr>) -> ArgRef<'_> {
-    if let Some(column_wrapper) = arg.as_any().downcast_ref::<MetadataPreservingColumn>() {
+    if let Some(column_wrapper) = arg.downcast_ref::<MetadataPreservingColumn>() {
         return parse_arg(column_wrapper.inner());
     }
 
-    if let Some(column) = arg.as_any().downcast_ref::<Column>() {
+    if let Some(column) = arg.downcast_ref::<Column>() {
         ArgRef::Col(column.clone())
-    } else if let Some(column_wrapper) = arg.as_any().downcast_ref::<MetadataPreservingColumn>() {
-        if let Some(column) = column_wrapper.inner().as_any().downcast_ref::<Column>() {
+    } else if let Some(column_wrapper) = arg.downcast_ref::<MetadataPreservingColumn>() {
+        if let Some(column) = column_wrapper.inner().downcast_ref::<Column>() {
             ArgRef::Col(column.clone())
         } else {
             ArgRef::Other
         }
-    } else if let Some(literal) = arg.as_any().downcast_ref::<Literal>() {
+    } else if let Some(literal) = arg.downcast_ref::<Literal>() {
         ArgRef::Lit(literal)
     } else {
         ArgRef::Other
@@ -598,7 +682,9 @@ fn parse_arg(arg: &Arc<dyn PhysicalExpr>) -> ArgRef<'_> {
 mod test {
     use arrow_schema::{DataType, Field};
     use datafusion_common::config::ConfigOptions;
-    use datafusion_expr::{ScalarUDF, Signature, SimpleScalarUDF, Volatility};
+    use datafusion_expr::{
+        expr::ScalarFunction, ScalarUDF, Signature, SimpleScalarUDF, Volatility,
+    };
     use rstest::rstest;
     use sedona_geometry::{bounding_box::BoundingBox, interval::Interval};
     use sedona_schema::datatypes::{WKB_GEOGRAPHY, WKB_GEOMETRY};
@@ -812,6 +898,66 @@ mod test {
         ));
         assert!(matches!(
             factory.try_from_expr(&expr_no_args).unwrap(),
+            SpatialFilter::Unknown
+        ));
+    }
+
+    #[test]
+    fn predicate_from_logical_expr() {
+        let factory = SpatialFilterFactory::default();
+        let storage_field = WKB_GEOMETRY.to_storage_field("", true).unwrap();
+        let literal = Expr::Literal(
+            create_scalar(Some("POINT (1 2)"), &WKB_GEOMETRY),
+            Some(storage_field.metadata().clone().into()),
+        );
+        let intersects = create_dummy_spatial_function("st_intersects", 2);
+        let spatial_expr = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(intersects),
+            args: vec![datafusion_expr::col("geometry"), literal.clone()],
+        });
+
+        let predicate = factory.try_from_logical_expr(&spatial_expr).unwrap();
+        let SpatialFilter::Intersects(column, bounds) = predicate else {
+            panic!("expected an intersects filter");
+        };
+        assert_eq!(column.name(), "geometry");
+        assert_eq!(column.index(), 0);
+        assert!(bounds.contains(&BoundingBox::xy((1.0, 1.0), (2.0, 2.0))));
+
+        let combined = spatial_expr.and(Expr::Literal(ScalarValue::Boolean(Some(false)), None));
+        let predicate = factory.try_from_logical_expr(&combined).unwrap();
+        assert!(
+            matches!(predicate, SpatialFilter::And(_, rhs) if matches!(*rhs, SpatialFilter::LiteralFalse))
+        );
+
+        let distance = create_dummy_spatial_function("st_dwithin", 3);
+        let distance_expr = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(distance),
+            args: vec![
+                datafusion_expr::col("geometry"),
+                literal.clone(),
+                Expr::Literal(ScalarValue::Float64(Some(10.0)), None),
+            ],
+        });
+        assert!(matches!(
+            factory.try_from_logical_expr(&distance_expr).unwrap(),
+            SpatialFilter::Intersects(_, _)
+        ));
+
+        let st_distance = create_dummy_spatial_function("st_distance", 2);
+        let distance_comparison = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(st_distance),
+            args: vec![datafusion_expr::col("geometry"), literal.clone()],
+        })
+        .lt_eq(Expr::Literal(ScalarValue::Float64(Some(10.0)), None));
+        assert!(matches!(
+            factory.try_from_logical_expr(&distance_comparison).unwrap(),
+            SpatialFilter::Intersects(_, _)
+        ));
+
+        let unsupported = datafusion_expr::col("geometry").alias("aliased_geometry");
+        assert!(matches!(
+            factory.try_from_logical_expr(&unsupported).unwrap(),
             SpatialFilter::Unknown
         ));
     }
