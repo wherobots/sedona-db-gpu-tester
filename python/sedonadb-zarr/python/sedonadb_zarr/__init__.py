@@ -55,12 +55,22 @@ class ZarrExtension:
         >>> sd.register(ZarrExtension())
     """
 
+    def __init__(self, io_concurrency: Optional[int] = None) -> None:
+        #: The loader's I/O budget: Zarr chunk reads in flight at once across
+        #: every concurrent ``RS_EnsureLoaded`` call in the session, whatever
+        #: the number of partitions. ``None`` keeps the loader's default.
+        self.io_concurrency = io_concurrency
+        #: The ``ZarrRasterLoader`` registered by this extension, set on
+        #: registration; its ``handle_stats()`` reports handle reuse.
+        self.loader: Optional[ZarrRasterLoader] = None
+
     def __sedonadb_extension__(self, sd: SedonaContext, **kwargs) -> None:
         if kwargs:
             raise ValueError("Registration options not supported for ZarrExtension")
 
-        # Register the ZarrRasterLoader
-        sd.register(ZarrRasterLoader())
+        # Register the ZarrRasterLoader, keeping it reachable for diagnostics
+        self.loader = ZarrRasterLoader(io_concurrency=self.io_concurrency)
+        sd.register(self.loader)
 
         # Register the Zarr() format as a FileFormatFactory for SQL and .read(..., format="zarr")
         sd.register(Zarr())
@@ -79,7 +89,9 @@ class Zarr(ExternalFormatSpec):
 
     Args:
         options: Supported options include
-            - `arrays` (`list[str]`) — explicit subset of group arrays to read.
+            - `arrays` (`list[str]`) — explicit subset of group arrays to read,
+              in band order: band `i` of every row is `arrays[i]`. Without it,
+              discovered arrays are read as bands sorted by path.
     """
 
     _SUPPORTED_OPTIONS = frozenset({"arrays"})
@@ -123,8 +135,13 @@ class ZarrRasterLoader(RasterLoader):
     and enables RS_EnsureLoaded() can resolve pixels of a Zarr.
     """
 
-    def __init__(self):
-        self._impl = PyZarrRasterLoader()
+    def __init__(self, io_concurrency: Optional[int] = None):
+        self._impl = PyZarrRasterLoader(io_concurrency)
+
+    def io_concurrency(self) -> int:
+        """The loader's I/O budget: chunk reads in flight at once across every
+        concurrent ``RS_EnsureLoaded`` call, shared by all partitions."""
+        return self._impl.io_concurrency()
 
     def name(self):
         return self._impl.name()
@@ -134,6 +151,17 @@ class ZarrRasterLoader(RasterLoader):
 
     def load(self, requests):
         return self._impl.load(requests)
+
+    def handle_stats(self) -> dict:
+        """Hit and miss counters for the handles this loader keeps across
+        ``RS_EnsureLoaded`` calls.
+
+        ``store_hits`` / ``store_misses`` count the object store client per
+        scheme and authority (a miss builds a client);
+        ``array_hits`` / ``array_misses`` count the opened array per store
+        and array path (a miss is a metadata round trip).
+        """
+        return self._impl.handle_stats()
 
 
 __all__ = ["Zarr", "ZarrExtension"]

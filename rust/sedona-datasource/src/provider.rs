@@ -23,24 +23,24 @@ use datafusion::{
     catalog::TableProvider,
     config::TableOptions,
     datasource::{
+        TableType,
         file_format::FileFormat,
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
         physical_plan::FileScanConfig,
-        TableType,
     },
-    execution::{options::ReadOptions, SessionState},
+    execution::{SessionState, options::ReadOptions},
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_catalog::{memory::DataSourceExec, Session};
-use datafusion_common::{exec_err, extensions::Extensions, Result, TableReference};
+use datafusion_catalog::{Session, memory::DataSourceExec};
+use datafusion_common::{Result, TableReference, exec_err, extensions::Extensions};
 use datafusion_datasource::{
-    file_groups::FileGroup, file_scan_config::FileScanConfigBuilder, table_schema::TableSchema,
-    PartitionedFile,
+    PartitionedFile, file_groups::FileGroup, file_scan_config::FileScanConfigBuilder,
+    table_schema::TableSchema,
 };
 use datafusion_execution::object_store::ObjectStoreUrl;
-use object_store::{path::Path as ObjectPath, ObjectMeta};
+use object_store::{ObjectMeta, path::Path as ObjectPath};
 
 use crate::{
     format::ExternalFileFormat,
@@ -107,8 +107,8 @@ async fn listing_table_provider(
             let file_path = path.as_str();
             if !file_path.ends_with(option_extension.clone().as_str()) && !path.is_collection() {
                 return exec_err!(
-                        "File path '{file_path}' does not match the expected extension '{option_extension}'"
-                    );
+                    "File path '{file_path}' does not match the expected extension '{option_extension}'"
+                );
             }
         }
     }
@@ -156,7 +156,7 @@ struct RecordBatchReaderTableOptions {
 impl ReadOptions<'_> for RecordBatchReaderTableOptions {
     fn to_listing_options(
         &self,
-        config: &SessionConfig,
+        _config: &SessionConfig,
         table_options: TableOptions,
     ) -> ListingOptions {
         let format = if let Some(modified) = self.spec.with_table_options(&table_options) {
@@ -165,9 +165,8 @@ impl ReadOptions<'_> for RecordBatchReaderTableOptions {
             ExternalFileFormat::new(self.spec.clone())
         };
 
-        let mut options = ListingOptions::new(Arc::new(format))
-            .with_file_extension(self.spec.extension())
-            .with_session_config_options(config);
+        let mut options =
+            ListingOptions::new(Arc::new(format)).with_file_extension(self.spec.extension());
 
         // Apply partition columns if explicitly specified (Some)
         // None means auto-discover later, Some([]) means no partitioning
@@ -269,7 +268,7 @@ impl TableProvider for SingleObjectExternalTable {
         // for single-object formats today.
         let (object_store_url, _) = &self.files[0];
 
-        let table_schema = TableSchema::new(self.schema.clone(), vec![]);
+        let table_schema = TableSchema::from(self.schema.clone());
         let format = ExternalFileFormat::new(self.spec.clone());
         let file_source = format.file_source(table_schema);
 
@@ -288,6 +287,7 @@ impl TableProvider for SingleObjectExternalTable {
                     metadata_size_hint: None,
                     ordering: None,
                     table_reference: Some(TableReference::bare(location.to_string())),
+                    arrow_schema: None,
                 }])
             })
             .collect();

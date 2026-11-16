@@ -20,9 +20,9 @@ use std::sync::Arc;
 use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, ArrayRef, BooleanArray};
 use arrow_schema::FieldRef;
-use datafusion_common::{cast::as_binary_array, error::Result, DataFusionError, ScalarValue};
+use datafusion_common::{DataFusionError, ScalarValue, cast::as_binary_array, error::Result};
 use datafusion_expr::{Accumulator, ColumnarValue, EmitTo, GroupsAccumulator};
-use geo::{algorithm::convex_hull::quick_hull, Coord};
+use geo::{Coord, algorithm::convex_hull::quick_hull};
 use geo_traits::{Dimensions, GeometryTrait};
 use sedona_common::sedona_internal_err;
 use sedona_expr::{
@@ -89,11 +89,7 @@ fn filter_keep(filter: Option<&BooleanArray>, i: usize) -> bool {
 }
 
 fn normalize_zero(v: f64) -> f64 {
-    if v == 0.0 {
-        0.0
-    } else {
-        v
-    }
+    if v == 0.0 { 0.0 } else { v }
 }
 
 fn coord_cmp(a: &Coord, b: &Coord) -> std::cmp::Ordering {
@@ -284,11 +280,9 @@ impl ConvexHullGroupsAccumulator {
             let group_id = group_indices[i];
             i += 1;
 
-            if keep {
-                if let Some(item) = maybe_item {
-                    self.has_input[group_id] = true;
-                    push_hull_coords(item, &mut self.coords[group_id])?;
-                }
+            if keep && let Some(item) = maybe_item {
+                self.has_input[group_id] = true;
+                push_hull_coords(item, &mut self.coords[group_id])?;
             }
 
             Ok(())
@@ -377,10 +371,25 @@ impl GroupsAccumulator for ConvexHullGroupsAccumulator {
         &mut self,
         values: &[ArrayRef],
         group_indices: &[usize],
-        opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        self.merge_state(values, group_indices, opt_filter, total_num_groups)
+        self.merge_state(values, group_indices, None, total_num_groups)
+    }
+
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        opt_filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        let num_rows = values[0].len();
+        let mut accumulator = Self::new(self.input_type.clone());
+        accumulator.execute_update(
+            values,
+            &(0..num_rows).collect::<Vec<_>>(),
+            opt_filter,
+            num_rows,
+        )?;
+        accumulator.state(EmitTo::All)
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {

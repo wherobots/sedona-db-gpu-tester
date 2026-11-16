@@ -26,9 +26,9 @@ use datafusion::{
     config::{ConfigField, ConfigOptions},
     datasource::{
         file_format::{
+            FileFormat, FileFormatFactory,
             file_compression_type::FileCompressionType,
             parquet::{ParquetFormat, ParquetFormatFactory},
-            FileFormat, FileFormatFactory,
         },
         physical_plan::{
             FileOpener, FileScanConfig, FileScanConfigBuilder, FileSinkConfig, FileSource,
@@ -36,33 +36,33 @@ use datafusion::{
         table_schema::TableSchema,
     },
 };
-use datafusion_catalog::{memory::DataSourceExec, Session};
-use datafusion_common::{plan_err, GetExt, Result, Statistics};
+use datafusion_catalog::{Session, memory::DataSourceExec};
 use datafusion_common::{
-    tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     DataFusionError,
+    tree_node::{Transformed, TreeNode, TreeNodeRecursion},
 };
+use datafusion_common::{GetExt, Result, Statistics, plan_err};
 use datafusion_datasource::morsel::Morselizer;
 use datafusion_datasource_parquet::metadata::DFParquetMetadata;
 use datafusion_datasource_parquet::{CachedParquetFileReaderFactory, ParquetFileReaderFactory};
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_expr::{
-    expressions::Column, projection::ProjectionExprs, LexRequirement, PhysicalExpr,
+    LexRequirement, PhysicalExpr, expressions::Column, projection::ProjectionExprs,
 };
 use datafusion_physical_plan::{
-    filter_pushdown::FilterPushdownPropagation, metrics::ExecutionPlanMetricsSet, ExecutionPlan,
+    ExecutionPlan, filter_pushdown::FilterPushdownPropagation, metrics::ExecutionPlanMetricsSet,
 };
 use futures::{StreamExt, TryStreamExt};
 use object_store::{ObjectMeta, ObjectStore};
 
-use sedona_common::{sedona_internal_datafusion_err, sedona_internal_err, SedonaOptions};
+use sedona_common::{SedonaOptions, sedona_internal_datafusion_err, sedona_internal_err};
 
 use sedona_expr::metadata_preserving_column::MetadataPreservingColumn;
 use sedona_geometry::bounds::WkbBounder2DFactory;
 use sedona_schema::extension_type::ExtensionType;
 
 use crate::{
-    file_opener::{storage_schema_contains_geo, GeoParquetFileOpenerMetrics, GeoParquetMorselizer},
+    file_opener::{GeoParquetFileOpenerMetrics, GeoParquetMorselizer, storage_schema_contains_geo},
     metadata::{GeoParquetColumnEncoding, GeoParquetMetadata},
     options::TableGeoParquetOptions,
     writer::create_geoparquet_writer_physical_plan,
@@ -216,7 +216,13 @@ impl FileFormat for GeoParquetFormat {
                 }
             })
             .boxed() // Workaround https://github.com/rust-lang/rust/issues/64552
-            .buffered(state.config_options().execution.meta_fetch_concurrency)
+            .buffered(
+                state
+                    .config_options()
+                    .execution
+                    .meta_fetch_concurrency
+                    .get(),
+            )
             .try_collect()
             .await?;
 
@@ -431,7 +437,7 @@ pub struct GeoParquetFileSource {
     metadata_size_hint: Option<usize>,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     options: TableGeoParquetOptions,
-    metadata_cache: Option<Arc<dyn FileMetadataCache>>,
+    metadata_cache: Option<Arc<FileMetadataCache>>,
     /// Factory for creating bounders used for spatial pruning
     ///
     /// Enables spatial pruning for both GEOMETRY and GEOGRAPHY columns.
@@ -512,7 +518,9 @@ impl GeoParquetFileSource {
                     if Arc::ptr_eq(&inner_predicate, &specified_predicate) {
                         Some(inner_predicate)
                     } else {
-                        return sedona_internal_err!("Inner predicate should be equivalent to the predicate in `GeoParquetFileSource`");
+                        return sedona_internal_err!(
+                            "Inner predicate should be equivalent to the predicate in `GeoParquetFileSource`"
+                        );
                     }
                 }
             };
@@ -577,6 +585,19 @@ impl GeoParquetFileSource {
 }
 
 impl FileSource for GeoParquetFileSource {
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        if self.inner.apply_expressions(f)? == TreeNodeRecursion::Stop {
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        if let Some(predicate) = &self.predicate {
+            return f(predicate);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
@@ -769,16 +790,16 @@ mod test {
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::{
         execution::SessionStateBuilder,
-        prelude::{col, ParquetReadOptions, SessionContext},
+        prelude::{ParquetReadOptions, SessionContext, col},
     };
     use datafusion_common::ScalarValue;
     use datafusion_expr::{Expr, Operator, ScalarUDF, Signature, SimpleScalarUDF, Volatility};
-    use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
     use datafusion_physical_expr::PhysicalExpr;
+    use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
 
     use rstest::rstest;
     use sedona_geometry::types::Edges;
-    use sedona_schema::crs::{deserialize_crs, lnglat};
+    use sedona_schema::crs::deserialize_crs;
     use sedona_schema::datatypes::{SedonaType, WKB_GEOMETRY};
     use sedona_schema::schema::SedonaSchema;
     use sedona_testing::create::create_scalar;
@@ -813,10 +834,7 @@ mod test {
             .unwrap();
         assert_eq!(sedona_types.len(), 2);
         assert_eq!(sedona_types[0], SedonaType::Arrow(DataType::Utf8View));
-        assert_eq!(
-            sedona_types[1],
-            SedonaType::WkbView(Edges::Planar, lnglat())
-        );
+        assert_eq!(sedona_types[1], SedonaType::WkbView(Edges::Planar, None));
 
         // Check that the batches resulting from the actual execution also have
         // the correct schema
@@ -829,10 +847,7 @@ mod test {
             .unwrap();
         assert_eq!(sedona_types.len(), 2);
         assert_eq!(sedona_types[0], SedonaType::Arrow(DataType::Utf8View));
-        assert_eq!(
-            sedona_types[1],
-            SedonaType::WkbView(Edges::Planar, lnglat())
-        );
+        assert_eq!(sedona_types[1], SedonaType::WkbView(Edges::Planar, None));
 
         // Check that the content is the same as if it were read by the normal reader
         let unwrapped_batches: Vec<_> = batches
@@ -899,10 +914,7 @@ mod test {
             .unwrap();
         assert_eq!(sedona_types.len(), 2);
         assert_eq!(sedona_types[0], SedonaType::Arrow(DataType::Utf8View));
-        assert_eq!(
-            sedona_types[1],
-            SedonaType::WkbView(Edges::Planar, lnglat())
-        );
+        assert_eq!(sedona_types[1], SedonaType::WkbView(Edges::Planar, None));
 
         // Make sure all the rows show up!
         let batches = df.collect().await.unwrap();
@@ -1069,10 +1081,10 @@ mod test {
         // factory so that per-query metadata reads are cached.
         let ctx = setup_context();
         let format = GeoParquetFormat::new(TableGeoParquetOptions::default());
-        let schema = Arc::new(Schema::new(vec![WKB_GEOMETRY
-            .to_storage_field("geometry", true)
-            .unwrap()]));
-        let table_schema = TableSchema::new(schema, vec![]);
+        let schema = Arc::new(Schema::new(vec![
+            WKB_GEOMETRY.to_storage_field("geometry", true).unwrap(),
+        ]));
+        let table_schema = TableSchema::from(schema);
         let file_source = format.file_source(table_schema);
         let conf =
             FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), file_source).build();
@@ -1104,7 +1116,7 @@ mod test {
             DataType::Int32,
             false,
         )]));
-        let table_schema = TableSchema::new(schema, vec![]);
+        let table_schema = TableSchema::from(schema);
 
         // Create a parquet source with the correct constructor signature
         let parquet_source = ParquetSource::new(table_schema);
@@ -1132,7 +1144,7 @@ mod test {
             "geoarrow.wkb".to_string(),
         );
         let file_schema = Schema::new(vec![
-            Field::new("geometry", DataType::Binary, true).with_metadata(metadata)
+            Field::new("geometry", DataType::Binary, true).with_metadata(metadata),
         ]);
 
         // Column expression for the geometry column (index 0 in file schema)

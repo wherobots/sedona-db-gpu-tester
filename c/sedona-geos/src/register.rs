@@ -14,7 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use sedona_expr::aggregate_udf::SedonaAccumulatorRef;
+use datafusion_expr::utils::AggregateOrderSensitivity;
+use sedona_expr::aggregate_udf::{SedonaAccumulatorRef, SedonaAggregateUDF};
 use sedona_expr::scalar_udf::{IntoScalarKernelRefs, ScalarKernelRef};
 
 macro_rules! define_scalar_kernels {
@@ -45,6 +46,8 @@ pub fn scalar_kernels() -> Vec<(&'static str, Vec<ScalarKernelRef>)> {
         "st_buffer" => crate::st_buffer::st_buffer_impl,
         "st_buffer" => crate::st_buffer::st_buffer_style_impl,
         "st_centroid" => crate::st_centroid::st_centroid_impl,
+        "st_closestpoint" => crate::st_closest_point::st_closest_point_impl,
+        "st_shortestline" => crate::st_closest_point::st_shortest_line_impl,
         "st_concavehull" => crate::st_concavehull::st_concave_hull_allow_holes_impl,
         "st_concavehull" => crate::st_concavehull::st_concave_hull_impl,
         "st_contains" => crate::binary_predicates::st_contains_impl,
@@ -100,5 +103,16 @@ pub fn scalar_kernels() -> Vec<(&'static str, Vec<ScalarKernelRef>)> {
 pub fn aggregate_kernels() -> Vec<(&'static str, Vec<SedonaAccumulatorRef>)> {
     define_aggregate_kernels!(
         "st_polygonize_agg" => crate::st_polygonize_agg::st_polygonize_agg_impl,
+        "st_union_agg" => crate::st_union_agg::st_union_agg_impl,
     )
+}
+
+pub fn aggregate_udfs() -> Vec<SedonaAggregateUDF> {
+    aggregate_kernels()
+        .into_iter()
+        .map(|(name, kernels)| {
+            SedonaAggregateUDF::from_impl(name, kernels)
+                .with_order_sensitivity(AggregateOrderSensitivity::Insensitive)
+        })
+        .collect()
 }

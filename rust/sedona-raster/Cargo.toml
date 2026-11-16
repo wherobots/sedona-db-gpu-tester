@@ -24,7 +24,7 @@ homepage.workspace = true
 repository.workspace = true
 description.workspace = true
 readme.workspace = true
-edition.workspace = true
+edition = "2024"
 rust-version.workspace = true
 
 [lints.clippy]
@@ -33,9 +33,10 @@ result_large_err = "allow"
 [dependencies]
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
-arrow-buffer = { workspace = true }
+arrow-buffer = { workspace = true, features = ["pool"] }
 async-trait = { workspace = true }
 datafusion-common = { workspace = true }
+lru = { workspace = true }
 sedona-common = { workspace = true }
 sedona-schema = { workspace = true }
 thiserror = { workspace = true }
@@ -45,4 +46,5 @@ sedona-testing = { workspace = true }
 approx = { workspace = true }
 arrow-data = { workspace = true }
 arrow-ipc = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

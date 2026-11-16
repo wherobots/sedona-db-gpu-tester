@@ -18,11 +18,11 @@
 use std::{fmt::Debug, iter::zip, sync::Arc};
 
 use arrow_schema::DataType;
-use datafusion_common::{plan_err, Result};
+use datafusion_common::{Result, plan_err};
 use sedona_common::sedona_internal_err;
 use sedona_geometry::types::Edges;
 
-use crate::datatypes::{SedonaType, RASTER, WKB_GEOGRAPHY, WKB_GEOMETRY};
+use crate::datatypes::{RASTER, SedonaType, WKB_GEOGRAPHY, WKB_GEOMETRY};
 
 /// Helper to match arguments and compute return types
 #[derive(Debug)]
@@ -79,6 +79,7 @@ impl ArgMatcher {
 
         match &self.out_type {
             SedonaType::Wkb(edges, _) => Ok(Some(SedonaType::Wkb(*edges, out_crs))),
+            SedonaType::WkbLarge(edges, _) => Ok(Some(SedonaType::WkbLarge(*edges, out_crs))),
             SedonaType::WkbView(edges, _) => Ok(Some(SedonaType::WkbView(*edges, out_crs))),
             _ => Ok(Some(self.out_type.clone())),
         }
@@ -353,7 +354,10 @@ struct IsGeometryOrGeography {}
 
 impl TypeMatcher for IsGeometryOrGeography {
     fn match_type(&self, arg: &SedonaType) -> bool {
-        matches!(arg, SedonaType::Wkb(_, _) | SedonaType::WkbView(_, _))
+        matches!(
+            arg,
+            SedonaType::Wkb(_, _) | SedonaType::WkbLarge(_, _) | SedonaType::WkbView(_, _)
+        )
     }
 }
 
@@ -363,7 +367,9 @@ struct IsGeometry {}
 impl TypeMatcher for IsGeometry {
     fn match_type(&self, arg: &SedonaType) -> bool {
         match arg {
-            SedonaType::Wkb(edges, _) | SedonaType::WkbView(edges, _) => {
+            SedonaType::Wkb(edges, _)
+            | SedonaType::WkbLarge(edges, _)
+            | SedonaType::WkbView(edges, _) => {
                 matches!(edges, Edges::Planar)
             }
             _ => false,
@@ -381,7 +387,9 @@ struct IsGeography {}
 impl TypeMatcher for IsGeography {
     fn match_type(&self, arg: &SedonaType) -> bool {
         match arg {
-            SedonaType::Wkb(edges, _) | SedonaType::WkbView(edges, _) => {
+            SedonaType::Wkb(edges, _)
+            | SedonaType::WkbLarge(edges, _)
+            | SedonaType::WkbView(edges, _) => {
                 matches!(edges, Edges::Spherical)
             }
             _ => false,
@@ -520,7 +528,10 @@ impl TypeMatcher for IsBinary {
     fn match_type(&self, arg: &SedonaType) -> bool {
         match arg {
             SedonaType::Arrow(data_type) => {
-                matches!(data_type, DataType::Binary | DataType::BinaryView)
+                matches!(
+                    data_type,
+                    DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+                )
             }
             _ => false,
         }
@@ -654,12 +665,16 @@ mod tests {
 
     #[test]
     fn matchers() {
-        assert!(ArgMatcher::is_arrow(DataType::Null).match_type(&SedonaType::Arrow(DataType::Null)));
+        assert!(
+            ArgMatcher::is_arrow(DataType::Null).match_type(&SedonaType::Arrow(DataType::Null))
+        );
 
         assert!(ArgMatcher::is_geometry_or_geography().match_type(&WKB_GEOMETRY));
         assert!(ArgMatcher::is_geometry_or_geography().match_type(&WKB_GEOGRAPHY));
-        assert!(!ArgMatcher::is_geometry_or_geography()
-            .match_type(&SedonaType::Arrow(DataType::Binary)));
+        assert!(
+            !ArgMatcher::is_geometry_or_geography()
+                .match_type(&SedonaType::Arrow(DataType::Binary))
+        );
         assert_eq!(ArgMatcher::is_geometry_or_geography().type_if_null(), None);
 
         assert!(ArgMatcher::is_geometry().match_type(&WKB_GEOMETRY));
@@ -726,6 +741,7 @@ mod tests {
         );
 
         assert!(ArgMatcher::is_binary().match_type(&SedonaType::Arrow(DataType::Binary)));
+        assert!(ArgMatcher::is_binary().match_type(&SedonaType::Arrow(DataType::LargeBinary)));
         assert!(ArgMatcher::is_binary().match_type(&SedonaType::Arrow(DataType::BinaryView)));
         assert!(!ArgMatcher::is_binary().match_type(&SedonaType::Arrow(DataType::Utf8)));
         assert_eq!(

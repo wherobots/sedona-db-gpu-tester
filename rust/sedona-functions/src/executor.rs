@@ -16,9 +16,11 @@
 // under the License.
 use std::iter::zip;
 
-use arrow_array::ArrayRef;
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
-use datafusion_common::cast::{as_binary_array, as_binary_view_array, as_struct_array};
+use datafusion_common::cast::{
+    as_binary_array, as_binary_view_array, as_large_binary_array, as_struct_array,
+};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::{DataFusionError, ScalarValue};
@@ -26,7 +28,7 @@ use datafusion_expr::ColumnarValue;
 use sedona_common::{option::SedonaOptions, sedona_internal_err};
 use sedona_geometry::{bounds::WkbBounder2D, types::Edges, wkb_header::WkbPointLayout};
 use sedona_schema::datatypes::SedonaType;
-use wkb::reader::{read_wkb, Wkb};
+use wkb::reader::{Wkb, read_wkb};
 
 /// Resolve the session bounder for a geometry/geography argument.
 pub(crate) fn bounder_for_arg_type(
@@ -35,7 +37,9 @@ pub(crate) fn bounder_for_arg_type(
     function_name: &str,
 ) -> Result<Box<dyn WkbBounder2D>> {
     let edges = match arg_type {
-        SedonaType::Wkb(edges, _) | SedonaType::WkbView(edges, _) => *edges,
+        SedonaType::Wkb(edges, _)
+        | SedonaType::WkbLarge(edges, _)
+        | SedonaType::WkbView(edges, _) => *edges,
         SedonaType::Arrow(DataType::Null) => Edges::Planar,
         _ => return sedona_internal_err!("Expected geometry or geography, got {arg_type:?}"),
     };
@@ -124,9 +128,10 @@ impl<'a, 'b, Factory0: GeometryFactory, Factory1: GeometryFactory>
     /// Execute a function by iterating over [Wkb] scalars in the first argument
     ///
     /// Provides a mechanism to iterate over a geometry array by converting each to
-    /// a [Wkb] scalar. For [SedonaType::Wkb] and [SedonaType::WkbView] arrays, this
-    /// is the conversion that would normally happen. For other future supported geometry
-    /// array types, this may incur a cast of item-wise conversion overhead.
+    /// a [Wkb] scalar. For [SedonaType::Wkb], [SedonaType::WkbLarge], and
+    /// [SedonaType::WkbView] arrays, this is the conversion that would normally happen.
+    /// For other future supported geometry array types, this may incur a cast of
+    /// item-wise conversion overhead.
     pub fn execute_wkb_void<F: FnMut(Option<&Factory0::Geom<'b>>) -> Result<()>>(
         &self,
         mut func: F,
@@ -150,9 +155,9 @@ impl<'a, 'b, Factory0: GeometryFactory, Factory1: GeometryFactory>
     /// first two arguments
     ///
     /// Provides a mechanism to iterate over two geometry arrays as pairs of [Wkb]
-    /// scalars. [SedonaType::Wkb] and [SedonaType::WkbView] arrays are iterated over
-    /// in place; however, future supported geometry array types may incur conversion
-    /// overhead.
+    /// scalars. [SedonaType::Wkb], [SedonaType::WkbLarge], and [SedonaType::WkbView]
+    /// arrays are iterated over in place; however, future supported geometry array types
+    /// may incur conversion overhead.
     pub fn execute_wkb_wkb_void<
         F: FnMut(Option<&Factory0::Geom<'b>>, Option<&Factory1::Geom<'b>>) -> Result<()>,
     >(
@@ -329,10 +334,10 @@ impl GeometryFactory for PointXYGeometryFactory {
     fn try_from_wkb<'a>(&self, wkb_bytes: &'a [u8]) -> Result<Self::Geom<'a>> {
         // A finite Point: read its coordinate from the fixed offset, no parse.
         // POINT EMPTY (NaN/NaN) and any header error fall through to the parser.
-        if let Ok(Some(layout)) = WkbPointLayout::try_from_wkb(wkb_bytes) {
-            if let Ok(Some((x, y))) = layout.read_xy(wkb_bytes) {
-                return Ok(PointOrWkb::Point(x, y));
-            }
+        if let Ok(Some(layout)) = WkbPointLayout::try_from_wkb(wkb_bytes)
+            && let Ok(Some((x, y))) = layout.read_xy(wkb_bytes)
+        {
+            return Ok(PointOrWkb::Point(x, y));
         }
         let wkb = read_wkb(wkb_bytes).map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(PointOrWkb::Other(wkb))
@@ -343,6 +348,49 @@ impl GeometryFactory for PointXYGeometryFactory {
 /// fast path for point-coordinate kernels.
 pub type PointXYExecutor<'a, 'b> =
     GenericExecutor<'a, 'b, PointXYGeometryFactory, PointXYGeometryFactory>;
+
+pub(crate) fn visible_wkb_bytes(arg_type: &SedonaType, arg: &ColumnarValue) -> Result<usize> {
+    match arg {
+        ColumnarValue::Array(array) => match arg_type {
+            SedonaType::Wkb(_, _) => {
+                let binary = as_binary_array(array)?;
+                let offsets = binary.offsets();
+                Ok((offsets[offsets.len() - 1] - offsets[0]) as usize)
+            }
+            SedonaType::WkbLarge(_, _) => {
+                let binary = as_large_binary_array(array)?;
+                let offsets = binary.offsets();
+                Ok((offsets[offsets.len() - 1] - offsets[0]) as usize)
+            }
+            SedonaType::WkbView(_, _) => {
+                let binary = as_binary_view_array(array)?;
+
+                // The low 32 bits of each view contain its byte length.
+                // Null views may retain nonzero lengths, so skip them.
+                Ok(binary
+                    .views()
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| binary.is_valid(*i))
+                    .map(|(_, view)| *view as u32 as usize)
+                    .sum())
+            }
+            _ => {
+                let mut total = 0usize;
+                array.iter_as_wkb_bytes(arg_type, array.len(), |maybe_wkb| {
+                    if let Some(wkb) = maybe_wkb {
+                        total += wkb.len();
+                    }
+                    Ok(())
+                })?;
+                Ok(total)
+            }
+        },
+        ColumnarValue::Scalar(scalar) => {
+            Ok(scalar.scalar_as_wkb_bytes()?.map_or(0, |wkb| wkb.len()))
+        }
+    }
+}
 
 /// Trait for iterating over a container type as geometry scalars
 ///
@@ -431,6 +479,7 @@ impl IterGeo for ArrayRef {
                 Ok(())
             }
             SedonaType::Wkb(_, _) => iter_wkb_binary(as_binary_array(self)?, func),
+            SedonaType::WkbLarge(_, _) => iter_wkb_binary(as_large_binary_array(self)?, func),
             SedonaType::WkbView(_, _) => iter_wkb_binary(as_binary_view_array(self)?, func),
             SedonaType::Arrow(DataType::Struct(fields)) if sedona_type.is_item_crs() => {
                 let struct_array = as_struct_array(self)?;
@@ -504,6 +553,41 @@ fn iter_wkb_wkb_array<
             factory1,
             as_binary_array(array0)?,
             as_binary_view_array(array1)?,
+            func,
+        ),
+        (SedonaType::Wkb(_, _), SedonaType::WkbLarge(_, _)) => iter_wkb_wkb_binary(
+            factory0,
+            factory1,
+            as_binary_array(array0)?,
+            as_large_binary_array(array1)?,
+            func,
+        ),
+        (SedonaType::WkbLarge(_, _), SedonaType::Wkb(_, _)) => iter_wkb_wkb_binary(
+            factory0,
+            factory1,
+            as_large_binary_array(array0)?,
+            as_binary_array(array1)?,
+            func,
+        ),
+        (SedonaType::WkbLarge(_, _), SedonaType::WkbLarge(_, _)) => iter_wkb_wkb_binary(
+            factory0,
+            factory1,
+            as_large_binary_array(array0)?,
+            as_large_binary_array(array1)?,
+            func,
+        ),
+        (SedonaType::WkbLarge(_, _), SedonaType::WkbView(_, _)) => iter_wkb_wkb_binary(
+            factory0,
+            factory1,
+            as_large_binary_array(array0)?,
+            as_binary_view_array(array1)?,
+            func,
+        ),
+        (SedonaType::WkbView(_, _), SedonaType::WkbLarge(_, _)) => iter_wkb_wkb_binary(
+            factory0,
+            factory1,
+            as_binary_view_array(array0)?,
+            as_large_binary_array(array1)?,
             func,
         ),
         (SedonaType::WkbView(_, _), SedonaType::Wkb(_, _)) => iter_wkb_wkb_binary(
@@ -580,12 +664,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use arrow_array::{builder::BinaryBuilder, create_array};
+    use arrow_array::{
+        BinaryArray, BinaryViewArray, LargeBinaryArray, builder::BinaryBuilder, create_array,
+    };
     use arrow_schema::DataType;
     use datafusion_common::{cast::as_binary_view_array, scalar::ScalarValue};
     use datafusion_expr::ColumnarValue;
     use rstest::rstest;
-    use sedona_schema::datatypes::{WKB_GEOMETRY, WKB_VIEW_GEOMETRY};
+    use sedona_schema::datatypes::{WKB_GEOMETRY, WKB_LARGE_GEOMETRY, WKB_VIEW_GEOMETRY};
 
     const POINT: [u8; 21] = [
         0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, 0x00, 0x00,
@@ -634,6 +720,22 @@ mod tests {
             .unwrap();
         assert_eq!(wkt_out, " 0: POINT(1 2) 1: None 2: POINT(1 2)");
 
+        let wkb_large_array_ref = ColumnarValue::Array(Arc::new(wkb_array.clone()))
+            .cast_to(&DataType::LargeBinary, None)
+            .unwrap()
+            .to_array(3)
+            .unwrap();
+        let mut wkt_out = String::new();
+        let mut i = 0;
+        wkb_large_array_ref
+            .iter_as_wkb(&WKB_LARGE_GEOMETRY, 3, |maybe_geom| {
+                write_to_test_output(&mut wkt_out, i, maybe_geom).unwrap();
+                i += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(wkt_out, " 0: POINT(1 2) 1: None 2: POINT(1 2)");
+
         let wkb_view_array_ref = ColumnarValue::Array(wkb_array_ref)
             .cast_to(&DataType::BinaryView, None)
             .unwrap()
@@ -662,11 +764,88 @@ mod tests {
     }
 
     #[rstest]
+    #[test]
+    fn visible_wkb_bytes_counts_visible_values() {
+        let values = vec![
+            Some(&b"abc"[..]),
+            None,
+            Some(&b"0123456789abcdefg"[..]),
+            Some(&b""[..]),
+        ];
+        let binary = BinaryArray::from_iter(values.clone());
+        let large = LargeBinaryArray::from_iter(values.clone());
+        let view = BinaryViewArray::from_iter(values);
+        let array = |a: ArrayRef| ColumnarValue::Array(a);
+
+        assert_eq!(
+            visible_wkb_bytes(&WKB_GEOMETRY, &array(Arc::new(binary.clone()))).unwrap(),
+            20
+        );
+        assert_eq!(
+            visible_wkb_bytes(&WKB_LARGE_GEOMETRY, &array(Arc::new(large.clone()))).unwrap(),
+            20
+        );
+        assert_eq!(
+            visible_wkb_bytes(&WKB_VIEW_GEOMETRY, &array(Arc::new(view.clone()))).unwrap(),
+            20
+        );
+
+        // Slices keep only the visible rows: [None, 17 bytes]
+        assert_eq!(
+            visible_wkb_bytes(&WKB_GEOMETRY, &array(Arc::new(binary.slice(1, 2)))).unwrap(),
+            17
+        );
+        assert_eq!(
+            visible_wkb_bytes(&WKB_LARGE_GEOMETRY, &array(Arc::new(large.slice(1, 2)))).unwrap(),
+            17
+        );
+        assert_eq!(
+            visible_wkb_bytes(&WKB_VIEW_GEOMETRY, &array(Arc::new(view.slice(1, 2)))).unwrap(),
+            17
+        );
+
+        let scalar = |v: ScalarValue| ColumnarValue::Scalar(v);
+        assert_eq!(
+            visible_wkb_bytes(
+                &WKB_GEOMETRY,
+                &scalar(ScalarValue::Binary(Some(vec![1, 2, 3])))
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            visible_wkb_bytes(
+                &WKB_LARGE_GEOMETRY,
+                &scalar(ScalarValue::LargeBinary(Some(vec![1, 2, 3, 4])))
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            visible_wkb_bytes(
+                &WKB_VIEW_GEOMETRY,
+                &scalar(ScalarValue::BinaryView(Some(vec![1; 17])))
+            )
+            .unwrap(),
+            17
+        );
+        assert_eq!(
+            visible_wkb_bytes(&WKB_GEOMETRY, &scalar(ScalarValue::Binary(None))).unwrap(),
+            0
+        );
+    }
+
+    #[rstest]
     fn wkb_wkb_types(
         #[values(
             (WKB_GEOMETRY, WKB_GEOMETRY),
+            (WKB_GEOMETRY, WKB_LARGE_GEOMETRY),
             (WKB_GEOMETRY, WKB_VIEW_GEOMETRY),
+            (WKB_LARGE_GEOMETRY, WKB_GEOMETRY),
+            (WKB_LARGE_GEOMETRY, WKB_LARGE_GEOMETRY),
+            (WKB_LARGE_GEOMETRY, WKB_VIEW_GEOMETRY),
             (WKB_VIEW_GEOMETRY, WKB_GEOMETRY),
+            (WKB_VIEW_GEOMETRY, WKB_LARGE_GEOMETRY),
             (WKB_VIEW_GEOMETRY, WKB_VIEW_GEOMETRY))
         ]
         types: (SedonaType, SedonaType),
@@ -808,9 +987,10 @@ mod tests {
                 |_| unreachable!(),
             )
             .unwrap_err();
-        assert!(err
-            .message()
-            .contains("Expected 1000000 items but got Array with 3 items"));
+        assert!(
+            err.message()
+                .contains("Expected 1000000 items but got Array with 3 items")
+        );
 
         let factory0 = WkbGeometryFactory::default();
         let factory1 = WkbGeometryFactory::default();
@@ -833,10 +1013,12 @@ mod tests {
     #[test]
     fn wkb_scalar() {
         let factory = WkbGeometryFactory::default();
-        assert!(ScalarValue::Binary(None)
-            .scalar_from_factory(&factory)
-            .unwrap()
-            .is_none());
+        assert!(
+            ScalarValue::Binary(None)
+                .scalar_from_factory(&factory)
+                .unwrap()
+                .is_none()
+        );
 
         let mut wkt_out = String::new();
         let binary_scalar = ScalarValue::Binary(Some(POINT.to_vec()));

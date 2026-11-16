@@ -32,12 +32,16 @@
 //! look `RS_EnsureLoaded` up from the [`FunctionRegistry`] rather than
 //! capturing an `Arc` at construction time. Because optimizer rules run
 //! to a fixpoint, the rewrite is idempotent: an argument already wrapped
-//! in `RS_EnsureLoaded` is left alone (see [`already_loaded`]).
+//! in `RS_EnsureLoaded` is left alone (see [`already_loaded`]), including
+//! when the wrap has been hoisted into a projection below by DataFusion's
+//! `CommonSubexprEliminate` and only a column reference remains (see
+//! [`loaded_columns`]).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_common::{DFSchema, Result};
+use datafusion_common::{Column, DFSchema, Result};
 use datafusion_expr::expr::{Alias, ScalarFunction};
 use datafusion_expr::expr_schema::ExprSchemable;
 use datafusion_expr::{Expr, LogicalPlan, ScalarUDF};
@@ -45,8 +49,6 @@ use datafusion_optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use sedona_common::sedona_internal_err;
 use sedona_expr::scalar_udf::SedonaScalarUDF;
 use sedona_schema::datatypes::SedonaType;
-
-use crate::restore_metadata::RESTORE_METADATA_NAME;
 
 /// `SedonaScalarUDF` metadata key marking a UDF whose kernels read raster
 /// pixel bytes. Duplicated from `sedona_raster_functions` (the owner),
@@ -57,10 +59,8 @@ const NEEDS_PIXELS_METADATA_KEY: &str = "needs_pixels";
 /// `SedonaScalarUDF` metadata key marking a UDF whose returned raster is
 /// already fully materialised in-database. When a `needs_pixels` argument is
 /// itself such a call, the rule skips wrapping it: its result is already
-/// loaded, so an extra `RS_EnsureLoaded` would be redundant — and, being
-/// async, would nest inside the argument's own async wrap, which DataFusion
-/// cannot currently hoist (apache/datafusion#20031). Duplicated from
-/// `sedona_raster_functions` — keep in sync with
+/// loaded, so an extra `RS_EnsureLoaded` would be a redundant pass over the
+/// bytes. Duplicated from `sedona_raster_functions` — keep in sync with
 /// `sedona_raster_functions::rs_ensure_loaded::RETURNS_BYTES_METADATA_KEY`.
 const RETURNS_BYTES_METADATA_KEY: &str = "returns_bytes";
 
@@ -121,10 +121,17 @@ impl OptimizerRule for EnsureLoadedOptimizerRule {
             // "raster bytes not loaded" error, not a wrong result.
             return Ok(Transformed::no(plan));
         };
+        // Columns the inputs already deliver as loaded rasters, so a bare
+        // column reference to a hoisted `rs_ensureloaded(..)` isn't wrapped
+        // again (see `loaded_columns`).
+        let loaded: HashSet<Column> = inputs
+            .iter()
+            .flat_map(|input| loaded_columns(input))
+            .collect();
         drop(inputs);
 
         plan.map_expressions(|e| {
-            e.transform_up(|expr| rewrite_expr_node(expr, &schema, &ensure_loaded_udf))
+            e.transform_up(|expr| rewrite_expr_node(expr, &schema, &ensure_loaded_udf, &loaded))
         })
     }
 }
@@ -144,11 +151,13 @@ fn merged_input_schema(inputs: &[&LogicalPlan]) -> Option<Arc<DFSchema>> {
 /// raster-typed arg with `RS_EnsureLoaded`. Two guards keep it correct:
 /// it never wraps `RS_EnsureLoaded` itself (recursion), and it never
 /// re-wraps an arg already wrapped in `RS_EnsureLoaded` (idempotency,
-/// required because optimizer rules run to a fixpoint).
+/// required because optimizer rules run to a fixpoint). `loaded` names the
+/// input columns that already carry loaded bytes (see [`loaded_columns`]).
 fn rewrite_expr_node(
     expr: Expr,
     schema: &Arc<DFSchema>,
     ensure_loaded_udf: &Arc<ScalarUDF>,
+    loaded: &HashSet<Column>,
 ) -> Result<Transformed<Expr>> {
     let Expr::ScalarFunction(ref func_call) = expr else {
         return Ok(Transformed::no(expr));
@@ -192,9 +201,9 @@ fn rewrite_expr_node(
         .map(|arg| {
             // Don't wrap an argument that already yields loaded bytes —
             // whether it's an injected loader (idempotency across fixpoint
-            // passes) or a function that returns materialised bytes (avoids a
-            // redundant nested async wrap; apache/datafusion#20031).
-            if already_loaded(&arg) {
+            // passes) or a function that returns materialised bytes (a wrap
+            // would be a redundant pass over them).
+            if already_loaded(&arg, loaded) {
                 return arg;
             }
             if expr_is_raster(&arg, schema) {
@@ -227,8 +236,7 @@ fn rewrite_expr_node(
 /// is renamed from `rs_dimtoband(rast, …)` to `rs_dimtoband(rs_ensureloaded(rast), …)`.
 /// DataFusion's `optimize_projections` invariant check then fails the query.
 /// Aliasing the wrap back to the argument's original name keeps the enclosing
-/// name — and the output schema — stable. (`WrapAsyncUdfRule` uses the same
-/// trick to preserve its wrapper's name.)
+/// name — and the output schema — stable.
 fn wrap_for_loading(arg: Expr, ensure_loaded_udf: &Arc<ScalarUDF>) -> Expr {
     let original_name = arg.schema_name().to_string();
     let wrapped = Expr::ScalarFunction(ScalarFunction {
@@ -239,25 +247,29 @@ fn wrap_for_loading(arg: Expr, ensure_loaded_udf: &Arc<ScalarUDF>) -> Expr {
 }
 
 /// True if `expr` already yields loaded (in-database) raster bytes, so the
-/// rule must not wrap it in `RS_EnsureLoaded`. Looks through aliases and the
-/// `sd_restore_metadata(...)` wrapper that [`WrapAsyncUdfRule`] stamps onto
-/// async calls between optimizer passes. Two reasons an argument is already
-/// loaded, unified here:
+/// rule must not wrap it in `RS_EnsureLoaded`. Looks through aliases. Three
+/// reasons an argument is already loaded, unified here:
 ///
 /// - it is (or wraps) an injected `rs_ensureloaded` call — the idempotency
-///   guard that stops a fixpoint re-run from stacking loaders into a tower of
-///   unresolved async calls. `RS_EnsureLoaded` is matched by name because it
-///   is a plain async UDF, not a `SedonaScalarUDF` that could carry metadata.
+///   guard that stops a fixpoint re-run from stacking loaders, one more per
+///   pass. `RS_EnsureLoaded` is matched by name because it is a plain UDF,
+///   not a `SedonaScalarUDF` that could carry metadata.
 /// - it is a call to a function tagged [`RETURNS_BYTES_METADATA_KEY`] (e.g.
 ///   `RS_DimToBand`), whose output is already materialised. Wrapping it would
-///   inject a redundant async `rs_ensureloaded` that nests inside the
-///   argument's own async wrap and can't be hoisted (apache/datafusion#20031).
-fn already_loaded(expr: &Expr) -> bool {
+///   add a redundant pass over its bytes.
+/// - it is a reference to one of the `loaded` columns: a column the input
+///   plan computes from an expression of the two shapes above (see
+///   [`loaded_columns`]). The shape itself is out of reach once DataFusion
+///   hoists the loader into a projection below, so the column is all there
+///   is to go on.
+///
+/// A loader the rule does wrap again is not an error: `RS_EnsureLoaded`
+/// returns already loaded input as is. The guards keep the plan free of
+/// redundant calls.
+fn already_loaded(expr: &Expr, loaded: &HashSet<Column>) -> bool {
     match expr {
+        Expr::Column(column) => loaded.contains(column),
         Expr::ScalarFunction(sf) if sf.func.name() == "rs_ensureloaded" => true,
-        Expr::ScalarFunction(sf) if sf.func.name() == RESTORE_METADATA_NAME => {
-            sf.args.first().is_some_and(already_loaded)
-        }
         Expr::ScalarFunction(sf) => sf
             .func
             .inner()
@@ -268,8 +280,55 @@ fn already_loaded(expr: &Expr) -> bool {
                     .map(String::as_str)
                     == Some("true")
             }),
-        Expr::Alias(alias) => already_loaded(&alias.expr),
+        Expr::Alias(alias) => already_loaded(&alias.expr, loaded),
         _ => false,
+    }
+}
+
+/// The output columns of `plan` that already carry loaded raster bytes.
+///
+/// [`already_loaded`] recognises a loaded argument by its shape, and two
+/// DataFusion rules replace that shape with a plain column reference between
+/// optimizer passes:
+///
+/// - `CommonSubexprEliminate`: when several `needs_pixels` calls share a raster
+///   argument, the shared `rs_ensureloaded(rast)` is hoisted into a projection
+///   below and each call is left with a bare `__common_expr_N` column.
+/// - `OptimizeProjections`: a user-written `RS_EnsureLoaded(rast) AS rast` in a
+///   subquery is a projection whose output column the outer call references.
+///
+/// In both cases the column is raster-typed and, by shape, not loaded, so
+/// without this the next pass wraps it again. The extra loader is hoisted or
+/// merged the same way, and every pass stacks one more:
+/// `rs_ensureloaded(rs_ensureloaded(..))`, each a redundant pass over the
+/// loaded bytes.
+///
+/// So resolve columns through the plan that produces them: a projection's
+/// output column is loaded when the expression it assigns is loaded (with the
+/// projection's own column references resolved the same way). Nodes that pass
+/// their input's columns through unchanged (`SubqueryAlias`, `Filter`, `Sort`,
+/// `Limit`) forward the input's set, re-qualified for an alias. Anything else
+/// contributes nothing, which is the conservative answer (wrap).
+fn loaded_columns(plan: &LogicalPlan) -> HashSet<Column> {
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            let inner = loaded_columns(&projection.input);
+            projection
+                .expr
+                .iter()
+                .zip(projection.schema.iter())
+                .filter(|(expr, _)| already_loaded(expr, &inner))
+                .map(|(_, (qualifier, field))| Column::new(qualifier.cloned(), field.name()))
+                .collect()
+        }
+        LogicalPlan::SubqueryAlias(alias) => loaded_columns(&alias.input)
+            .into_iter()
+            .map(|column| Column::new(Some(alias.alias.clone()), column.name))
+            .collect(),
+        LogicalPlan::Filter(filter) => loaded_columns(&filter.input),
+        LogicalPlan::Sort(sort) => loaded_columns(&sort.input),
+        LogicalPlan::Limit(limit) => loaded_columns(&limit.input),
+        _ => HashSet::new(),
     }
 }
 
@@ -292,14 +351,16 @@ mod tests {
     use super::*;
 
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion_common::tree_node::TreeNodeRecursion;
-    use datafusion_expr::{col, ScalarUDF, Volatility};
+    use datafusion_expr::registry::FunctionRegistry;
+    use datafusion_expr::{EmptyRelation, LogicalPlanBuilder, ScalarUDF, Volatility, col};
     use sedona_expr::scalar_udf::{ScalarKernelRef, SedonaScalarUDF, SimpleSedonaScalarKernel};
     use sedona_schema::matchers::ArgMatcher;
 
     /// A stand-in `rs_ensureloaded` UDF. The rule keys off the name and
-    /// the `needs_bytes` marker, never the real async impl (which lives
-    /// in the `sedona` crate and can't be referenced here), so a plain
+    /// the `needs_bytes` marker, never the real impl (which lives in
+    /// `sedona-raster-functions` and can't be referenced here), so a plain
     /// SedonaScalarUDF carrying the canonical name is sufficient.
     fn fake_ensure_loaded_udf() -> Arc<ScalarUDF> {
         let kernel: ScalarKernelRef = SimpleSedonaScalarKernel::new_ref(
@@ -365,10 +426,10 @@ mod tests {
     fn count_ensure_loaded(expr: &Expr) -> usize {
         let mut n = 0;
         expr.apply(|e| {
-            if let Expr::ScalarFunction(sf) = e {
-                if sf.func.name() == "rs_ensureloaded" {
-                    n += 1;
-                }
+            if let Expr::ScalarFunction(sf) = e
+                && sf.func.name() == "rs_ensureloaded"
+            {
+                n += 1;
             }
             Ok(TreeNodeRecursion::Continue)
         })
@@ -377,7 +438,9 @@ mod tests {
     }
 
     fn rewrite(expr: Expr, schema: &Arc<DFSchema>, udf: &Arc<ScalarUDF>) -> Expr {
-        rewrite_expr_node(expr, schema, udf).unwrap().data
+        rewrite_expr_node(expr, schema, udf, &HashSet::new())
+            .unwrap()
+            .data
     }
 
     #[test]
@@ -392,15 +455,17 @@ mod tests {
         let Expr::ScalarFunction(ScalarFunction { args, .. }) = &out else {
             panic!("expected ScalarFunction, got {out:?}");
         };
-        assert!(already_loaded(&args[0]), "raster arg should be wrapped");
+        assert!(
+            already_loaded(&args[0], &HashSet::new()),
+            "raster arg should be wrapped"
+        );
     }
 
     #[test]
     fn does_not_wrap_arg_that_returns_loaded_bytes() {
         // Models RS_BandToDim(RS_DimToBand(rast)): the inner call already
-        // returns loaded bytes, so the outer needs_bytes call must NOT wrap it.
-        // Otherwise a redundant async rs_ensureloaded nests inside the inner
-        // call's own async wrap and DataFusion can't hoist it.
+        // returns loaded bytes, so the outer needs_bytes call must NOT wrap it
+        // in a redundant rs_ensureloaded.
         let schema = raster_schema_named("rast");
         let udf = fake_ensure_loaded_udf();
         let inner = Expr::ScalarFunction(ScalarFunction {
@@ -446,7 +511,7 @@ mod tests {
             panic!("expected ScalarFunction, got {out:?}");
         };
         assert!(
-            already_loaded(&args[0]),
+            already_loaded(&args[0], &HashSet::new()),
             "wrapped arg should still be detected"
         );
     }
@@ -522,42 +587,8 @@ mod tests {
     }
 
     #[test]
-    fn idempotent_through_restore_metadata_wrapper() {
-        // Models the cross-rule fixpoint: after the first pass wraps the arg,
-        // WrapAsyncUdfRule re-stamps it as `sd_restore_metadata(rs_ensureloaded(rast))`
-        // (aliased back to the original name). A later pass must recognise this
-        // as already-loaded and not inject another wrapper — otherwise the
-        // async calls tower up and only the innermost is ever extracted, so the
-        // rest are invoked synchronously and the query fails at runtime.
-        use crate::restore_metadata::restore_metadata_udf;
-        use std::collections::HashMap;
-
-        let schema = raster_schema_named("rast");
-        let udf = fake_ensure_loaded_udf();
-
-        let restore = restore_metadata_udf(HashMap::new());
-        let wrapped = Expr::ScalarFunction(ScalarFunction {
-            func: restore,
-            args: vec![wrap_for_loading(col("rast"), &udf)],
-        })
-        .alias("rs_ensureloaded(rast)");
-
-        let call = Expr::ScalarFunction(ScalarFunction {
-            func: needs_bytes_udf("rs_mock"),
-            args: vec![wrapped],
-        });
-        let out = rewrite(call, &schema, &udf);
-        assert_eq!(
-            count_ensure_loaded(&out),
-            1,
-            "arg already wrapped as sd_restore_metadata(rs_ensureloaded(..)) must not be re-wrapped: {out:?}"
-        );
-    }
-
-    #[test]
-    fn registers_before_cse_with_wrap_async_between() {
+    fn registers_before_cse() {
         use crate::optimizer::register_ensure_loaded_optimizer;
-        use datafusion::execution::session_state::SessionStateBuilder;
 
         let builder = SessionStateBuilder::new().with_default_features();
         let mut builder = register_ensure_loaded_optimizer(builder).unwrap();
@@ -567,25 +598,15 @@ mod tests {
             .iter()
             .position(|r| r.name() == "sedona.ensure_loaded")
             .expect("ensure_loaded rule registered");
-        let wrap_async = rules
-            .iter()
-            .position(|r| r.name() == "sedona.wrap_async_udf")
-            .expect("wrap_async_udf rule registered");
         let cse = rules
             .iter()
             .position(|r| r.name() == "common_sub_expression_eliminate")
             .expect("CSE present in default optimizer");
 
-        // Order: ensure_loaded -> wrap_async_udf -> CSE
         assert_eq!(
             ensure_loaded + 1,
-            wrap_async,
-            "wrap_async_udf must follow ensure_loaded"
-        );
-        assert_eq!(
-            wrap_async + 1,
             cse,
-            "CSE must follow wrap_async_udf so metadata wrappers dedupe in the same pass"
+            "CSE must follow ensure_loaded so the injected loaders dedupe in the same pass"
         );
     }
 
@@ -629,10 +650,6 @@ mod tests {
         // to recognise and wrap the raster arg. A regression guard against
         // switching to `plan.schema()`, which would silently skip wrapping
         // here (the common single-projection case).
-        use datafusion::execution::session_state::SessionStateBuilder;
-        use datafusion_expr::registry::FunctionRegistry;
-        use datafusion_expr::{EmptyRelation, LogicalPlanBuilder};
-
         // SessionState doubles as the OptimizerConfig and carries the
         // function registry the rule resolves `rs_ensureloaded` from.
         let mut state = SessionStateBuilder::new().with_default_features().build();
@@ -666,7 +683,7 @@ mod tests {
             panic!("expected the projected expr to be a ScalarFunction");
         };
         assert!(
-            already_loaded(&args[0]),
+            already_loaded(&args[0], &HashSet::new()),
             "wrapped arg should be rs_ensureloaded: {:?}",
             args[0]
         );
@@ -687,7 +704,7 @@ mod tests {
 
         // First pass via transform_up (matching the optimizer's pattern).
         let first_pass = call
-            .transform_up(|e| rewrite_expr_node(e, &schema, &udf))
+            .transform_up(|e| rewrite_expr_node(e, &schema, &udf, &HashSet::new()))
             .unwrap();
         assert!(first_pass.transformed, "first pass should wrap");
         assert_eq!(
@@ -699,12 +716,204 @@ mod tests {
         // Second pass: should be a no-op.
         let second_pass = first_pass
             .data
-            .transform_up(|e| rewrite_expr_node(e, &schema, &udf))
+            .transform_up(|e| rewrite_expr_node(e, &schema, &udf, &HashSet::new()))
             .unwrap();
         assert_eq!(
             count_ensure_loaded(&second_pass.data),
             1,
             "second pass should not add more wrappers"
+        );
+    }
+
+    /// `(total rs_ensureloaded calls in the plan, how many of them have another
+    /// rs_ensureloaded somewhere in their arguments)`.
+    fn loader_stats(plan: &LogicalPlan) -> (usize, usize) {
+        let (mut total, mut nested) = (0, 0);
+        plan.apply(|node| {
+            node.apply_expressions(|expr| {
+                expr.apply(|e| {
+                    if let Expr::ScalarFunction(sf) = e
+                        && sf.func.name() == "rs_ensureloaded"
+                    {
+                        total += 1;
+                        if sf.args.iter().any(|arg| count_ensure_loaded(arg) > 0) {
+                            nested += 1;
+                        }
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+            })
+        })
+        .unwrap();
+        (total, nested)
+    }
+
+    fn state_with_fake_ensure_loaded() -> datafusion::execution::session_state::SessionState {
+        let mut state = SessionStateBuilder::new().with_default_features().build();
+        state.register_udf(fake_ensure_loaded_udf()).unwrap();
+        state
+    }
+
+    fn raster_scan(name: &str) -> LogicalPlan {
+        LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema: raster_schema_named(name),
+        })
+    }
+
+    #[test]
+    fn does_not_rewrap_column_hoisted_by_cse() {
+        // Models the optimizer's second pass over
+        //   SELECT rs_mock_a(rast), rs_mock_b(rast) FROM t
+        // after the first pass wrapped both raster args and DataFusion's
+        // CommonSubexprEliminate hoisted the shared loader into a projection
+        // below, leaving each call a bare `__common_expr_1` column:
+        //   Projection: rs_mock_a(__common_expr_1 AS rast), rs_mock_b(__common_expr_1 AS rast)
+        //     Projection: rs_ensureloaded(rast) AS __common_expr_1
+        // The column is raster-typed; only its producer says it is loaded.
+        let state = state_with_fake_ensure_loaded();
+        let udf = fake_ensure_loaded_udf();
+
+        let hoisted = wrap_for_loading(col("rast"), &udf).alias("__common_expr_1");
+        let consumer = |name: &str| {
+            Expr::ScalarFunction(ScalarFunction {
+                func: needs_bytes_udf(name),
+                args: vec![col("__common_expr_1").alias("rast")],
+            })
+        };
+        let plan = LogicalPlanBuilder::from(raster_scan("rast"))
+            .project(vec![hoisted])
+            .unwrap()
+            .project(vec![consumer("rs_mock_a"), consumer("rs_mock_b")])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let out = EnsureLoadedOptimizerRule.rewrite(plan, &state).unwrap();
+        assert!(
+            !out.transformed,
+            "a column CSE hoisted the loader into must count as loaded, got: {}",
+            out.data.display_indent()
+        );
+        assert_eq!(loader_stats(&out.data), (1, 0));
+    }
+
+    #[test]
+    fn does_not_rewrap_column_from_user_ensure_loaded_projection() {
+        // A user-written loader in a subquery, the outer call referencing its
+        // output column through the subquery alias:
+        //   SELECT rs_mock(sub.rast) FROM (SELECT rs_ensureloaded(rast) AS rast FROM t) sub
+        // Wrapping `sub.rast` again would nest the loaders once
+        // OptimizeProjections merges the single-use projection into its parent.
+        let state = state_with_fake_ensure_loaded();
+        let udf = fake_ensure_loaded_udf();
+
+        let user_loaded = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::clone(&udf),
+            args: vec![col("rast")],
+        })
+        .alias("rast");
+        let plan = LogicalPlanBuilder::from(raster_scan("rast"))
+            .project(vec![user_loaded])
+            .unwrap()
+            .alias("sub")
+            .unwrap()
+            .project(vec![Expr::ScalarFunction(ScalarFunction {
+                func: needs_bytes_udf("rs_mock"),
+                args: vec![col("sub.rast")],
+            })])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let out = EnsureLoadedOptimizerRule.rewrite(plan, &state).unwrap();
+        assert!(
+            !out.transformed,
+            "a column produced by rs_ensureloaded must count as loaded, got: {}",
+            out.data.display_indent()
+        );
+        assert_eq!(loader_stats(&out.data), (1, 0));
+    }
+
+    #[test]
+    fn loaded_columns_flow_through_schema_preserving_nodes() {
+        let udf = fake_ensure_loaded_udf();
+        let loaded = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::clone(&udf),
+            args: vec![col("rast")],
+        })
+        .alias("loaded");
+        let plan = LogicalPlanBuilder::from(raster_scan("rast"))
+            .project(vec![loaded, col("rast")])
+            .unwrap()
+            .filter(col("rast").is_not_null())
+            .unwrap()
+            .sort(vec![col("rast").sort(true, true)])
+            .unwrap()
+            .limit(0, Some(10))
+            .unwrap()
+            .alias("sub")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let columns = loaded_columns(&plan);
+        assert!(
+            columns.contains(&Column::new(Some("sub"), "loaded")),
+            "{columns:?}"
+        );
+        assert!(
+            !columns.contains(&Column::new(Some("sub"), "rast")),
+            "{columns:?}"
+        );
+        assert_eq!(columns.len(), 1);
+    }
+
+    /// The reported shape, through the whole optimizer to its fixpoint: two
+    /// `needs_pixels` calls sharing a raster column over a scan. Each pass used
+    /// to add a loader around the column CSE had hoisted the previous one
+    /// into, ending with `rs_ensureloaded(rs_ensureloaded(..))`: a redundant
+    /// load per pass.
+    #[tokio::test]
+    async fn optimizer_fixpoint_keeps_one_loader_for_calls_sharing_a_raster() {
+        use crate::optimizer::register_ensure_loaded_optimizer;
+        use datafusion::catalog::MemTable;
+        use datafusion::physical_plan::displayable;
+        use datafusion::prelude::SessionContext;
+
+        let builder =
+            register_ensure_loaded_optimizer(SessionStateBuilder::new().with_default_features())
+                .unwrap();
+        let ctx = SessionContext::new_with_state(builder.build());
+        ctx.register_udf(ScalarUDF::clone(&fake_ensure_loaded_udf()));
+        ctx.register_udf(ScalarUDF::clone(&needs_bytes_udf("rs_mock_a")));
+        ctx.register_udf(ScalarUDF::clone(&needs_bytes_udf("rs_mock_b")));
+        let schema = Arc::new(Schema::new(vec![
+            SedonaType::Raster.to_storage_field("rast", true).unwrap(),
+        ]));
+        let table = MemTable::try_new(schema, vec![vec![]]).unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+
+        let df = ctx
+            .sql("SELECT rs_mock_a(rast) AS a, rs_mock_b(rast) AS b FROM t")
+            .await
+            .unwrap();
+
+        let optimized = df.clone().into_optimized_plan().unwrap();
+        assert_eq!(
+            loader_stats(&optimized),
+            (1, 0),
+            "expected one shared, un-nested loader, got: {}",
+            optimized.display_indent()
+        );
+
+        // The physical plan evaluates that one loader once per batch.
+        let physical = df.create_physical_plan().await.unwrap();
+        let physical_str = displayable(physical.as_ref()).indent(true).to_string();
+        assert_eq!(
+            physical_str.matches("rs_ensureloaded").count(),
+            1,
+            "{physical_str}"
         );
     }
 }

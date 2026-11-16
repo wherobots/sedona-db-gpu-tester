@@ -82,13 +82,13 @@ fn invoke_scalar(item: &Wkb) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{create_array as arrow_array, ArrayRef};
+    use arrow_array::{ArrayRef, create_array as arrow_array};
     use datafusion_common::ScalarValue;
     use datafusion_expr::ScalarUDF;
     use rstest::rstest;
     use sedona_schema::datatypes::{
         WKB_GEOGRAPHY, WKB_GEOGRAPHY_ITEM_CRS, WKB_GEOMETRY, WKB_GEOMETRY_ITEM_CRS,
-        WKB_VIEW_GEOGRAPHY, WKB_VIEW_GEOMETRY,
+        WKB_LARGE_GEOGRAPHY, WKB_LARGE_GEOMETRY, WKB_VIEW_GEOGRAPHY, WKB_VIEW_GEOMETRY,
     };
     use sedona_testing::{compare::assert_array_equal, testers::ScalarUdfTester};
 
@@ -102,7 +102,7 @@ mod tests {
 
     #[rstest]
     fn udf(
-        #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY, WKB_GEOGRAPHY, WKB_VIEW_GEOGRAPHY, WKB_GEOMETRY_ITEM_CRS.clone(), WKB_GEOGRAPHY_ITEM_CRS.clone())]
+        #[values(WKB_GEOMETRY, WKB_LARGE_GEOMETRY, WKB_VIEW_GEOMETRY, WKB_GEOGRAPHY, WKB_LARGE_GEOGRAPHY, WKB_VIEW_GEOGRAPHY, WKB_GEOMETRY_ITEM_CRS.clone(), WKB_GEOGRAPHY_ITEM_CRS.clone())]
         sedona_type: SedonaType,
     ) {
         let tester = ScalarUdfTester::new(st_isempty_udf().into(), vec![sedona_type.clone()]);

@@ -19,7 +19,11 @@
 //!
 //! [`ZarrChunkReader`] walks the group's chunk grid lazily and emits one
 //! raster row per chunk position, with one band per array in the group.
-//! Each row carries an `outdb_uri` chunk anchor
+//! For an array stored with the `sharding_indexed` codec the grid is the
+//! inner-chunk grid, not the shard grid: a shard is only a container of
+//! inner chunks, and reading it whole would make the row size follow the
+//! shard size rather than the chunk shape the writer chose. Each row
+//! carries an `outdb_uri` chunk anchor
 //! (`zarr://<store-uri>/<array-path>#chunk=i0,i1,...`); the `data`
 //! column stays empty until the async resolver lands and dereferences
 //! the anchor to bytes on demand.
@@ -34,16 +38,16 @@ use sedona_raster::geo_transform::geotransform_from_bbox_and_spatial_shape;
 use sedona_raster::traits::is_spatial_dim_pair;
 use sedona_schema::datatypes::SedonaType;
 use sedona_schema::raster::BandDataType;
-use zarrs::array::Array;
 #[cfg(test)]
 use zarrs::array::ArrayBytes;
+use zarrs::array::{Array, ArrayShardedExt};
 use zarrs::group::Group;
 use zarrs::node::NodeMetadata;
 use zarrs::storage::{AsyncReadableListableStorage, AsyncReadableListableStorageTraits};
 
 use crate::coords;
 use crate::dtype::zarr_to_band_data_type;
-use crate::geozarr::{crs_from_cf_attributes, geotransform_from_cf_attributes, GroupGeoMetadata};
+use crate::geozarr::{GroupGeoMetadata, crs_from_cf_attributes, geotransform_from_cf_attributes};
 use crate::source_uri::build_chunk_anchor;
 
 /// Streaming reader over the chunk grid of a Zarr group.
@@ -98,7 +102,8 @@ impl ZarrChunkReader {
     /// `arrays`:
     /// - `None` — read every multi-dimensional array. 1-D arrays
     ///   (typical xarray coord variables) are auto-skipped.
-    /// - `Some(names)` — read exactly the named arrays. Unknown names
+    /// - `Some(names)` — read exactly the named arrays, as bands in that
+    ///   order (band `i` of every row is `names[i]`). Unknown names
     ///   error. 1-D arrays are always rejected (a raster band needs
     ///   ≥ 2 dimensions); naming one explicitly errors with a clear
     ///   message.
@@ -245,12 +250,15 @@ struct ArrayInfo {
     /// Dimension names in array order. Required to be `Some(_)` for every
     /// dim; missing names error at validation time.
     dim_names: Vec<String>,
-    /// Inner chunk grid shape, one entry per dimension. Used to enumerate
-    /// chunk positions and validated to match across arrays.
+    /// Chunk grid shape, one entry per dimension. Used to enumerate
+    /// chunk positions and validated to match across arrays. For a
+    /// sharded array this is the inner-chunk grid (zarrs' "subchunk
+    /// grid"), so a store with one shard per array still yields one row
+    /// per inner chunk.
     chunk_grid_shape: Vec<u64>,
-    /// Chunk shape (elements per chunk per dim). Same for every chunk
-    /// position — ragged final chunks are not emitted as separate short
-    /// rows.
+    /// Chunk shape (elements per chunk per dim); the inner-chunk shape
+    /// for a sharded array. Same for every chunk position — ragged
+    /// final chunks are not emitted as separate short rows.
     chunk_shape: Vec<u64>,
     /// Full array shape (extent per dim). Used to validate that a spatial
     /// coordinate array's length matches the data extent before deriving a
@@ -322,7 +330,13 @@ async fn open_and_validate(
                     "Zarr group at {group_uri} has no child arrays"
                 )));
             }
-            let kept: Vec<_> = arrays.into_iter().filter(|a| a.shape().len() > 1).collect();
+            // Sort by path so band order is deterministic: zarrs's store
+            // listing order is implementation-defined (filesystem stores
+            // happen to enumerate alphabetically, but that is not a
+            // contract). With an explicit `arrays` list the caller's order
+            // is the band order, so only this arm sorts.
+            let mut kept: Vec<_> = arrays.into_iter().filter(|a| a.shape().len() > 1).collect();
+            kept.sort_by(|a, b| a.path().as_str().cmp(b.path().as_str()));
             if kept.is_empty() {
                 return Err(ArrowError::InvalidArgumentError(format!(
                     "Zarr group at {group_uri} contains only 1-D arrays (typical \
@@ -461,13 +475,13 @@ fn transform_from_bbox(
             // Mirror the coordinate-array path: when the group declares no CRS,
             // infer a geographic one from the spatial dim names (lat/lon).
             // Generic y/x stay CRS-less (attach via RS_SetCRS).
-            if geo.crs.is_none() {
-                if let Some(inferred) = coords::infer_geographic_crs(
+            if geo.crs.is_none()
+                && let Some(inferred) = coords::infer_geographic_crs(
                     &array_infos[0].dim_names[y_axis],
                     &array_infos[0].dim_names[x_axis],
-                ) {
-                    geo.crs = Some(inferred.to_string());
-                }
+                )
+            {
+                geo.crs = Some(inferred.to_string());
             }
             log::debug!(
                 "Zarr group at {group_uri} has no `spatial:transform`; derived a \
@@ -736,32 +750,37 @@ async fn enumerate_child_arrays(
     Ok(arrays)
 }
 
-/// Collect per-array metadata from open zarrs `Array` handles.
-///
-/// Sorts arrays by path so band ordering across rows is deterministic
-/// (zarrs's underlying store listing order is implementation-defined —
-/// filesystem stores currently happen to enumerate alphabetically, but
-/// that's not part of the contract we want consumers to rely on).
+/// Collect per-array metadata from open zarrs `Array` handles, in the
+/// order given: that order becomes the band order of every row.
 fn collect_array_infos(
-    mut arrays: Vec<Array<dyn AsyncReadableListableStorageTraits>>,
+    arrays: Vec<Array<dyn AsyncReadableListableStorageTraits>>,
 ) -> Result<Vec<ArrayInfo>, ArrowError> {
-    arrays.sort_by(|a, b| a.path().as_str().cmp(b.path().as_str()));
     let mut out = Vec::with_capacity(arrays.len());
     for array in arrays {
         let path = array.path().to_string();
         let data_type = zarr_to_band_data_type(array.data_type())?;
         let dim_names = resolve_dim_names(&array, &path)?;
-        let chunk_grid_shape = array.chunk_grid_shape().to_vec();
-        let chunk_shape = array
-            .chunk_shape(&vec![0u64; chunk_grid_shape.len()])
-            .map_err(|e| {
-                ArrowError::ExternalError(Box::new(sedona_internal_datafusion_err!(
-                    "array {path}: failed to query chunk shape: {e}"
-                )))
-            })?
-            .iter()
-            .map(|n| n.get())
-            .collect();
+        // For a sharded array zarrs' chunk grid is the shard grid and its
+        // subchunk grid is the inner-chunk grid; for any other array the
+        // two are the same grid. Rows follow the inner chunks, so a shard
+        // is never decoded whole. The effective subchunk shape accounts
+        // for array-to-array codecs ahead of the sharding codec; when
+        // zarrs cannot determine it, its subchunk grid is the shard grid
+        // and the shard shape is the matching row shape.
+        let chunk_grid_shape = array.subchunk_grid_shape();
+        let chunk_shape = match array.effective_subchunk_shape() {
+            Some(shape) => shape.iter().map(|n| n.get()).collect(),
+            None => array
+                .chunk_shape(&vec![0u64; chunk_grid_shape.len()])
+                .map_err(|e| {
+                    ArrowError::ExternalError(Box::new(sedona_internal_datafusion_err!(
+                        "array {path}: failed to query chunk shape: {e}"
+                    )))
+                })?
+                .iter()
+                .map(|n| n.get())
+                .collect(),
+        };
         let shape = array.shape().to_vec();
         let fill_bytes = array.fill_value().as_ne_bytes();
         let nodata = if fill_bytes.is_empty() {
@@ -988,7 +1007,8 @@ fn advance_chunk_indices(chunk_indices: &mut [u64], chunk_grid_shape: &[u64]) ->
 /// The sync chunk-decode path, exercised by the unit test below against a
 /// filesystem fixture. The production byte loader (`raster_loader::ZarrLoader`)
 /// reads over async object_store storage and so retrieves chunks directly
-/// via `Array::async_retrieve_chunk` rather than through this helper.
+/// via `AsyncArrayShardedReadableExt::async_retrieve_subchunk_opt` rather
+/// than through this helper.
 #[cfg(test)]
 fn retrieve_chunk_bytes<S>(array: &Array<S>, chunk_indices: &[u64]) -> Result<Vec<u8>, ArrowError>
 where
@@ -1017,9 +1037,11 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use zarrs::array::data_type;
     use zarrs::array::ArrayBuilder;
+    use zarrs::array::data_type;
     use zarrs_filesystem::FilesystemStore;
+
+    use crate::{object_store_for_uri, open_storage_from_uri};
 
     /// Direct coverage for `retrieve_chunk_bytes`. The function is the
     /// only pixel-byte read primitive in the crate today; previously it
@@ -1045,6 +1067,103 @@ mod tests {
 
         let chunk_1 = retrieve_chunk_bytes(&arr, &[0, 1]).unwrap();
         assert_eq!(chunk_1, vec![20u8, 21u8]);
+    }
+
+    /// Reader-level check of the array-to-band mapping: an explicit
+    /// `arrays` list is the band order, discovery sorts by path.
+    async fn band_paths(uri: &str, names: Option<&[String]>) -> Vec<String> {
+        let storage = open_storage_from_uri(uri, object_store_for_uri(uri).unwrap()).unwrap();
+        let reader = ZarrChunkReader::try_new(storage, uri, names, 8)
+            .await
+            .unwrap();
+        reader
+            .array_infos
+            .iter()
+            .map(|info| info.path.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn arrays_option_order_is_band_order() {
+        use zarrs::group::GroupBuilder;
+
+        let tmp = TempDir::new().unwrap();
+        let store_path = tmp.path().join("g.zarr");
+        let store = Arc::new(FilesystemStore::new(&store_path).unwrap());
+        GroupBuilder::new()
+            .build(store.clone(), "/")
+            .unwrap()
+            .store_metadata()
+            .unwrap();
+        for name in ["b2", "a0", "a1"] {
+            let arr =
+                ArrayBuilder::new(vec![2u64, 2u64], vec![2u64, 2u64], data_type::uint8(), 0u8)
+                    .dimension_names(Some(["y", "x"]))
+                    .build(store.clone(), &format!("/{name}"))
+                    .unwrap();
+            arr.store_metadata().unwrap();
+        }
+        let uri = format!("file://{}", store_path.display());
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            band_paths(&uri, Some(&names(&["a1", "a0"]))).await,
+            ["/a1", "/a0"]
+        );
+        assert_eq!(
+            band_paths(&uri, Some(&names(&["b2", "a0", "a1"]))).await,
+            ["/b2", "/a0", "/a1"]
+        );
+        assert_eq!(
+            band_paths(&uri, Some(&names(&["b2", "a1"]))).await,
+            ["/b2", "/a1"]
+        );
+        // Discovery: deterministic, sorted by path regardless of store order.
+        assert_eq!(band_paths(&uri, None).await, ["/a0", "/a1", "/b2"]);
+    }
+
+    /// A sharded array reads as one row per inner chunk, not per shard.
+    /// One 4×4 shard holding 2×2 inner chunks must give a 2×2 grid of
+    /// 2×2 rows, the same as the unsharded array with 2×2 chunks.
+    #[tokio::test]
+    async fn sharded_array_rows_follow_inner_chunks() {
+        use zarrs::group::GroupBuilder;
+
+        let tmp = TempDir::new().unwrap();
+        let store_path = tmp.path().join("g.zarr");
+        let store = Arc::new(FilesystemStore::new(&store_path).unwrap());
+        GroupBuilder::new()
+            .build(store.clone(), "/")
+            .unwrap()
+            .store_metadata()
+            .unwrap();
+        // Shard shape [4, 4] (zarrs' "chunk" of a sharded array), inner
+        // chunk shape [2, 2].
+        ArrayBuilder::new(vec![4u64, 4u64], vec![4u64, 4u64], data_type::uint8(), 0u8)
+            .dimension_names(Some(["y", "x"]))
+            .subchunk_shape(vec![2u64, 2u64])
+            .build(store.clone(), "/sharded")
+            .unwrap()
+            .store_metadata()
+            .unwrap();
+        ArrayBuilder::new(vec![4u64, 4u64], vec![2u64, 2u64], data_type::uint8(), 0u8)
+            .dimension_names(Some(["y", "x"]))
+            .build(store.clone(), "/plain")
+            .unwrap()
+            .store_metadata()
+            .unwrap();
+        let uri = format!("file://{}", store_path.display());
+
+        for name in ["sharded", "plain"] {
+            let storage = open_storage_from_uri(&uri, object_store_for_uri(&uri).unwrap()).unwrap();
+            let reader = ZarrChunkReader::try_new(storage, &uri, Some(&[name.to_string()]), 8)
+                .await
+                .unwrap();
+            assert_eq!(reader.array_infos[0].chunk_grid_shape, [2, 2], "{name}");
+            assert_eq!(reader.array_infos[0].chunk_shape, [2, 2], "{name}");
+            let rows: usize = reader.map(|batch| batch.unwrap().num_rows()).sum();
+            assert_eq!(rows, 4, "{name}");
+        }
     }
 
     #[test]
@@ -1098,7 +1217,7 @@ mod tests {
         // y_axis=0, x_axis=1 → x_off=2*2=4, y_off=1*2=2
         assert_eq!(t[0], 10.0 + 4.0); // origin_x
         assert_eq!(t[3], 20.0 - 2.0); // origin_y after y_off=2 with sy=-1
-                                      // Scale/skew carry through unchanged.
+        // Scale/skew carry through unchanged.
         assert_eq!(t[1], 1.0);
         assert_eq!(t[2], 0.0);
         assert_eq!(t[4], 0.0);

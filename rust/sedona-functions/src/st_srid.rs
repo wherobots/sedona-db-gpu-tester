@@ -17,13 +17,13 @@
 
 use crate::executor::WkbExecutor;
 use arrow_array::{
-    builder::{StringViewBuilder, UInt32Builder},
     Array,
+    builder::{StringViewBuilder, UInt32Builder},
 };
 use arrow_schema::DataType;
 use datafusion_common::{
+    Result, ScalarValue,
     cast::{as_string_view_array, as_struct_array},
-    DataFusionError, Result, ScalarValue,
 };
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_common::sedona_internal_err;
@@ -75,13 +75,14 @@ impl SedonaScalarKernel for StSrid {
     ) -> Result<ColumnarValue> {
         let executor = WkbExecutor::new(arg_types, args);
         let mut builder = UInt32Builder::with_capacity(executor.num_iterations());
+        // A CRS with an authority code yields its integer SRID. A valid CRS with
+        // no authority code (e.g. a custom WKT) has no integer to give, so it
+        // yields 0, the same value as a missing CRS: SRID is the lossy integer
+        // view of a CRS, and ST_Crs carries the full definition.
         let srid_opt = match &arg_types[0] {
-            SedonaType::Wkb(_, Some(crs)) | SedonaType::WkbView(_, Some(crs)) => {
-                match crs.srid()? {
-                    Some(srid) => Some(srid),
-                    None => return Err(DataFusionError::Execution("CRS has no SRID".to_string())),
-                }
-            }
+            SedonaType::Wkb(_, Some(crs))
+            | SedonaType::WkbLarge(_, Some(crs))
+            | SedonaType::WkbView(_, Some(crs)) => Some(crs.srid()?.unwrap_or(0)),
             _ => Some(0),
         };
 
@@ -178,7 +179,9 @@ impl SedonaScalarKernel for StCrs {
         let executor = WkbExecutor::new(arg_types, args);
         let mut builder = StringViewBuilder::with_capacity(executor.num_iterations());
         let crs_opt: Option<String> = match &arg_types[0] {
-            SedonaType::Wkb(_, Some(crs)) | SedonaType::WkbView(_, Some(crs)) => {
+            SedonaType::Wkb(_, Some(crs))
+            | SedonaType::WkbLarge(_, Some(crs))
+            | SedonaType::WkbView(_, Some(crs)) => {
                 // Return the full round-trippable definition rather than
                 // collapsing to the authority code: an `authority:code` CRS
                 // stays compact, while a PROJJSON/WKT definition is preserved
@@ -272,7 +275,7 @@ impl SedonaScalarKernel for StCrsItemCrs {
 #[cfg(test)]
 mod test {
     use super::*;
-    use arrow_array::{create_array, ArrayRef};
+    use arrow_array::{ArrayRef, create_array};
     use arrow_schema::Field;
     use datafusion_common::ScalarValue;
     use datafusion_expr::ScalarUDF;
@@ -373,13 +376,20 @@ mod test {
             &expected.as_ref()
         );
 
-        // Call with a CRS with no SRID (should error)
-        let crs = deserialize_crs("{}").unwrap();
+        // Call with a valid CRS that carries no authority code (a custom LCC
+        // WKT with no top-level AUTHORITY): the CRS is usable but has no
+        // integer SRID, so ST_SRID returns 0, like a missing CRS, rather than
+        // erroring.
+        let wkt_no_authority = r#"PROJCS["Custom LCC",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]]],PROJECTION["Lambert_Conformal_Conic_2SP"],PARAMETER["standard_parallel_1",33],PARAMETER["standard_parallel_2",45],UNIT["metre",1]]"#;
+        let crs = deserialize_crs(wkt_no_authority).unwrap();
+        assert!(
+            crs.is_some(),
+            "custom WKT should deserialize to a valid CRS"
+        );
         let sedona_type = SedonaType::Wkb(Edges::Planar, crs.clone());
         let tester = ScalarUdfTester::new(udf.clone(), vec![sedona_type]);
-        let result = tester.invoke_scalar("POINT (0 1)");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("CRS has no SRID"));
+        let result = tester.invoke_scalar("POINT (0 1)").unwrap();
+        tester.assert_scalar_result_equals(result, 0);
     }
 
     #[test]
@@ -406,25 +416,33 @@ mod test {
             .unwrap();
         tester.assert_scalar_result_equals(result, 3857);
 
+        // A valid CRS with no top-level authority code (a custom LCC WKT) has no
+        // integer SRID, so its row is 0, the same value as the no-CRS row that
+        // follows it.
+        const WKT_NO_AUTHORITY: &str = r#"PROJCS["Custom LCC",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]]],PROJECTION["Lambert_Conformal_Conic_2SP"],PARAMETER["standard_parallel_1",33],PARAMETER["standard_parallel_2",45],UNIT["metre",1]]"#;
         let item_crs_array = create_array_item_crs(
             &[
                 Some("POINT (0 1)"),
                 Some("POINT (2 3)"),
                 Some("POINT (4 5)"),
                 Some("POINT (6 7)"),
+                Some("POINT (8 9)"),
                 None,
             ],
             [
                 Some("OGC:CRS84"),
                 Some("EPSG:3857"),
                 Some("EPSG:3857"),
+                Some(WKT_NO_AUTHORITY),
                 None,
                 None,
             ],
             &WKB_GEOMETRY,
         );
-        let expected_srid =
-            create_array!(UInt32, [Some(4326), Some(3857), Some(3857), Some(0), None]) as ArrayRef;
+        let expected_srid = create_array!(
+            UInt32,
+            [Some(4326), Some(3857), Some(3857), Some(0), Some(0), None]
+        ) as ArrayRef;
 
         let result = tester.invoke_array(item_crs_array).unwrap();
         assert_eq!(&result, &expected_srid);

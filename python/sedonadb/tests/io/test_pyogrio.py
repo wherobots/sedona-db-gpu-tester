@@ -36,6 +36,33 @@ import sedonadb
 import shapely
 from sedonadb.datasource import PyogrioFormatSpec
 
+CHILD_PROCESS_TIMEOUT_SECONDS = 15
+
+
+def test_read_ogr_subset_with_renamed_geometry(con, tmp_path):
+    # Column pruning narrows the scan first; a rename of the geometry column
+    # is then pushed down on top, whose column indices refer to the narrowed
+    # output rather than to the file (apache/sedona-db#1405).
+    gdf = geopandas.GeoDataFrame(
+        {"name": ["a", "b"], "v": [1.0, 2.0]},
+        geometry=geopandas.points_from_xy([0, 1], [0, 1]),
+        crs="EPSG:3857",
+    )
+    path = tmp_path / "things.gpkg"
+    gdf.to_file(path, layer="things")
+    df = con.read_pyogrio(path, options={"layer": "things"})
+    df.to_view("things", overwrite=True)
+
+    result = con.sql("SELECT v, geom AS geometry FROM things ORDER BY v").to_pandas()
+    assert list(result.columns) == ["v", "geometry"]
+    assert result["v"].tolist() == [1.0, 2.0]
+    assert [g.wkt for g in result["geometry"]] == ["POINT (0 0)", "POINT (1 1)"]
+
+    renamed = df.rename(geometry="geom")
+    subset = renamed.select(renamed["v"], renamed["geometry"]).to_pandas()
+    assert list(subset.columns) == ["v", "geometry"]
+    assert len(subset) == 2
+
 
 def test_read_ogr_projection(con):
     n = 1024
@@ -301,6 +328,27 @@ def test_write_ogr_from_view_types(con):
         assert tab_roundtrip.sort_by("string_col") == tab_simple
 
 
+@pytest.mark.parametrize("ext", ["gpkg", "fgb"])
+def test_write_ogr_from_ewkb(con, ext):
+    # GDAL silently writes NULL geometries when given EWKB with an embedded
+    # SRID, so check that these are written as ISO WKB.
+    # https://github.com/apache/sedona-db/issues/1523
+    ewkb_point_srid = bytes.fromhex(
+        "0101000020ad1000000000000000000000000000000000f03f"
+    )
+    con.create_data_frame(pa.table({"wkb": [ewkb_point_srid]})).to_view(
+        "pyogrio_ewkb", overwrite=True
+    )
+    df = con.sql(
+        "SELECT ST_SetCrs(ST_GeomFromWKB(wkb), 'EPSG:4269') AS geometry FROM pyogrio_ewkb"
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        df.to_pyogrio(f"{td}/foofy.{ext}")
+        roundtrip = geopandas.read_file(f"{td}/foofy.{ext}")
+        assert roundtrip.geometry.to_wkt().tolist() == ["POINT (0 1)"]
+
+
 def test_read_ogr_partitioned(con):
     n = 100
     series = geopandas.GeoSeries.from_xy(
@@ -547,10 +595,10 @@ def _exit_child_process(result_sender):
 
 def _terminate_child(process):
     process.terminate()
-    process.join(5)
+    process.join(CHILD_PROCESS_TIMEOUT_SECONDS)
     if process.is_alive():
         process.kill()
-        process.join(5)
+        process.join(CHILD_PROCESS_TIMEOUT_SECONDS)
 
 
 def _run_child_process(target, *args, timeout):
@@ -601,12 +649,12 @@ def test_independent_scans_child_timeout_is_bounded():
     started = time.monotonic()
     with pytest.raises(TimeoutError, match="exceeded 0.2 seconds"):
         _run_child_process(_block_child_process, timeout=0.2)
-    assert time.monotonic() - started < 5
+    assert time.monotonic() - started < CHILD_PROCESS_TIMEOUT_SECONDS
 
 
 def test_child_process_nonzero_exit_is_reported():
     with pytest.raises(AssertionError, match="child process exited with 17: None"):
-        _run_child_process(_exit_child_process, timeout=5)
+        _run_child_process(_exit_child_process, timeout=CHILD_PROCESS_TIMEOUT_SECONDS)
 
 
 @pytest.mark.parametrize("extension", ["fgb", "gpkg"])
@@ -636,7 +684,10 @@ def test_independent_reader_progress_while_first_reader_is_paused(extension):
     with tempfile.TemporaryDirectory() as td:
         paths = _write_pyogrio_pair(td, extension, expected_values)
         result = _run_child_process(
-            _run_paused_pyogrio_readers, paths, expected_values, timeout=15
+            _run_paused_pyogrio_readers,
+            paths,
+            expected_values,
+            timeout=CHILD_PROCESS_TIMEOUT_SECONDS,
         )
 
     assert result["ok"], result["error"]

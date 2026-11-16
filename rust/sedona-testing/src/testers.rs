@@ -110,12 +110,23 @@ impl AggregateUdfTester {
     /// in batches of one. This has the effect of testing all the pieces of
     /// an aggregator in a somewhat configurable/predictable way.
     pub fn aggregate(&self, batches: &Vec<ArrayRef>) -> Result<ScalarValue> {
+        let batches = batches
+            .iter()
+            .map(|batch| vec![batch.clone()])
+            .collect::<Vec<_>>();
+        self.aggregate_columns(&batches)
+    }
+
+    /// Perform a simple aggregation of a multi-argument aggregate
+    ///
+    /// As [Self::aggregate], but each batch holds one array per argument.
+    pub fn aggregate_columns(&self, batches: &[Vec<ArrayRef>]) -> Result<ScalarValue> {
         let state_schema = Arc::new(Schema::new(self.state_fields()?));
         let mut state_accumulator = self.new_accumulator()?;
 
         for batch in batches {
             let mut batch_accumulator = self.new_accumulator()?;
-            batch_accumulator.update_batch(std::slice::from_ref(batch))?;
+            batch_accumulator.update_batch(batch)?;
             let state_batch_of_one = RecordBatch::try_new(
                 state_schema.clone(),
                 batch_accumulator
@@ -183,7 +194,6 @@ impl AggregateUdfTester {
             state_accumulator.merge_batch(
                 state_batch.columns(),
                 &(0..total_num_groups).collect::<Vec<_>>(),
-                None,
                 total_num_groups,
             )?;
         }
@@ -510,6 +520,32 @@ impl ScalarUdfTester {
         }
     }
 
+    /// Invoke this function with any number of scalars, each given as a literal
+    /// expression (e.g. `vec![lit(1), lit(2.5), lit("POINT (0 1)")]`) and cast
+    /// to its argument type as in [Self::invoke_scalar]
+    pub fn invoke_scalars(&self, args: Vec<Expr>) -> Result<ScalarValue> {
+        assert_eq!(args.len(), self.arg_types.len(), "Unexpected arg length");
+        let scalar_args = args
+            .into_iter()
+            .zip(&self.arg_types)
+            .map(|(arg, sedona_type)| Self::scalar_from_expr(arg, sedona_type))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Some UDF calculate the return type from the input scalar arguments, so try it first.
+        let return_type = self
+            .return_type_with_scalars_inner(
+                &scalar_args.iter().cloned().map(Some).collect::<Vec<_>>(),
+            )
+            .ok();
+
+        let args = scalar_args.into_iter().map(ColumnarValue::Scalar).collect();
+        if let ColumnarValue::Scalar(scalar) = self.invoke_with_return_type(args, return_type)? {
+            Ok(scalar)
+        } else {
+            sedona_internal_err!("Expected scalar result from scalar invoke")
+        }
+    }
+
     /// Invoke this function with a raster scalar built from a [RasterSpec]
     pub fn invoke_raster_scalar(&self, spec: &RasterSpec) -> Result<ScalarValue> {
         self.invoke_scalar(spec)
@@ -707,9 +743,15 @@ impl ScalarUdfTester {
     }
 
     fn scalar_lit(arg: impl Literal, sedona_type: &SedonaType) -> Result<ScalarValue> {
-        if let Expr::Literal(scalar, _) = arg.lit() {
+        Self::scalar_from_expr(arg.lit(), sedona_type)
+    }
+
+    fn scalar_from_expr(arg: Expr, sedona_type: &SedonaType) -> Result<ScalarValue> {
+        if let Expr::Literal(scalar, _) = arg {
             let is_geometry_or_geography = match sedona_type {
-                SedonaType::Wkb(_, _) | SedonaType::WkbView(_, _) => true,
+                SedonaType::Wkb(_, _) | SedonaType::WkbLarge(_, _) | SedonaType::WkbView(_, _) => {
+                    true
+                }
                 SedonaType::Arrow(_) if sedona_type.is_item_crs() => true,
                 _ => false,
             };

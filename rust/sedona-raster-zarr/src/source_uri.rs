@@ -30,7 +30,9 @@
 //!    is the original group URI verbatim (whatever scheme that uses);
 //!    array path and chunk indices both live in the fragment so the
 //!    store URI is unambiguous even when both contain `/` (e.g.
-//!    `s3://bucket/foo.zarr/2024` + `subgroup/B01`).
+//!    `s3://bucket/foo.zarr/2024` + `subgroup/B01`). For an array stored
+//!    with the `sharding_indexed` codec the indices are on the
+//!    inner-chunk grid, not the shard grid.
 //!
 //!    The "this is a zarr anchor" signal lives in the band's
 //!    `outdb_format = "zarr"` field, not in a URI scheme prefix — matches
@@ -40,9 +42,9 @@
 use std::sync::Arc;
 
 use arrow_schema::ArrowError;
+use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
 use object_store::prefix::PrefixStore;
-use object_store::ObjectStore;
 use url::Url;
 use zarrs::storage::AsyncReadableListableStorage;
 use zarrs_object_store::AsyncObjectStore;
@@ -186,13 +188,20 @@ pub fn object_store_for_uri(uri: &str) -> Result<Arc<dyn ObjectStore>, ArrowErro
             Ok(Arc::new(store))
         }
         "http" | "https" => {
+            use object_store::ClientOptions;
             use object_store::http::HttpBuilder;
             // open_storage_from_uri applies the path as a PrefixStore, so the
             // HttpStore must be rooted at scheme+authority only — unlike S3,
             // HttpBuilder roots at whatever URL it's given.
             let authority = format!("{}://{}", url.scheme(), url.authority());
+            // object_store refuses plain `http://` unless asked; an explicit
+            // `http://` URI is the caller asking (local servers, test
+            // fixtures, private networks).
+            let options =
+                ClientOptions::new().with_allow_http(url.scheme().eq_ignore_ascii_case("http"));
             let store = HttpBuilder::new()
                 .with_url(authority)
+                .with_client_options(options)
                 .build()
                 .map_err(|e| build_err("http", e))?;
             Ok(Arc::new(store))
@@ -201,6 +210,24 @@ pub fn object_store_for_uri(uri: &str) -> Result<Arc<dyn ObjectStore>, ArrowErro
             "unsupported Zarr URI scheme {other:?}; expected one of: file, s3, http, https"
         ))),
     }
+}
+
+/// Identity of the `ObjectStore` client [`object_store_for_uri`] builds for
+/// `uri`: its scheme and authority. The client never depends on the path
+/// ([`open_storage_from_uri`] applies that as a prefix), so every group in
+/// one bucket or on one host shares a client and its connection pool.
+pub fn store_client_key(uri: &str) -> Result<String, ArrowError> {
+    if uri.starts_with("file://") || !uri.contains("://") {
+        return Ok("file://".to_string());
+    }
+    let url = Url::parse(uri).map_err(|e| {
+        ArrowError::InvalidArgumentError(format!("group URI {uri:?} is not a valid URL: {e}"))
+    })?;
+    Ok(format!(
+        "{}://{}",
+        url.scheme().to_ascii_lowercase(),
+        url.authority()
+    ))
 }
 
 pub fn open_storage_from_uri(
@@ -249,6 +276,28 @@ mod tests {
         assert_eq!(
             uri,
             "s3://bucket/foo.zarr/2024#array=subgroup/B01&chunk=1,5"
+        );
+    }
+
+    #[test]
+    fn store_client_key_is_scheme_and_authority() {
+        assert_eq!(store_client_key("file:///tmp/a.zarr").unwrap(), "file://");
+        assert_eq!(store_client_key("/tmp/a.zarr").unwrap(), "file://");
+        assert_eq!(
+            store_client_key("s3://bucket/a/b.zarr").unwrap(),
+            "s3://bucket"
+        );
+        assert_eq!(
+            store_client_key("s3://bucket/other.zarr").unwrap(),
+            "s3://bucket"
+        );
+        assert_eq!(
+            store_client_key("HTTPS://Host.example:8443/x/y.zarr").unwrap(),
+            "https://host.example:8443"
+        );
+        assert_ne!(
+            store_client_key("s3://a/x.zarr").unwrap(),
+            store_client_key("s3://b/x.zarr").unwrap()
         );
     }
 

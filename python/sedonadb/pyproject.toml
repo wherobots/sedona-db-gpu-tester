@@ -22,11 +22,10 @@ build-backend = "maturin"
 [project]
 name = "sedonadb"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
 
@@ -34,12 +33,17 @@ dynamic = ["version"]
 test = [
     "adbc-driver-manager[dbapi]",
     "adbc-driver-postgresql",
+    # Tests use the `@` operator for Affine matrix multiplication (affine>=3.0).
+    "affine>=3.0",
     "datafusion",
     "duckdb",
-    "geoarrow-pyarrow",
+    "geoarrow-c>=0.4.0",
+    "geoarrow-pyarrow>=0.3.0",
     "geopandas",
     "pandas",
     "polars",
+    # Raster export tests need the inline binary view fix in Arrow 25.
+    "pyarrow>=25.0.0",
     "pytest",
     "pyyaml",
     "rasterio",
@@ -52,7 +56,16 @@ geopandas = [
     "sedonadb-expr",
 ]
 
+[tool.cibuildwheel]
+# PyO3's stable ABI support makes this one wheel per platform compatible with
+# every supported CPython version, rather than producing one wheel per version.
+build = "cp310-*"
+# Set here rather than via CIBW_TEST_REQUIRES in the workflow: environment
+# variables take precedence over the overrides below.
+test-requires = ["pyarrow>=25.0.0", "pytest", "adbc_driver_manager", "geoarrow-pyarrow", "geopandas", "duckdb"]
+
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module", "pyo3/abi3-py310"]
 module-name = "sedonadb._lib"
 python-source = "python"
+strip = true

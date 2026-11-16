@@ -18,8 +18,9 @@
 //! `RS_Value` — sample a raster's pixel value at a point.
 //!
 //! ```text
-//! RS_Value(raster, point)        -> Double  -- band defaults to 1
-//! RS_Value(raster, point, band)  -> Double
+//! RS_Value(raster, point)             -> Double  -- band defaults to 1
+//! RS_Value(raster, point, band)       -> Double
+//! RS_Value(raster, colX, rowY, band)  -> Double  -- grid coordinate (1-based)
 //! ```
 //!
 //! Returns the value of the pixel that contains the point (no resampling). The
@@ -34,11 +35,11 @@
 
 use std::sync::Arc;
 
-use arrow_array::{builder::Float64Builder, Array, ArrayRef, Float64Array, StructArray};
+use arrow_array::{Array, ArrayRef, Float64Array, StructArray, builder::Float64Builder};
 use arrow_schema::DataType;
 use datafusion_common::cast::as_int32_array;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{exec_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_geometry::transform::CrsTransform;
@@ -63,6 +64,7 @@ pub fn rs_value_udf() -> SedonaScalarUDF {
         vec![
             Arc::new(RsValuePoint { with_band: false }), // RS_Value(raster, point)
             Arc::new(RsValuePoint { with_band: true }),  // RS_Value(raster, point, band)
+            Arc::new(RsValueGrid),                       // RS_Value(raster, colX, rowY, band)
         ],
         Volatility::Immutable,
     )
@@ -166,7 +168,7 @@ impl RsValuePoint {
                         }
                     }
                 } else {
-                    default_band("RS_Value", raster.num_bands())?
+                    default_band("RS_Value", "2-argument", raster.num_bands())?
                 };
 
                 // Parse the point and bring it into the raster's CRS. Null/empty
@@ -320,7 +322,7 @@ impl RsValuePoint {
         let const_band = if self.with_band {
             const_band
         } else {
-            Some(default_band("RS_Value", raster.num_bands())?)
+            Some(default_band("RS_Value", "2-argument", raster.num_bands())?)
         };
 
         // Phase 2 — sample. A constant band resolves its buffer/nodata once (now
@@ -381,6 +383,86 @@ fn resolve_point_xy(
 /// [`NdBuffer`](sedona_raster::traits::NdBuffer) strides — zero-copy and O(1),
 /// no whole-band materialisation. Errors if the band index is out of range or
 /// the band is not 2-D.
+/// Kernel for `RS_Value(raster, colX, rowY, band)` — sample by grid coordinate.
+///
+/// Reads the pixel coordinate **1-based**, as PostGIS `ST_Value` does and like
+/// `RS_PixelAs*`: `(1, 1)` is the origin pixel. The band is 1-based too. No CRS
+/// or affine transform is involved: the coordinates index the band grid
+/// directly. A coordinate outside the grid (including column or row 0), or a
+/// pixel equal to the band's nodata, samples NULL.
+#[derive(Debug)]
+struct RsValueGrid;
+
+impl SedonaScalarKernel for RsValueGrid {
+    fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+        let matcher = ArgMatcher::new(
+            vec![
+                ArgMatcher::is_raster(),
+                ArgMatcher::is_integer(),
+                ArgMatcher::is_integer(),
+                ArgMatcher::is_integer(),
+            ],
+            SedonaType::Arrow(DataType::Float64),
+        );
+        matcher.match_args(args)
+    }
+
+    fn invoke_batch(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+    ) -> Result<ColumnarValue> {
+        let executor = RasterExecutor::new(arg_types, args);
+        let num_iterations = executor.num_iterations();
+        let mut builder = Float64Builder::with_capacity(num_iterations);
+
+        // colX, rowY and band as Int32 columns, indexed in lockstep with the row.
+        let col_arr = int32_array_arg(&args[1], num_iterations)?;
+        let row_arr = int32_array_arg(&args[2], num_iterations)?;
+        let band_arr = int32_array_arg(&args[3], num_iterations)?;
+        let col = as_int32_array(&col_arr)?;
+        let row = as_int32_array(&row_arr)?;
+        let band = as_int32_array(&band_arr)?;
+
+        executor.execute_raster_void(|i, raster_opt| {
+            let raster = match raster_opt {
+                Some(raster) => raster,
+                None => {
+                    builder.append_null();
+                    return Ok(());
+                }
+            };
+            if col.is_null(i) || row.is_null(i) || band.is_null(i) {
+                builder.append_null();
+                return Ok(());
+            }
+            // Clamp a negative band to 0 so resolve_band rejects it as not
+            // 1-based rather than wrapping it into a huge usize.
+            let band_num = band.value(i).max(0) as usize;
+            // `sample_pixel` works in 0-based grid space.
+            let (col0, row0) = (col.value(i) as i64 - 1, row.value(i) as i64 - 1);
+            match sample_pixel(raster, col0, row0, band_num)? {
+                Some(value) => builder.append_value(value),
+                None => builder.append_null(),
+            }
+            Ok(())
+        })?;
+
+        executor.finish(Arc::new(builder.finish()))
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        _config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        self.invoke_batch(arg_types, args)
+    }
+}
+
 fn sample_pixel(
     raster: &dyn RasterRef,
     col: i64,
@@ -461,6 +543,80 @@ mod tests {
     }
 
     #[test]
+    fn grid_coordinate_overload_is_one_based() {
+        // The (raster, int, int, int) matcher dispatches to the grid kernel,
+        // which reads 1-based pixel coordinates (PostGIS's convention) with a
+        // 1-based band. sample_pixel's own 0-based / out-of-bounds behaviour is
+        // covered directly above; this exercises the end-to-end dispatch.
+        // 3x2 raster, row-major: row0 = [10, 20, 30], row1 = [40, 50, 60].
+        let i32t = SedonaType::Arrow(DataType::Int32);
+        let udf: ScalarUDF = rs_value_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER, i32t.clone(), i32t.clone(), i32t]);
+        let raster = || {
+            RasterSpec::d2(3, 2)
+                .band_values(&[10u8, 20, 30, 40, 50, 60])
+                .build()
+        };
+
+        // (1, 1) is the origin pixel (1-based) -> top-left value 10.
+        let result = tester
+            .invoke_arrays(vec![
+                Arc::new(raster()),
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![1])),
+            ])
+            .unwrap();
+        assert_eq!(
+            result
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            10.0
+        );
+
+        // (3, 2) is the last pixel -> bottom-right value 60.
+        let result = tester
+            .invoke_arrays(vec![
+                Arc::new(raster()),
+                Arc::new(Int32Array::from(vec![3])),
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(Int32Array::from(vec![1])),
+            ])
+            .unwrap();
+        assert_eq!(
+            result
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            60.0
+        );
+
+        // Column past the width (4) and column/row 0 are out of the grid -> NULL,
+        // not an error.
+        for (col, row) in [(4, 1), (0, 1), (1, 0)] {
+            let result = tester
+                .invoke_arrays(vec![
+                    Arc::new(raster()),
+                    Arc::new(Int32Array::from(vec![col])),
+                    Arc::new(Int32Array::from(vec![row])),
+                    Arc::new(Int32Array::from(vec![1])),
+                ])
+                .unwrap();
+            assert!(
+                result
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .is_null(0),
+                "({col}, {row}) should be outside the grid"
+            );
+        }
+    }
+
+    #[test]
     fn out_of_bounds_pixel_is_none() {
         let spec = || RasterSpec::d2(3, 2).band_values(&[10u8, 20, 30, 40, 50, 60]);
         assert_eq!(sample(spec(), 3, 0, 1).unwrap(), None); // col == width
@@ -493,9 +649,14 @@ mod tests {
 
     #[test]
     fn band_out_of_range_errors() {
+        // The error names the 1-based band the caller asked for, not the
+        // accessor's 0-based index (which read "Band index 1" here).
         let spec = RasterSpec::d2(2, 1).band_values(&[1u8, 2]);
         let err = sample(spec, 0, 0, 2).unwrap_err().to_string();
-        assert!(err.contains("RS_Value"), "unexpected error: {err}");
+        assert!(
+            err.contains("RS_Value: Band 2 is out of range: this raster has 1 bands"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -921,13 +1082,10 @@ mod tests {
         let raster_crs = resolve_crs(rasters.get(0).unwrap().crs()).unwrap();
         let point_type = SedonaType::Wkb(Edges::Planar, lnglat());
         with_global_proj_engine(|engine| {
-            assert!(column_point_crs_transform(
-                "RS_Value",
-                &point_type,
-                raster_crs.as_deref(),
-                engine
-            )
-            .is_err());
+            assert!(
+                column_point_crs_transform("RS_Value", &point_type, raster_crs.as_deref(), engine)
+                    .is_err()
+            );
             Ok(())
         })
         .unwrap();

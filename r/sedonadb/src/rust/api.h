@@ -22,6 +22,11 @@ SEXP savvy_apply_crses_to_sf_stream__ffi(SEXP c_arg__stream_in_xptr,
 SEXP savvy_configure_proj_shared__ffi(SEXP c_arg__shared_library_path,
                                       SEXP c_arg__database_path,
                                       SEXP c_arg__search_path);
+SEXP savvy_configure_gdal_prefix_native__ffi(SEXP c_arg__prefix);
+SEXP savvy_configure_gdal_shared__ffi(SEXP c_arg__shared_library_path);
+SEXP savvy_configure_gdal_system_native__ffi(void);
+SEXP savvy_configure_proj_prefix_native__ffi(SEXP c_arg__prefix);
+SEXP savvy_configure_proj_system_native__ffi(void);
 SEXP savvy_init_r_runtime__ffi(DllInfo *c_arg___dll_info);
 SEXP savvy_init_r_runtime_interrupts__ffi(SEXP c_arg__interrupts_call,
                                           SEXP c_arg__pkg_env);
@@ -37,7 +42,19 @@ SEXP savvy_InternalContext_deregister_table__ffi(SEXP self__,
 SEXP savvy_InternalContext_list_functions__ffi(SEXP self__);
 SEXP savvy_InternalContext_new__ffi(SEXP c_arg__option_keys,
                                     SEXP c_arg__option_values);
-SEXP savvy_InternalContext_read_parquet__ffi(SEXP self__, SEXP c_arg__paths);
+SEXP savvy_InternalContext_read__ffi(SEXP self__, SEXP c_arg__paths,
+                                     SEXP c_arg__option_keys,
+                                     SEXP c_arg__option_values,
+                                     SEXP c_arg__partitioning,
+                                     SEXP c_arg__partitioning_set,
+                                     SEXP c_arg__check_extension,
+                                     SEXP c_arg__format);
+SEXP savvy_InternalContext_read_parquet__ffi(SEXP self__, SEXP c_arg__paths,
+                                             SEXP c_arg__option_keys,
+                                             SEXP c_arg__option_values,
+                                             SEXP c_arg__geometry_columns,
+                                             SEXP c_arg__validate,
+                                             SEXP c_arg__partitioning);
 SEXP savvy_InternalContext_register_scalar_udf__ffi(
     SEXP self__, SEXP c_arg__scalar_udf_xptr);
 SEXP savvy_InternalContext_scalar_udf_xptr__ffi(SEXP self__, SEXP c_arg__name);

@@ -14,7 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use sedona_expr::aggregate_udf::SedonaAccumulatorRef;
+use datafusion_expr::utils::AggregateOrderSensitivity;
+use sedona_expr::aggregate_udf::{SedonaAccumulatorRef, SedonaAggregateUDF};
 use sedona_expr::scalar_udf::{IntoScalarKernelRefs, ScalarKernelRef};
 
 macro_rules! define_scalar_kernels {
@@ -47,7 +48,6 @@ pub fn scalar_kernels() -> Vec<(&'static str, Vec<ScalarKernelRef>)> {
         "st_dwithin" => crate::st_dwithin::st_dwithin_impl,
         "st_intersects" => crate::st_intersects::st_intersects_impl,
         "st_length" => crate::st_length::st_length_impl,
-        "st_lineinterpolatepoint" => crate::st_line_interpolate_point::st_line_interpolate_point_impl,
         "st_perimeter" => crate::st_perimeter::st_perimeter_impl,
     )
 }
@@ -56,6 +56,15 @@ pub fn aggregate_kernels() -> Vec<(&'static str, Vec<SedonaAccumulatorRef>)> {
     define_aggregate_kernels!(
         "st_convexhull_agg" => crate::st_convexhull_agg::st_convexhull_agg_impl,
         "st_intersection_agg" => crate::st_intersection_agg::st_intersection_agg_impl,
-        "st_union_agg" => crate::st_union_agg::st_union_agg_impl,
     )
+}
+
+pub fn aggregate_udfs() -> Vec<SedonaAggregateUDF> {
+    aggregate_kernels()
+        .into_iter()
+        .map(|(name, kernels)| {
+            SedonaAggregateUDF::from_impl(name, kernels)
+                .with_order_sensitivity(AggregateOrderSensitivity::Insensitive)
+        })
+        .collect()
 }

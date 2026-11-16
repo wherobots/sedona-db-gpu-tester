@@ -28,7 +28,7 @@ use arrow_array::ffi::FFI_ArrowArray;
 use arrow_schema::{ffi::FFI_ArrowSchema, DataType, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion_catalog::{Session, TableProvider};
-use datafusion_common::{exec_err, plan_err, Result, Statistics};
+use datafusion_common::{exec_err, plan_err, Result, Statistics, TableReference};
 use datafusion_execution::FunctionRegistry;
 use datafusion_expr::{Expr, HigherOrderUDF, ScalarUDF, TableProviderFilterPushDown, TableType};
 use datafusion_physical_plan::ExecutionPlan;
@@ -57,6 +57,7 @@ use crate::{
 pub struct ExportedTableProvider {
     inner: Arc<dyn TableProvider>,
     session: Arc<dyn Session>,
+    table_reference: Option<TableReference>,
     /// We hold Arc<RuntimeHandle> instead of just Handle to keep the runtime
     /// alive as long as this provider exists.
     runtime: Arc<RuntimeHandle>,
@@ -86,8 +87,18 @@ impl ExportedTableProvider {
         Self {
             inner,
             session,
+            table_reference: None,
             runtime,
         }
+    }
+
+    /// Set the table reference to use for logical scans of this provider.
+    ///
+    /// The reference is propagated across the extension boundary and can be
+    /// used by consumers instead of DataFusion's default `?table?` name.
+    pub fn with_table_reference(mut self, table_reference: impl Into<TableReference>) -> Self {
+        self.table_reference = Some(table_reference.into());
+        self
     }
 
     fn scan(
@@ -121,6 +132,10 @@ impl ExportedTableProvider {
                 };
                 Ok(type_str.to_string())
             }
+            "table_reference" => match &self.table_reference {
+                Some(table_reference) => serialize_table_reference(table_reference),
+                None => Ok(String::new()),
+            },
             _ => exec_err!("Unknown property: {}", property),
         }
     }
@@ -186,10 +201,18 @@ unsafe extern "C" fn c_table_provider_get_schema(
 
 unsafe extern "C" fn c_table_provider_get_property_schema(
     _self_: *const SedonaCTableProvider,
-    _property: *const std::ffi::c_char,
+    property: *const std::ffi::c_char,
     out: *mut FFI_ArrowSchema,
     err: *mut SedonaCError,
 ) -> c_int {
+    let property_name = cstr_from_ptr_or_empty(property);
+    if !matches!(
+        property_name.as_ref(),
+        "table_type" | "table_reference" | "supports_filters_pushdown"
+    ) {
+        set_ffi_error!(err, "Unknown property: {}", property_name);
+        return libc::ENOTSUP;
+    }
     debug_assert!(!out.is_null(), "out pointer is null");
     // All properties are returned as Utf8 strings
     use arrow_schema::{DataType, Field};
@@ -213,6 +236,14 @@ unsafe extern "C" fn c_table_provider_get_property(
     out: *mut FFI_ArrowArray,
     err: *mut SedonaCError,
 ) -> c_int {
+    let property_name = cstr_from_ptr_or_empty(property);
+    if !matches!(
+        property_name.as_ref(),
+        "table_type" | "table_reference" | "supports_filters_pushdown"
+    ) {
+        set_ffi_error!(err, "Unknown property: {}", property_name);
+        return libc::ENOTSUP;
+    }
     debug_assert!(!self_.is_null(), "self pointer is null");
     debug_assert!(!out.is_null(), "out pointer is null");
     let self_ref = &*self_;
@@ -418,10 +449,12 @@ pub struct ImportedTableProvider {
     inner: SedonaCTableProvider,
     schema: SchemaRef,
     table_type: TableType,
+    table_reference: Option<TableReference>,
     /// Stored as Arc so it can be cloned for each scan execution.
     cancel_checker: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Interval for periodic cancellation checking during stream consumption.
     check_interval: Option<Duration>,
+    use_async_execution: bool,
 }
 
 impl Debug for ImportedTableProvider {
@@ -453,14 +486,22 @@ impl ImportedTableProvider {
 
         // Get table type via get_property
         let table_type = Self::get_table_type(&inner)?;
+        let table_reference = Self::get_table_reference(&inner)?;
 
         Ok(Self {
             inner,
             schema,
             table_type,
+            table_reference,
             cancel_checker: None,
             check_interval: None,
+            use_async_execution: false,
         })
+    }
+
+    /// Return the table reference supplied by the exporting provider, if any.
+    pub fn table_reference(&self) -> Option<&TableReference> {
+        self.table_reference.as_ref()
     }
 
     /// Set a cancellation checker for this table provider.
@@ -486,6 +527,14 @@ impl ImportedTableProvider {
         self
     }
 
+    /// Select async-device-stream execution for plans returned by this provider.
+    ///
+    /// The synchronous Arrow C stream path remains the default.
+    pub fn with_async_execution(mut self, use_async: bool) -> Self {
+        self.use_async_execution = use_async;
+        self
+    }
+
     fn get_table_type(provider: &SedonaCTableProvider) -> Result<TableType> {
         let type_str = match get_table_provider_string_property(provider, "table_type") {
             Ok(s) => s,
@@ -498,6 +547,46 @@ impl ImportedTableProvider {
             "Temporary" => Ok(TableType::Temporary),
             _ => Ok(TableType::Base), // Default to Base for unknown types
         }
+    }
+
+    fn get_table_reference(provider: &SedonaCTableProvider) -> Result<Option<TableReference>> {
+        let serialized = get_table_provider_string_property(provider, "table_reference")?;
+        if serialized.is_empty() {
+            Ok(None)
+        } else {
+            deserialize_table_reference(&serialized).map(Some)
+        }
+    }
+}
+
+fn serialize_table_reference(table_reference: &TableReference) -> Result<String> {
+    let parts: Vec<&str> = match table_reference {
+        TableReference::Bare { table } => vec![table],
+        TableReference::Partial { schema, table } => vec![schema, table],
+        TableReference::Full {
+            catalog,
+            schema,
+            table,
+        } => vec![catalog, schema, table],
+    };
+
+    serde_json::to_string(&parts)
+        .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))
+}
+
+fn deserialize_table_reference(serialized: &str) -> Result<TableReference> {
+    let parts: Vec<String> = serde_json::from_str(serialized)
+        .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))?;
+
+    match parts.as_slice() {
+        [table] => Ok(TableReference::bare(table.clone())),
+        [schema, table] => Ok(TableReference::partial(schema.clone(), table.clone())),
+        [catalog, schema, table] => Ok(TableReference::full(
+            catalog.clone(),
+            schema.clone(),
+            table.clone(),
+        )),
+        _ => plan_err!("Invalid serialized table reference: expected 1 to 3 parts"),
     }
 }
 
@@ -653,6 +742,8 @@ impl TableProvider for ImportedTableProvider {
         }
 
         let mut exec = ImportedSedonaCExec::try_new(ffi_plan)?;
+
+        exec = exec.with_async_execution(self.use_async_execution);
 
         // Pipe through the cancel checker and interval if configured
         if let Some(ref checker) = self.cancel_checker {
@@ -834,6 +925,14 @@ mod tests {
     /// 3. Importing it and registering in a new context
     /// 4. Running the SQL query and asserting results
     fn test_roundtrip_query(sql: &str, expected: &[&str]) -> Result<()> {
+        test_roundtrip_query_with_mode(sql, expected, false)
+    }
+
+    fn test_roundtrip_query_with_mode(
+        sql: &str,
+        expected: &[&str],
+        use_async_execution: bool,
+    ) -> Result<()> {
         let runtime = test_runtime();
         runtime.block_on(async {
             let ctx = create_test_context().await?;
@@ -847,7 +946,8 @@ mod tests {
             let ffi_provider: SedonaCTableProvider = exported.into();
 
             // Import the table provider
-            let imported = ImportedTableProvider::try_new(ffi_provider)?;
+            let imported = ImportedTableProvider::try_new(ffi_provider)?
+                .with_async_execution(use_async_execution);
 
             // Create a new context and register the imported table
             let ctx2 = SessionContext::new();
@@ -875,6 +975,26 @@ mod tests {
                 "| 5  | 500     |",
                 "+----+---------+",
             ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_roundtrip_simple_select_async() {
+        test_roundtrip_query_with_mode(
+            "SELECT id, value_a FROM imported_data ORDER BY id LIMIT 5",
+            &[
+                "+----+---------+",
+                "| id | value_a |",
+                "+----+---------+",
+                "| 1  | 100     |",
+                "| 2  | 200     |",
+                "| 3  | 300     |",
+                "| 4  | 400     |",
+                "| 5  | 500     |",
+                "+----+---------+",
+            ],
+            true,
         )
         .unwrap();
     }
@@ -1162,6 +1282,31 @@ mod tests {
     }
 
     #[test]
+    fn unknown_properties_return_enotsup() {
+        let (imported, _runtime) = setup_imported_provider_with(TableType::Base);
+        let raw = &imported.inner;
+        let mut schema = FFI_ArrowSchema::empty();
+        let mut array = arrow_array::ffi::FFI_ArrowArray::empty();
+        let mut err = SedonaCError::default();
+        unsafe {
+            assert_eq!(
+                raw.get_property_schema.unwrap()(raw, c"unknown".as_ptr(), &mut schema, &mut err),
+                libc::ENOTSUP
+            );
+            assert_eq!(
+                raw.get_property.unwrap()(
+                    raw,
+                    c"unknown".as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut array,
+                    &mut err
+                ),
+                libc::ENOTSUP
+            );
+        }
+    }
+
+    #[test]
     fn test_table_provider_roundtrip_schema() {
         let (imported, _runtime) = setup_imported_provider_with(TableType::Base);
 
@@ -1180,5 +1325,52 @@ mod tests {
             let (imported, _runtime) = setup_imported_provider_with(table_type);
             assert_eq!(imported.table_type(), table_type);
         }
+    }
+
+    #[test]
+    fn test_table_provider_roundtrip_table_reference() {
+        for table_reference in [
+            TableReference::bare("table.with.dots"),
+            TableReference::partial("schema", "table"),
+            TableReference::full("catalog", "schema", "table"),
+        ] {
+            let dummy = Arc::new(DummyTableProvider::with_table_type(TableType::Base));
+            let ctx = SessionContext::new();
+            let runtime = test_runtime();
+            let session = Arc::new(ctx.state());
+            let exported = ExportedTableProvider::new(dummy, session, runtime.clone())
+                .with_table_reference(table_reference.clone());
+            let ffi_provider: SedonaCTableProvider = exported.into();
+            let imported = ImportedTableProvider::try_new(ffi_provider)
+                .expect("Failed to import table provider");
+
+            assert_eq!(imported.table_reference(), Some(&table_reference));
+        }
+    }
+
+    #[test]
+    fn test_table_provider_roundtrip_without_table_reference() {
+        let (imported, _runtime) = setup_imported_provider_with(TableType::Base);
+        assert_eq!(imported.table_reference(), None);
+    }
+
+    #[test]
+    fn test_table_reference_property_error_is_propagated() {
+        unsafe extern "C" fn get_failing_property(
+            _self_: *const SedonaCTableProvider,
+            _property: *const std::ffi::c_char,
+            _args: *mut SedonaCExecutionPlanArgs,
+            _out: *mut FFI_ArrowArray,
+            _err: *mut SedonaCError,
+        ) -> c_int {
+            libc::EINVAL
+        }
+
+        let provider = SedonaCTableProvider {
+            get_property: Some(get_failing_property),
+            ..Default::default()
+        };
+
+        assert!(ImportedTableProvider::get_table_reference(&provider).is_err());
     }
 }

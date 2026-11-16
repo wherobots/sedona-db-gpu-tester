@@ -17,18 +17,20 @@
 
 use std::{iter, sync::Arc};
 
-use datafusion_common::{config::ConfigOptions, error::DataFusionError};
+use datafusion_common::{
+    config::ConfigOptions, error::DataFusionError, tree_node::TreeNodeRecursion,
+};
 use datafusion_datasource::{
+    TableSchema,
     file::FileSource,
     file_groups::FileGroupPartitioner,
     file_scan_config::FileScanConfig,
     file_stream::FileOpener,
     projection::{ProjectionOpener, SplitProjection},
     source::DataSource,
-    TableSchema,
 };
 use datafusion_physical_expr::{
-    conjunction, projection::ProjectionExprs, LexOrdering, PhysicalExpr,
+    LexOrdering, PhysicalExpr, conjunction, projection::ProjectionExprs,
 };
 use datafusion_physical_plan::{
     filter_pushdown::{FilterPushdownPropagation, PushedDown},
@@ -88,6 +90,23 @@ impl LasSource {
 }
 
 impl FileSource for LasSource {
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion, DataFusionError>,
+    ) -> Result<TreeNodeRecursion, DataFusionError> {
+        if let Some(predicate) = &self.predicate
+            && f(predicate)? == TreeNodeRecursion::Stop
+        {
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        for projection in &self.projection {
+            if f(&projection.expr)? == TreeNodeRecursion::Stop {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,

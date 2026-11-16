@@ -23,7 +23,12 @@ import pandas as pd
 import geoarrow.pyarrow as ga
 import geopandas.testing
 
-from sedonadb.expr.literal import lit
+from sedonadb.expr.literal import (
+    ScalarGeometry,
+    _resolve_arrow_array,
+    _resolve_py_value,
+    lit,
+)
 from sedonadb.expr.expression import Expr
 import pytest
 
@@ -87,6 +92,204 @@ def test_shapely_linearring():
 
     array = pa.array(literal)
     assert array == ga.as_wkb(["LINESTRING (0 0, 1 0, 0 1, 0 0)"])
+
+
+@pytest.mark.parametrize(
+    "type",
+    [ga.wkb(), ga.large_wkb()],
+    ids=["wkb", "large_wkb"],
+)
+def test_shapely_array(type):
+    values = [shapely.Point(1, 2), None, shapely.Point(3, 4)]
+    array = _resolve_arrow_array(values, type)
+
+    assert array.type == type
+    assert ga.as_wkb(array).storage.to_pylist() == shapely.to_wkb(values).tolist()
+
+
+@pytest.mark.parametrize("type", [ga.wkb(), ga.large_wkb()])
+@pytest.mark.parametrize("values", [[], [None], [None, shapely.Point(1, 2).wkb, None]])
+def test_wkb_list_array(type, values):
+    array = _resolve_arrow_array(values, type)
+
+    assert array.type == type
+    assert array.storage.to_pylist() == values
+
+
+@pytest.mark.parametrize("source_type", [ga.wkb(), ga.wkt(), ga.point()])
+@pytest.mark.parametrize("target_type", [ga.wkb(), ga.large_wkb(), ga.wkb_view()])
+def test_geoarrow_scalar_list_array(source_type, target_type):
+    source = ga.as_geoarrow(["POINT (1 2)", None], type=source_type)
+    result = _resolve_arrow_array([None, source[0], source[1]], target_type)
+
+    assert result.type == target_type
+    assert result.storage.to_pylist() == [None, shapely.Point(1, 2).wkb, None]
+
+
+def test_resolve_array_requires_target_type():
+    with pytest.raises(ValueError, match="without a target type"):
+        _resolve_arrow_array([1], None)
+
+
+@pytest.mark.parametrize("values", [[], [None], [1, None, 2]])
+def test_resolve_array_plain_list(values):
+    result = _resolve_arrow_array(values, pa.int32())
+    assert result.equals(pa.array(values, pa.int32()))
+
+
+def test_resolve_array_same_type_preserves_slice_and_buffers():
+    source = pa.array([99, 1, None, 2], pa.int32()).slice(1)
+    result = _resolve_arrow_array(source, pa.int32())
+    assert result.equals(source)
+    assert result.offset == source.offset
+    assert result.buffers()[1].address == source.buffers()[1].address
+
+
+def test_resolve_array_cast():
+    source = pa.array([99, 1, None, 2], pa.int32()).slice(1)
+    result = _resolve_arrow_array(source, pa.float64())
+    assert result.equals(pa.array([1.0, None, 2.0], pa.float64()))
+
+
+def test_resolve_array_cast_rejects_overflow():
+    with pytest.raises(pa.ArrowInvalid):
+        _resolve_arrow_array(pa.array([128]), pa.int8())
+
+
+@pytest.mark.parametrize(
+    "target_type",
+    [
+        ga.wkt(),
+        ga.point(),
+        pa.field(
+            "custom",
+            pa.int64(),
+            metadata={b"ARROW:extension:name": b"test.unregistered"},
+        ),
+    ],
+)
+@pytest.mark.parametrize("values", [[None], pa.array([None])])
+def test_resolve_array_rejects_unsupported_extension(values, target_type):
+    # Unregistered extensions must not silently fall back to their storage type.
+    with pytest.raises(TypeError, match="Unsupported cast to extension"):
+        _resolve_arrow_array(values, target_type)
+
+
+def test_geometry_array_rejects_non_wkb_extension():
+    source = ga.wkt().wrap_array(pa.array(["POINT (1 2)"]))
+    with pytest.raises(TypeError, match="Unsupported cast from"):
+        _resolve_arrow_array(source, ga.wkb())
+
+
+def test_geometry_array_rejects_non_list():
+    with pytest.raises(TypeError, match="Can't create geometry array from tuple"):
+        _resolve_arrow_array((shapely.Point(1, 2),), ga.wkb())
+
+
+def test_shapely_geography_array_preserves_type():
+    type = ga.wkb().with_edge_type(ga.EdgeType.SPHERICAL).with_crs(ga.OGC_CRS84)
+    array = _resolve_arrow_array([shapely.Point(1, 2), None], type)
+
+    assert array.type == type
+    assert array.type.edge_type == ga.EdgeType.SPHERICAL
+    assert array.type.crs == ga.OGC_CRS84
+
+
+@pytest.mark.parametrize("source_type", [ga.wkb(), ga.large_wkb(), ga.wkb_view()])
+@pytest.mark.parametrize("target_type", [ga.wkb(), ga.large_wkb(), ga.wkb_view()])
+@pytest.mark.parametrize("extension", [False, True])
+def test_geometry_array_storage_cast(source_type, target_type, extension):
+    source_type = source_type.with_crs(ga.OGC_CRS84).with_edge_type(
+        ga.EdgeType.SPHERICAL
+    )
+    target_type = target_type.with_crs(ga.OGC_CRS84).with_edge_type(
+        ga.EdgeType.SPHERICAL
+    )
+    values = shapely.to_wkb([shapely.Point(1, 2), None], flavor="iso").tolist()
+    source = pa.array(values, source_type.storage_type)
+    if extension:
+        source = source_type.wrap_array(source)
+
+    result = _resolve_arrow_array(source, target_type)
+
+    result.validate(full=True)
+    assert result.type == target_type
+    assert result.storage.to_pylist() == values
+
+
+@pytest.mark.parametrize("target_type", [ga.wkb(), ga.large_wkb(), ga.wkb_view()])
+@pytest.mark.parametrize("values", [[], [None], [shapely.Point(1, 2, 3), None]])
+def test_shapely_array_wkb_storage(target_type, values):
+    result = _resolve_arrow_array(values, target_type)
+
+    result.validate(full=True)
+    assert result.type == target_type
+    assert result.storage.to_pylist() == shapely.to_wkb(values, flavor="iso").tolist()
+
+
+@pytest.mark.parametrize(
+    "source_type",
+    [ga.wkb().with_crs(ga.OGC_CRS84), ga.wkb().with_edge_type(ga.EdgeType.SPHERICAL)],
+)
+def test_geometry_array_rejects_metadata_change(source_type):
+    source = source_type.wrap_array(pa.array([None], pa.binary()))
+    with pytest.raises(TypeError, match="different CRS or edge type"):
+        _resolve_arrow_array(source, ga.large_wkb())
+
+
+@pytest.mark.parametrize("kind", ["empty", "null", "mixed"])
+def test_raster_array(kind):
+    from sedonadb._lib import raster_type
+    from sedonadb.raster import Raster
+
+    pixels = np.arange(6, dtype=np.uint8).reshape(2, 3)
+    raster = Raster.from_numpy(pixels)
+    values = {"empty": [], "null": [None, None], "mixed": [raster, None, raster]}[kind]
+
+    result = _resolve_arrow_array(values, raster_type())
+
+    result.validate(full=True)
+    assert result.type == pa.array(raster).type
+    assert len(result) == len(values)
+    assert result.is_null().to_pylist() == [value is None for value in values]
+    for i, value in enumerate(values):
+        if value is not None:
+            assert result.slice(i, 1).equals(pa.array(value))
+            np.testing.assert_array_equal(result[i].as_py().to_numpy(), pixels[None])
+
+
+def test_raster_array_rejects_invalid_element():
+    from sedonadb._lib import raster_type
+
+    with pytest.raises(TypeError, match="list of Raster or None"):
+        _resolve_arrow_array([None, 1], raster_type())
+
+
+def test_raster_array_same_type():
+    from sedonadb._lib import raster_type
+    from sedonadb.raster import Raster
+
+    raster = Raster.from_numpy(np.arange(1024, dtype=np.uint8).reshape(32, 32))
+    source = _resolve_arrow_array([raster, None], raster_type())
+    result = _resolve_arrow_array(source, raster_type())
+    assert result.equals(source)
+    source_data = source.storage.field("bands").values.field("data")
+    result_data = result.storage.field("bands").values.field("data")
+    assert result_data.buffers()[2].address == source_data.buffers()[2].address
+
+
+def test_raster_array_rejects_non_list():
+    from sedonadb._lib import raster_type
+
+    with pytest.raises(TypeError, match="list of Raster or None"):
+        _resolve_arrow_array((None,), raster_type())
+
+
+def test_raster_array_rejects_different_array_type():
+    from sedonadb._lib import raster_type
+
+    with pytest.raises(TypeError, match="Unsupported cast to extension"):
+        _resolve_arrow_array(pa.array([None]), raster_type())
 
 
 def test_geopandas_literal():
@@ -264,9 +467,9 @@ def test_pandas_timestamp_literal():
     assert lit_array.type == pa.timestamp("ns")
     assert lit_array[0].as_py() == stamp
 
-    aware = pd.Timestamp("2026-01-01 00:00:00.000000001", tz="US/Pacific")
+    aware = pd.Timestamp("2026-01-01 00:00:00.000000001", tz="America/Los_Angeles")
     lit_array = pa.array(lit(aware))
-    assert lit_array.type == pa.timestamp("ns", "US/Pacific")
+    assert lit_array.type == pa.timestamp("ns", "America/Los_Angeles")
     assert lit_array[0].as_py() == aware
 
     # A coarser-unit Timestamp keeps its unit rather than being forced to ns
@@ -355,3 +558,148 @@ def test_numpy_void_literal():
     lit_array = pa.array(lit(record))
     assert lit_array.type == pa.struct([("c", pa.int16()), ("r", pa.float32())])
     assert lit_array.to_pylist() == [{"c": 3, "r": 1.5}]
+
+
+def test_scalar_geometry():
+    point_type = ga.wkb().with_crs("EPSG:3857")
+    values = point_type.wrap_array(pa.array([None, shapely.Point(0, 1).wkb]))
+    point = ScalarGeometry(values, 1)
+
+    assert point.crs == point_type.crs
+    assert point.wkb == shapely.Point(0, 1).wkb
+    assert point.to_shapely().equals(shapely.Point(0, 1))
+    assert point.__geo_interface__ == {"type": "Point", "coordinates": (0.0, 1.0)}
+    assert shapely.geometry.shape(point).equals(shapely.Point(0, 1))
+    assert repr(point) == "ScalarGeometry geometry<Wkb(epsg:3857)>\n<POINT (0 1)>"
+
+    # As a literal, it is the one value with its type
+    assert pa.array(lit(point)).equals(values.slice(1, 1))
+    assert pa.array(lit(point)).type.crs == point_type.crs
+
+
+def test_scalar_geometry_equality():
+    point_type = ga.wkb().with_crs("EPSG:3857")
+    wkbs = [shapely.Point(0, 1).wkb, shapely.Point(0, 1).wkb, shapely.Point(1, 1).wkb]
+    point, same, other = (
+        ScalarGeometry(point_type.wrap_array(pa.array(wkbs)), i) for i in range(3)
+    )
+    assert point == same and hash(point) == hash(same)
+    assert point != other
+    assert len({point, same, other}) == 2
+
+    # Whatever the storage of the WKB or the spelling of the CRS
+    for value_type, storage in (
+        (ga.large_wkb().with_crs("EPSG:3857"), pa.large_binary()),
+        (ga.wkb().with_crs("epsg:3857"), pa.binary()),
+    ):
+        value = ScalarGeometry(value_type.wrap_array(pa.array(wkbs[:1], storage)))
+        assert point == value and hash(point) == hash(value)
+
+    # Of another CRS or kind, the same WKB is another value
+    for value_type in (
+        ga.wkb(),
+        ga.wkb().with_crs("EPSG:4326"),
+        point_type.with_edge_type(ga.EdgeType.SPHERICAL),
+    ):
+        assert point != ScalarGeometry(value_type.wrap_array(pa.array(wkbs[:1])))
+    assert point != shapely.Point(0, 1)
+
+
+def test_scalar_geography():
+    spherical = ga.wkb().with_edge_type(ga.EdgeType.SPHERICAL).with_crs(ga.OGC_CRS84)
+    point = ScalarGeometry(spherical.wrap_array(pa.array([shapely.Point(0, 1).wkb])))
+    assert pa.array(lit(point)).type.edge_type == ga.EdgeType.SPHERICAL
+    assert repr(point).startswith("ScalarGeometry geography<Wkb(ogc:crs84, Spherical)>")
+
+
+def test_scalar_geometry_repr_truncates_long_values():
+    line = shapely.LineString([(i, i) for i in range(100)])
+    value = ScalarGeometry(ga.wkb().wrap_array(pa.array([line.wkb])))
+    header, wkt = repr(value).split("\n")
+    assert header == "ScalarGeometry geometry<Wkb>"
+    assert wkt == f"<{line.wkt[:67]}...>"
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        pa.array([1, None, 3]),
+        pa.array(["a", None, "c"]).slice(1),
+        pa.array([[1], None, [2, 3]]),
+        pa.array([[1, 2], [3, 4]], pa.list_(pa.int64(), 2)),
+        pa.array([{"a": 1, "b": [2]}, None, {"a": None, "b": None}]),
+        pa.array(
+            [[("k", 1)], None, [("k", 2), ("l", None)]],
+            pa.map_(pa.string(), pa.int64()),
+        ),
+    ],
+)
+def test_resolve_py_value_as_py(values):
+    # Without a geometry or a raster, a value is what pyarrow gives
+    assert [
+        _resolve_py_value(values, i) for i in range(len(values))
+    ] == values.to_pylist()
+
+
+def test_resolve_py_value_geometry():
+    point_type = ga.wkb().with_crs("EPSG:3857")
+    points = point_type.wrap_array(pa.array([None, shapely.Point(0, 1).wkb]))
+    assert _resolve_py_value(points, 0) is None
+    point = _resolve_py_value(points, 1)
+    assert isinstance(point, ScalarGeometry)
+    assert point.wkb == shapely.Point(0, 1).wkb and point.crs == point_type.crs
+
+
+def test_resolve_py_value_nested_geometry():
+    # pyarrow's as_py() gives the geometries inside a list, a struct or a map as
+    # WKB, without their CRS
+    point_type = ga.wkb().with_crs("EPSG:3857")
+    wkbs = [shapely.Point(0, 1).wkb, None, shapely.Point(1, 2).wkb]
+    points = point_type.wrap_array(pa.array(wkbs))
+    offsets = pa.array([0, 1, 3], pa.int32())
+
+    def check(value, wkb):
+        if wkb is None:
+            assert value is None
+        else:
+            assert isinstance(value, ScalarGeometry)
+            assert value.wkb == wkb and value.crs == point_type.crs
+
+    items = _resolve_py_value(pa.ListArray.from_arrays(offsets, points), 1)
+    assert len(items) == 2
+    check(items[0], None)
+    check(items[1], wkbs[2])
+
+    structs = pa.StructArray.from_arrays([pa.array([1, 2, 3]), points], ["a", "geom"])
+    fields = _resolve_py_value(structs, 2)
+    assert list(fields) == ["a", "geom"] and fields["a"] == 3
+    check(fields["geom"], wkbs[2])
+
+    keys = pa.array(["p", "q", "r"])
+    entries = _resolve_py_value(pa.MapArray.from_arrays(offsets, keys, points), 1)
+    assert [key for key, _ in entries] == ["q", "r"]
+    check(entries[0][1], None)
+    check(entries[1][1], wkbs[2])
+
+
+def test_resolve_py_value_raster_shares_buffers():
+    from sedonadb._lib import raster_type
+    from sedonadb.raster import Raster
+
+    raster = Raster.from_numpy(np.arange(1024, dtype=np.uint8).reshape(32, 32))
+    source = _resolve_arrow_array([None, raster], raster_type())
+    assert _resolve_py_value(source, 0) is None
+
+    # The raster refers to the array's pixels rather than copying them
+    result = _resolve_py_value(source, 1)
+    assert isinstance(result, Raster)
+    source_data = source.storage.field("bands").values.field("data")
+    result_data = pa.array(result).storage.field("bands").values.field("data")
+    assert result_data.buffers()[2].address == source_data.buffers()[2].address
+
+    # and so do the rasters inside a list
+    rasters = pa.ListArray.from_arrays(pa.array([0, 2], pa.int32()), source)
+    items = _resolve_py_value(rasters, 0)
+    assert items[0] is None
+    item_data = pa.array(items[1]).storage.field("bands").values.field("data")
+    assert item_data.buffers()[2].address == source_data.buffers()[2].address

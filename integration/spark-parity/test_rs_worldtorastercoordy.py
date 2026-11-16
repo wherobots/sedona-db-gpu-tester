@@ -16,28 +16,32 @@
 # under the License.
 """SedonaDB vs Sedona Spark parity for RS_WorldToRasterCoordY.
 
-Every case is a cataloged divergence: SedonaDB treats pixel coordinates
-as 0-based where Sedona Spark (following PostGIS, and SedonaDB's own
-RS_PixelAs* functions) is 1-based, so results are exactly one pixel
-apart everywhere, extrapolation included (apache/sedona-db#1235). The
-geometry-returning combined form is deferred until the harness can
-compare geometry columns without ST_ wrappers.
+Both engines answer 1-based pixel coordinates, as PostGIS and the
+RS_PixelAs* functions do, extrapolation included (apache/sedona-db#1235),
+in the numeric and point-geometry forms alike.
 """
-
-import pytest
 
 from sedonadb.testing import SedonaDB, compare
 from sedonadb.testing_spark import SedonaSpark
 
 
-@pytest.mark.xfail(
-    reason="SedonaDB maps pixel coordinates 0-based (the origin is row 0); "
-    "Sedona Spark is 1-based (row 1) — apache/sedona-db#1235"
-)
 def test_rs_worldtorastercoordy(tmp_path):
     """The origin corner maps to the first row on both engines."""
     sedona, spark = SedonaDB(), SedonaSpark()
     for eng in (sedona, spark):
         eng.create_random_raster_view("w2ry_src", tmp_path / "w2ry_src.tif")
     sql = "SELECT RS_WorldToRasterCoordY(rast, 100.0, 500.0) FROM w2ry_src"
+    compare(sql, sedona, spark)
+
+
+def test_rs_worldtorastercoordy_point_overload(tmp_path):
+    """The point-geometry form maps the interior point (104 494) to the
+    same row on both engines."""
+    sedona, spark = SedonaDB(), SedonaSpark()
+    for eng in (sedona, spark):
+        eng.create_random_raster_view("w2ryp_src", tmp_path / "w2ryp_src.tif")
+    sql = (
+        "SELECT RS_WorldToRasterCoordY(rast, ST_GeomFromWKT('POINT (104 494)')) "
+        "FROM w2ryp_src"
+    )
     compare(sql, sedona, spark)

@@ -19,11 +19,11 @@ use std::sync::Arc;
 
 use datafusion_common::{error::DataFusionError, pruning::PrunableStatistics};
 use datafusion_datasource::{
-    file_stream::{FileOpenFuture, FileOpener},
     PartitionedFile,
+    file_stream::{FileOpenFuture, FileOpener},
 };
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_pruning::PruningPredicate;
+use datafusion_pruning::PruningPredicateBuilder;
 use futures::StreamExt;
 
 use sedona_expr::spatial_filter::SpatialFilterFactory;
@@ -77,7 +77,10 @@ impl FileOpener for LasOpener {
             )?);
 
             let pruning_predicate = predicate.and_then(|physical_expr| {
-                PruningPredicate::try_new(physical_expr, schema.clone()).ok()
+                PruningPredicateBuilder::new()
+                    .with_file_schema(schema.clone())
+                    .try_build(physical_expr)
+                    .ok()
             });
 
             let factory = SpatialFilterFactory::default();
@@ -103,10 +106,10 @@ impl FileOpener for LasOpener {
                 // based on file statistics
                 if let Some(statistics) = file.statistics {
                     let prunable_statistics = PrunableStatistics::new(vec![statistics], schema);
-                    if let Ok(filter) = pruning_predicate.prune(&prunable_statistics) {
-                        if !filter[0] {
-                            return Ok(futures::stream::empty().boxed());
-                        }
+                    if let Ok(filter) = pruning_predicate.prune(&prunable_statistics)
+                        && !filter[0]
+                    {
+                        return Ok(futures::stream::empty().boxed());
                     }
                 }
             }
@@ -129,11 +132,10 @@ impl FileOpener for LasOpener {
                     }
 
                     // limit
-                    if let Some(limit) = limit {
-                        if row_count >= limit {
+                    if let Some(limit) = limit
+                        && row_count >= limit {
                             break;
                         }
-                    }
 
                     // byte range
                     if !file.range.as_ref().is_none_or(|range| {
@@ -144,11 +146,10 @@ impl FileOpener for LasOpener {
                     }
 
                     // pruning
-                    if let Some(filter) = chunk_filter_xyz.as_ref() {
-                        if !filter[i] {
+                    if let Some(filter) = chunk_filter_xyz.as_ref()
+                        && !filter[i] {
                             continue;
                         }
-                    }
                     if let (Some(spatial_filter), Some(stats)) = (spatial_filter.as_ref(), metadata.statistics.as_ref()) {
                         let bbox = stats.get_bbox(i).unwrap();
                         if !spatial_filter.filter_bbox("geometry").intersects(&bbox) {

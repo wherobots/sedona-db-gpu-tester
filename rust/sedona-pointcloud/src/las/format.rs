@@ -18,17 +18,17 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use arrow_schema::{Schema, SchemaRef};
-use datafusion_catalog::{memory::DataSourceExec, Session};
+use datafusion_catalog::{Session, memory::DataSourceExec};
 use datafusion_common::{
-    config::ExtensionOptions, error::DataFusionError, parsers::CompressionTypeVariant, GetExt,
-    Statistics,
+    GetExt, Statistics, config::ExtensionOptions, error::DataFusionError,
+    parsers::CompressionTypeVariant,
 };
 use datafusion_datasource::{
+    TableSchema,
     file::FileSource,
     file_compression_type::FileCompressionType,
     file_format::{FileFormat, FileFormatFactory},
     file_scan_config::{FileScanConfig, FileScanConfigBuilder},
-    TableSchema,
 };
 use datafusion_physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
@@ -189,7 +189,13 @@ impl FileFormat for LasFormat {
             })
             .boxed() // Workaround https://github.com/rust-lang/rust/issues/64552
             // fetch schemas concurrently, if requested (note that this is not parallel)
-            .buffered(state.config_options().execution.meta_fetch_concurrency)
+            .buffered(
+                state
+                    .config_options()
+                    .execution
+                    .meta_fetch_concurrency
+                    .get(),
+            )
             .try_collect()
             .await?;
 
@@ -258,7 +264,7 @@ mod test {
     use arrow_schema::DataType;
     use datafusion::{execution::SessionStateBuilder, prelude::SessionContext};
     use datafusion_datasource::file_format::FileFormatFactory;
-    use las::{point::Format, Builder, Writer};
+    use las::{Builder, Writer, point::Format};
 
     use crate::las::format::{Extension, LasFormat, LasFormatFactory};
 

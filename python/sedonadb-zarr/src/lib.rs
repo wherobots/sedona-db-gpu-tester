@@ -21,15 +21,12 @@
 //! - `ZarrRasterLoader`: a Python class implementing the raster loader interface
 //!   that can be registered with `sedonadb` via `py_raster_loader`.
 
-use std::ffi::c_int;
 use std::sync::{Mutex, OnceLock};
 
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
-use arrow_buffer::Buffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
-use pyo3::ffi::Py_buffer;
 use pyo3::prelude::*;
-use pyo3::types::PyCapsule;
+use pyo3::types::{PyBytes, PyBytesMethods, PyCapsule, PyDict};
 use sedona_raster::view_entries::{ViewEntries, ViewEntry};
 use sedona_raster_zarr::{
     object_store_for_uri, open_storage_from_uri, ZarrChunkReader, ZarrLoader,
@@ -38,14 +35,27 @@ use tokio::runtime::{Builder, Runtime};
 
 /// Process-wide tokio runtime backing the sync Python FFI bridge.
 ///
-/// `ZarrChunkReader::try_new` is async, but the Python constructor is sync
-/// by contract, so we `block_on` here. Building a runtime per reader is
-/// wasteful; one shared runtime serves every open in the package. `next()`
-/// on the returned reader is pure CPU and never touches this runtime.
+/// `ZarrChunkReader::try_new` and `ZarrLoader::load` are async, but the
+/// Python entry points are sync by contract, so we `block_on` here. One
+/// shared runtime serves every open and every load in the package;
+/// `next()` on a reader is pure CPU and never touches it.
+///
+/// Multi-thread rather than current-thread: `load` is called from one
+/// blocking thread per DataFusion partition at once, and on a
+/// current-thread runtime every caller's I/O readiness is delivered by
+/// whichever caller happens to own the driver, so a CPU-bound chunk decode
+/// on that thread stalls the others' fetches. With workers owning the
+/// driver, each `block_on` only drives its own future.
+///
+/// Like any tokio runtime held in a Python process, the workers do not
+/// survive `fork()`: a forked child that inherits an initialized runtime
+/// must not use this module. Spawn-start multiprocessing is unaffected.
 fn shared_runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
-        Builder::new_current_thread()
+        Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("sedonadb-zarr-io")
             .enable_all()
             .build()
             .expect("build sedonadb-zarr tokio runtime")
@@ -103,107 +113,16 @@ impl PyZarrChunkReader {
     }
 }
 
-/// Zero-copy wrapper around an Arrow Buffer implementing Python's buffer protocol.
-///
-/// This allows Python code to access the underlying memory without copying,
-/// e.g., via `memoryview(zarr_buffer)` or passing directly to numpy.
-#[pyclass(frozen)]
-pub struct ZarrBuffer {
-    buffer: Buffer,
-}
-
-impl ZarrBuffer {
-    fn new(buffer: Buffer) -> Self {
-        Self { buffer }
-    }
-}
-
-#[pymethods]
-impl ZarrBuffer {
-    fn __len__(&self) -> usize {
-        self.buffer.len()
-    }
-
-    fn __repr__(&self) -> String {
-        format!("ZarrBuffer(len={})", self.buffer.len())
-    }
-
-    /// Implement Python buffer protocol for zero-copy access.
-    ///
-    /// # Safety
-    /// The caller must ensure the view is properly released via __releasebuffer__.
-    unsafe fn __getbuffer__(
-        slf: PyRef<'_, Self>,
-        view: *mut Py_buffer,
-        flags: c_int,
-    ) -> PyResult<()> {
-        use pyo3::ffi;
-
-        if view.is_null() {
-            return Err(pyo3::exceptions::PyBufferError::new_err(
-                "View pointer is null",
-            ));
-        }
-
-        // Check for unsupported flags
-        if (flags & ffi::PyBUF_WRITABLE) != 0 {
-            return Err(pyo3::exceptions::PyBufferError::new_err(
-                "Buffer is read-only",
-            ));
-        }
-
-        // Fill in the buffer view
-        (*view).buf = slf.buffer.as_ptr() as *mut std::ffi::c_void;
-        (*view).len = slf.buffer.len() as isize;
-        (*view).itemsize = 1;
-        (*view).readonly = 1;
-        (*view).ndim = 1;
-        (*view).format = if (flags & ffi::PyBUF_FORMAT) != 0 {
-            // "B" = unsigned byte
-            c"B".as_ptr() as *mut std::ffi::c_char
-        } else {
-            std::ptr::null_mut()
-        };
-        (*view).shape = if (flags & ffi::PyBUF_ND) != 0 {
-            &mut (*view).len as *mut isize
-        } else {
-            std::ptr::null_mut()
-        };
-        (*view).strides = if (flags & ffi::PyBUF_STRIDES) != 0 {
-            &mut (*view).itemsize as *mut isize
-        } else {
-            std::ptr::null_mut()
-        };
-        (*view).suboffsets = std::ptr::null_mut();
-        (*view).internal = std::ptr::null_mut();
-
-        // Set obj to the ZarrBuffer and increment its refcount to keep it alive
-        // while the buffer view exists. Python will call __releasebuffer__ when done,
-        // which decrements the refcount.
-        let obj_ptr = slf.as_ptr();
-        ffi::Py_INCREF(obj_ptr);
-        (*view).obj = obj_ptr;
-
-        Ok(())
-    }
-
-    #[allow(unused_variables)]
-    unsafe fn __releasebuffer__(&self, view: *mut Py_buffer) {
-        // Python handles decrementing the refcount of view.obj automatically
-        // when the buffer is released. Nothing else to clean up.
-    }
-}
-
 /// Result from a Zarr raster load operation.
 ///
 /// This type matches the interface expected by `py_raster_loader` from `sedonadb`:
-/// - `bytes`: raw pixel data (zero-copy via buffer protocol)
+/// - `bytes`: raw pixel data
 /// - `source_shape`: shape of the returned data
 /// - `view`: view entries (identity when returning full source)
 #[pyclass]
 pub struct ZarrLoadResult {
     #[pyo3(get)]
-    pub bytes: Py<ZarrBuffer>,
+    pub bytes: Py<PyBytes>,
     #[pyo3(get)]
     pub source_shape: Vec<i64>,
     #[pyo3(get)]
@@ -213,7 +132,7 @@ pub struct ZarrLoadResult {
 #[pymethods]
 impl ZarrLoadResult {
     fn __repr__(&self, py: Python<'_>) -> String {
-        let bytes_len = self.bytes.borrow(py).buffer.len();
+        let bytes_len = self.bytes.bind(py).as_bytes().len();
         format!(
             "ZarrLoadResult(bytes_len={}, source_shape={:?})",
             bytes_len, self.source_shape
@@ -222,7 +141,7 @@ impl ZarrLoadResult {
 }
 
 /// View entry for Zarr load results.
-#[pyclass(skip_from_py_object)]
+#[pyclass]
 #[derive(Clone, Copy)]
 pub struct ZarrViewEntry {
     #[pyo3(get)]
@@ -256,11 +175,22 @@ pub struct PyZarrRasterLoader {
 
 #[pymethods]
 impl PyZarrRasterLoader {
+    /// `io_concurrency` is the loader's I/O budget: chunk reads in flight
+    /// at once across every concurrent `RS_EnsureLoaded` call in the
+    /// session. `None` keeps the loader's default.
     #[new]
-    fn new() -> Self {
-        Self {
-            loader: ZarrLoader::new(),
+    #[pyo3(signature = (io_concurrency=None))]
+    fn new(io_concurrency: Option<usize>) -> Self {
+        let mut loader = ZarrLoader::new();
+        if let Some(n) = io_concurrency {
+            loader = loader.with_concurrency(n);
         }
+        Self { loader }
+    }
+
+    /// The configured I/O budget (see `io_concurrency` on the constructor).
+    fn io_concurrency(&self) -> usize {
+        self.loader.concurrency()
     }
 
     /// Returns the loader name ("zarr").
@@ -276,6 +206,20 @@ impl PyZarrRasterLoader {
     fn supports_format(&self, format: Option<&str>) -> bool {
         use sedona_raster::raster_loader::AsyncRasterLoader;
         self.loader.supports_format(format)
+    }
+
+    /// Hit and miss counters for the handles kept across `load` calls: the
+    /// object store client per scheme and authority, and the opened array
+    /// per store and array path. An array miss is a metadata round trip; a
+    /// store miss builds a client.
+    fn handle_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let stats = self.loader.handle_stats();
+        let dict = PyDict::new(py);
+        dict.set_item("store_hits", stats.store_hits)?;
+        dict.set_item("store_misses", stats.store_misses)?;
+        dict.set_item("array_hits", stats.array_hits)?;
+        dict.set_item("array_misses", stats.array_misses)?;
+        Ok(dict)
     }
 
     /// Load raster data from Zarr stores.
@@ -375,14 +319,15 @@ impl PyZarrRasterLoader {
 
         let results = results.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // Convert results to Python objects (zero-copy for bytes via ZarrBuffer)
+        // The buffer protocol did not join Python's Limited API until 3.11.
+        // Materialize a built-in bytes object so this extension can use abi3
+        // while retaining Python 3.9 support. This performs one copy at the
+        // Rust/Python boundary.
         let py_results: PyResult<Vec<ZarrLoadResult>> = results
             .into_iter()
             .map(|r| {
-                let zarr_buffer = ZarrBuffer::new(r.bytes);
-                let py_buffer = Py::new(py, zarr_buffer)?;
                 Ok(ZarrLoadResult {
-                    bytes: py_buffer,
+                    bytes: PyBytes::new(py, r.bytes.as_slice()).unbind(),
                     source_shape: r.source_shape,
                     view: r
                         .view
@@ -419,7 +364,6 @@ struct OwnedLoadRequest {
 fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyZarrChunkReader>()?;
     m.add_class::<PyZarrRasterLoader>()?;
-    m.add_class::<ZarrBuffer>()?;
     m.add_class::<ZarrLoadResult>()?;
     m.add_class::<ZarrViewEntry>()?;
     Ok(())

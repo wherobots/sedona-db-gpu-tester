@@ -18,6 +18,7 @@
 #ifndef SEDONA_EXTENSION_H
 #define SEDONA_EXTENSION_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -111,6 +112,66 @@ struct ArrowArrayStream {
 
 #endif  // ARROW_C_STREAM_INTERFACE
 #endif  // ARROW_FLAG_DICTIONARY_ORDERED
+
+#ifndef ARROW_C_DEVICE_DATA_INTERFACE
+#define ARROW_C_DEVICE_DATA_INTERFACE
+
+typedef int32_t ArrowDeviceType;
+#define ARROW_DEVICE_CPU 1
+#define ARROW_DEVICE_CUDA 2
+#define ARROW_DEVICE_CUDA_HOST 3
+#define ARROW_DEVICE_OPENCL 4
+#define ARROW_DEVICE_VULKAN 7
+#define ARROW_DEVICE_METAL 8
+#define ARROW_DEVICE_VPI 9
+#define ARROW_DEVICE_ROCM 10
+#define ARROW_DEVICE_ROCM_HOST 11
+#define ARROW_DEVICE_EXT_DEV 12
+#define ARROW_DEVICE_CUDA_MANAGED 13
+#define ARROW_DEVICE_ONEAPI 14
+#define ARROW_DEVICE_WEBGPU 15
+#define ARROW_DEVICE_HEXAGON 16
+
+struct ArrowDeviceArray {
+  struct ArrowArray array;
+  int64_t device_id;
+  ArrowDeviceType device_type;
+  void* sync_event;
+  int64_t reserved[3];
+};
+
+#endif  // ARROW_C_DEVICE_DATA_INTERFACE
+
+#ifndef ARROW_C_ASYNC_STREAM_INTERFACE
+#define ARROW_C_ASYNC_STREAM_INTERFACE
+
+/// Experimental Arrow C async-device stream interface.
+struct ArrowAsyncTask {
+  int (*extract_data)(struct ArrowAsyncTask* self, struct ArrowDeviceArray* out);
+  void* private_data;
+};
+
+struct ArrowAsyncProducer {
+  ArrowDeviceType device_type;
+  void (*request)(struct ArrowAsyncProducer* self, int64_t n);
+  void (*cancel)(struct ArrowAsyncProducer* self);
+  const char* additional_metadata;
+  void* private_data;
+};
+
+struct ArrowAsyncDeviceStreamHandler {
+  int (*on_schema)(struct ArrowAsyncDeviceStreamHandler* self,
+                   struct ArrowSchema* stream_schema);
+  int (*on_next_task)(struct ArrowAsyncDeviceStreamHandler* self,
+                      struct ArrowAsyncTask* task, const char* metadata);
+  void (*on_error)(struct ArrowAsyncDeviceStreamHandler* self, int code,
+                   const char* message, const char* metadata);
+  void (*release)(struct ArrowAsyncDeviceStreamHandler* self);
+  struct ArrowAsyncProducer* producer;
+  void* private_data;
+};
+
+#endif  // ARROW_C_ASYNC_STREAM_INTERFACE
 
 /// \brief Simple ABI-stable scalar function implementation
 ///
@@ -229,6 +290,107 @@ struct SedonaCError {
   void (*release)(struct SedonaCError* self);
 };
 
+/// \brief Borrowed configuration view
+///
+/// Provides read-only access to configuration options and extensions. All callbacks
+/// are thread safe. The view and its private data remain valid until the receiving
+/// kernel implementation is released.
+struct SedonaCConfigOptionsView {
+  /// \brief Get a configuration option
+  ///
+  /// key must be non-NULL, null-terminated UTF-8. Returns a nullable, length-one
+  /// Arrow value for key together with its schema. ConfigOptions currently exposes
+  /// values as Utf8 strings. A missing or unset key is returned as a null value.
+  /// Successful outputs belong to the caller. Malformed arguments return EINVAL.
+  /// On error, both outputs are untouched.
+  int (*get_option)(const struct SedonaCConfigOptionsView* self, const char* key,
+                    struct ArrowSchema* out_schema, struct ArrowArray* out,
+                    struct SedonaCError* err);
+
+  /// \brief Get a configuration option object
+  ///
+  /// key must be non-NULL, null-terminated UTF-8 and identifies the object (for
+  /// example, "sedona.crs_engine"). object_type identifies an independently agreed
+  /// output layout. No object type constants are currently defined. Object resources
+  /// require their own documented lifetime and release rules; native Rust objects
+  /// must never be passed directly through this interface.
+  ///
+  /// out_size_bytes is the size of the caller-provided output buffer. Unknown keys
+  /// or unsupported types return ENOTSUP; malformed arguments return EINVAL. On
+  /// error, out is untouched.
+  int (*get_option_object)(const struct SedonaCConfigOptionsView* self, const char* key,
+                           int object_type, void* out, size_t out_size_bytes,
+                           struct SedonaCError* err);
+
+  /// \brief Reserved for future use. Must be NULL.
+  void* reserved;
+
+  /// \brief Opaque implementation-specific data
+  ///
+  /// Borrowed for the lifetime of the receiving kernel implementation.
+  const void* private_data;
+};
+
+/// \brief Extensible scalar kernel factory
+///
+/// Provides function-level properties and initializes scalar kernel implementations.
+/// V1 remains ABI-compatible and independent. Callbacks accepting const self are
+/// thread safe. A NULL release callback indicates an invalid instance.
+struct SedonaCScalarKernelV2 {
+  /// \brief Get the data type of a property
+  ///
+  /// The properties documented by get_property have a non-null Utf8 schema.
+  /// Successful outputs belong to the caller. Unknown properties return ENOTSUP
+  /// and leave out untouched.
+  int (*get_property_schema)(const struct SedonaCScalarKernelV2* self,
+                             const char* property, struct ArrowSchema* out,
+                             struct SedonaCError* err);
+
+  /// \brief Get a function-level property
+  ///
+  /// Arguments are borrowed, null-terminated UTF-8 JSON (NULL when unused).
+  /// Each property returns one non-null Utf8 Arrow value containing JSON:
+  /// - "function_name": string or null.
+  /// - "volatility": "immutable", "stable", or "volatile".
+  /// - "metadata_keys": array of unique strings (including an empty array).
+  /// - "metadata": args is a JSON string key; result is a string.
+  ///
+  /// These declarations are stable for the factory lifetime and cached on import.
+  /// All V2 overloads of a function must agree on volatility and the entire
+  /// metadata map. Metadata is attached to the registered UDF for use by the planner.
+  ///
+  /// Successful outputs belong to the caller. Unknown properties or missing
+  /// metadata keys return ENOTSUP; invalid arguments return EINVAL. On error,
+  /// out is untouched.
+  int (*get_property)(const struct SedonaCScalarKernelV2* self, const char* property,
+                      const char* args, struct ArrowArray* out, struct SedonaCError* err);
+
+  /// \brief Initialize a new implementation
+  ///
+  /// config may be NULL. Otherwise the caller keeps it valid through release of
+  /// out, including all init/execute calls.
+  /// On success out must be a valid independently owned implementation.
+  /// The implementation uses the existing V1 init/execute protocol. The factory
+  /// must copy any state needed after its own release into the implementation.
+  ///
+  /// Returns zero on success or an errno-compatible error code on failure.
+  /// On error, out is untouched.
+  int (*new_impl)(const struct SedonaCScalarKernelV2* self,
+                  const struct SedonaCConfigOptionsView* config,
+                  struct SedonaCScalarKernelImpl* out, struct SedonaCError* err);
+
+  /// \brief Reserved for future use. Must be NULL.
+  void* reserved;
+
+  /// \brief Release this factory
+  ///
+  /// Implementations of this callback must set self->release to NULL.
+  void (*release)(struct SedonaCScalarKernelV2* self);
+
+  /// \brief Opaque implementation-specific data
+  void* private_data;
+};
+
 /// \brief Non-owning view of an expression
 ///
 /// This structure provides a read-only view into an expression without taking
@@ -252,6 +414,8 @@ struct SedonaCError {
 /// Instances with a NULL private_data are not valid and must not be used.
 struct SedonaCExprView {
   /// \brief Get the data type of a property
+  ///
+  /// Unknown properties return ENOTSUP from both property callbacks.
   int (*get_property_schema)(const struct SedonaCExprView* self, const char* property,
                              struct ArrowSchema* out, struct SedonaCError* err);
 
@@ -313,6 +477,8 @@ struct SedonaCExecutionPlan {
                     struct SedonaCError* err);
 
   /// \brief Get the data type of a property
+  ///
+  /// Unknown properties return ENOTSUP from both property callbacks.
   int (*get_property_schema)(const struct SedonaCExecutionPlan* self,
                              const char* property, struct ArrowSchema* out,
                              struct SedonaCError* err);
@@ -340,9 +506,9 @@ struct SedonaCExecutionPlan {
 
   /// \brief Resolve an asynchronous stream for one partition from this plan
   ///
-  /// This is not currently implemented and must be NULL. In the future,
-  /// out must point to a caller-supplied struct ArrowAsyncDeviceStreamHandler
-  /// as specified in the Arrow C Device Async Stream specification.
+  /// `out` must point to a caller-supplied ArrowAsyncDeviceStreamHandler.
+  /// Implementations may leave this callback NULL when async execution is not
+  /// supported; callers must check it before use.
   int (*execute_async)(const struct SedonaCExecutionPlan* self,
                        struct SedonaCExecutionPlanArgs* args, void* out,
                        struct SedonaCError* err);
@@ -376,6 +542,8 @@ struct SedonaCTableProvider {
                     struct SedonaCError* err);
 
   /// \brief Get the data type of a property
+  ///
+  /// Unknown properties return ENOTSUP from both property callbacks.
   int (*get_property_schema)(const struct SedonaCTableProvider* self,
                              const char* property, struct ArrowSchema* out,
                              struct SedonaCError* err);
@@ -433,6 +601,54 @@ struct SedonaCTableProvider {
   void (*release)(struct SedonaCTableProvider* self);
 
   /// \brief Opaque implementation-specific data
+  void* private_data;
+};
+
+/// \brief Catalog operations over full identifier paths.
+///
+/// Callbacks may block and must support concurrent calls. Property names are
+/// UTF-8; identifiers and arguments are UTF-8 JSON. Strings are borrowed for the
+/// duration of the call. All successful outputs transfer ownership to the caller.
+struct SedonaCCatalogProviderList {
+  /// Get a property's schema. name and list_identifiers are non-null Utf8.
+  /// Unknown properties return ENOTSUP from both property callbacks.
+  int (*get_property_schema)(const struct SedonaCCatalogProviderList* self,
+                             const char* property, struct ArrowSchema* out,
+                             struct SedonaCError* err);
+  /// Get a JSON-encoded property. name returns the stable implementation name
+  /// (e.g., "iceberg") as a JSON string and takes no arguments. It must be
+  /// available without catalog I/O and is cached on import.
+  /// list_identifiers accepts
+  /// args: {"prefix": [...], "depth": null|integer}.
+  /// Prefix matches exact components. Depth counts components after
+  /// prefix, including the prefix itself at depth zero; null is unlimited.
+  /// out: one non-null Utf8 Arrow value containing a JSON array of
+  /// {"identifier": [...], "object_type": "catalog"|"schema"|"table"|"view"|"index"}.
+  int (*get_property)(const struct SedonaCCatalogProviderList* self, const char* property,
+                      const char* args, struct ArrowArray* out, struct SedonaCError* err);
+  /// identifier: JSON array of literal components. Missing table: NULL release.
+  int (*table)(const struct SedonaCCatalogProviderList* self, const char* identifier,
+               struct SedonaCTableProvider* out, struct SedonaCError* err);
+  /// args: {"identifier": [...], "options": {"object_type": ..., "mode":
+  /// "create"|"create_or_ignore"|"replace", "temporary": bool, "external": bool,
+  /// "definition": null|string}}. Missing options fields use their Rust defaults.
+  /// A NULL input means no plan; otherwise move it and clear its release callback
+  /// when taking ownership. out is required on success and defers the mutation
+  /// (including existence/conflict checks) until execution. Return ENOTSUP if this
+  /// catalog list cannot create the object: for a new top-level catalog (CREATE
+  /// DATABASE), SedonaDB then offers it to the next registered catalog list.
+  int (*create_object)(const struct SedonaCCatalogProviderList* self, const char* args,
+                       struct SedonaCExecutionPlan* input,
+                       struct SedonaCExecutionPlan* out, struct SedonaCError* err);
+  /// args: {"identifier": [...], "options": {"object_type": ..., "if_exists": bool,
+  /// "cascade": bool, "purge": bool}}. Missing fields use their Rust defaults.
+  /// out is required on success, including for DROP IF EXISTS.
+  int (*drop_object)(const struct SedonaCCatalogProviderList* self, const char* args,
+                     struct SedonaCExecutionPlan* out, struct SedonaCError* err);
+  /// Reserved; must be NULL.
+  void* reserved;
+  /// Release the instance and set release to NULL.
+  void (*release)(struct SedonaCCatalogProviderList* self);
   void* private_data;
 };
 

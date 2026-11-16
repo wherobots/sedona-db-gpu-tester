@@ -19,6 +19,7 @@ use arrow_buffer::Buffer;
 use sedona_schema::raster::BandDataType;
 
 use crate::band_builder::BandWriter;
+use crate::band_builder::MAX_BAND_DATA_LEN;
 use crate::builder::StartBandArgs;
 use crate::error::RasterError;
 use crate::view_entries::ViewEntries;
@@ -142,17 +143,36 @@ impl<'a> NdBuffer<'a> {
 /// This is the shared convention consumers use to recover the source path and
 /// band from a band's `outdb_uri()`.
 pub fn split_outdb_band_fragment(uri: &str) -> Result<(String, u32), RasterError> {
-    if let Some((prefix, fragment)) = uri.rsplit_once('#') {
-        if let Some(band_str) = fragment.strip_prefix("band=") {
-            return match band_str.parse::<u32>() {
-                Ok(band) if band >= 1 => Ok((prefix.to_string(), band)),
-                _ => Err(RasterError::Invalid(format!(
-                    "Invalid band index in outdb URI fragment '#band={band_str}': expected a positive integer in 1..=u32::MAX"
-                ))),
-            };
-        }
+    if let Some((prefix, band_str)) = band_fragment(uri) {
+        return match band_str.parse::<u32>() {
+            Ok(band) if band >= 1 => Ok((prefix.to_string(), band)),
+            _ => Err(RasterError::Invalid(format!(
+                "Invalid band index in outdb URI fragment '#band={band_str}': expected a positive integer in 1..=u32::MAX"
+            ))),
+        };
     }
     Ok((uri.to_string(), 1))
+}
+
+/// The source an out-DB band reads from: `uri` without a trailing
+/// `#band=...` fragment, borrowed from `uri`.
+///
+/// Every band of one file shares this value, so it is the key to group rows
+/// by when they should be loaded together. Only the fragment
+/// [`split_outdb_band_fragment`] consumes is stripped: an earlier `#anchor`
+/// and any other fragment stay, so `x.zarr#var=a` and `x.zarr#var=b` remain
+/// distinct sources and `p#anchor#band=1` is `p#anchor`. The band value is
+/// not validated here; loading the band reports a malformed one.
+pub fn outdb_source(uri: &str) -> &str {
+    band_fragment(uri).map_or(uri, |(prefix, _)| prefix)
+}
+
+/// `(prefix, value)` when `uri` ends in a `#band=value` fragment. The one
+/// place the band-fragment convention is parsed, shared by
+/// [`split_outdb_band_fragment`] and [`outdb_source`] so they cannot drift.
+fn band_fragment(uri: &str) -> Option<(&str, &str)> {
+    let (prefix, fragment) = uri.rsplit_once('#')?;
+    Some((prefix, fragment.strip_prefix("band=")?))
 }
 
 /// Trait for accessing an N-dimensional raster (top level).
@@ -579,12 +599,16 @@ pub trait BandRef {
                 Ok(())
             }
             Override::Set(buffer) => {
-                let len = u32::try_from(buffer.len()).map_err(|_| {
-                    RasterError::Invalid(format!(
-                        "band data of {} bytes exceeds the BinaryView length limit",
-                        buffer.len()
-                    ))
-                })?;
+                let len = u32::try_from(buffer.len())
+                    .ok()
+                    .filter(|_| buffer.len() <= MAX_BAND_DATA_LEN)
+                    .ok_or_else(|| {
+                        RasterError::Invalid(format!(
+                            "band data of {} bytes exceeds the {MAX_BAND_DATA_LEN}-byte \
+                             BinaryView length limit",
+                            buffer.len()
+                        ))
+                    })?;
                 builder.append_band_data_buffer(buffer, 0, len)
             }
         }
@@ -764,6 +788,20 @@ pub fn nodata_f64_to_bytes(value: f64, dt: &BandDataType) -> Result<Vec<u8>, Ras
     })
 }
 
+/// Pack an `f64` pixel value into the little-endian bytes of a band's data
+/// type, the way a pixel write stores it. An integer type truncates toward zero
+/// first (3.9 is stored as 3, as a Java or Spark numeric cast does); the result
+/// must then fit the type exactly, as for [`nodata_f64_to_bytes`]: in range,
+/// not NaN, and within ±2^53 for the 64-bit integer types. `Float32` rounds to
+/// the nearest `f32`.
+pub fn pixel_f64_to_bytes(value: f64, dt: &BandDataType) -> Result<Vec<u8>, RasterError> {
+    let stored = match dt {
+        BandDataType::Float32 | BandDataType::Float64 => value,
+        _ => value.trunc(),
+    };
+    nodata_f64_to_bytes(stored, dt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,6 +846,46 @@ mod tests {
         nodata_f64_to_bytes(-1.0, &BandDataType::UInt8).unwrap_err();
         // Beyond 2^53 can't have arrived losslessly through f64.
         nodata_f64_to_bytes(1e18, &BandDataType::Int64).unwrap_err();
+    }
+
+    #[test]
+    fn test_pixel_f64_to_bytes_truncates_toward_zero() {
+        assert_eq!(
+            pixel_f64_to_bytes(3.9, &BandDataType::UInt8).unwrap(),
+            vec![3]
+        );
+        assert_eq!(
+            pixel_f64_to_bytes(-3.9, &BandDataType::Int16).unwrap(),
+            (-3i16).to_le_bytes().to_vec()
+        );
+        // Floats are not truncated; Float32 rounds to the nearest f32.
+        assert_eq!(
+            pixel_f64_to_bytes(0.1, &BandDataType::Float32).unwrap(),
+            0.1f32.to_le_bytes().to_vec()
+        );
+        assert_eq!(
+            pixel_f64_to_bytes(-7.25, &BandDataType::Float64).unwrap(),
+            (-7.25f64).to_le_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn test_pixel_f64_to_bytes_rejects_what_does_not_fit() {
+        // 255.9 truncates to 255 and fits; 256 does not.
+        assert_eq!(
+            pixel_f64_to_bytes(255.9, &BandDataType::UInt8).unwrap(),
+            vec![255]
+        );
+        pixel_f64_to_bytes(256.0, &BandDataType::UInt8).unwrap_err();
+        // -0.5 truncates to 0 and fits an unsigned type; -1 does not.
+        assert_eq!(
+            pixel_f64_to_bytes(-0.5, &BandDataType::UInt8).unwrap(),
+            vec![0]
+        );
+        pixel_f64_to_bytes(-1.0, &BandDataType::UInt8).unwrap_err();
+        pixel_f64_to_bytes(f64::NAN, &BandDataType::Int32).unwrap_err();
+        pixel_f64_to_bytes(f64::INFINITY, &BandDataType::Int32).unwrap_err();
+        pixel_f64_to_bytes(1e18, &BandDataType::Int64).unwrap_err();
     }
 
     #[test]
@@ -881,6 +959,21 @@ mod tests {
         assert_eq!(val, 42.0);
         let val = nodata_bytes_to_f64_lossless(&[0xFE], &BandDataType::Int8).unwrap();
         assert_eq!(val, -2.0);
+    }
+
+    #[test]
+    fn test_outdb_source_strips_only_a_trailing_band_fragment() {
+        assert_eq!(outdb_source("s3://b/a.tif#band=2"), "s3://b/a.tif");
+        assert_eq!(outdb_source("s3://b/a.tif"), "s3://b/a.tif");
+        assert_eq!(outdb_source("p#anchor#band=1"), "p#anchor");
+        // A non-band fragment names a different source and is kept.
+        assert_eq!(outdb_source("x.zarr#var=a"), "x.zarr#var=a");
+        assert_ne!(outdb_source("x.zarr#var=a"), outdb_source("x.zarr#var=b"));
+        assert_eq!(outdb_source("x.zarr#var=a#band=3"), "x.zarr#var=a");
+        // Agrees with the parser on every well-formed URI.
+        for uri in ["s3://b/a.tif#band=7", "p#anchor#band=1", "x.zarr#var=a"] {
+            assert_eq!(split_outdb_band_fragment(uri).unwrap().0, outdb_source(uri));
+        }
     }
 
     #[test]

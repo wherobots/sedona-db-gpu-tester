@@ -16,6 +16,7 @@
 # under the License.
 
 import io
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Literal, Optional, Union
 
@@ -34,13 +35,22 @@ if TYPE_CHECKING:
 class DataFrame:
     """Representation of a (lazy) collection of columns
 
-    This object is usually constructed from `sd = sedona.db.connect()`
-    by importing an object with `sd.create_data_frame()`, reading a file
-    with `sd.read_parquet()`/`sd.read_pyogrio()`, or executing SQL with
-    `sd.sql()`. Once created, a DataFrame can be modified using the Python
-    API (e.g., `.select()`, `.filter()`, `.sort()`, `.limit()`) or by
-    creating a temporary view with `.to_view("name")` and querying the
-    resulting view using `sd.sql()`. The Python API aims to provide
+    This object is usually constructed from a
+    [`SedonaContext`][sedonadb.context.SedonaContext], returned by
+    [`connect()`][sedonadb.context.connect], by importing an object with
+    [`create_data_frame()`][sedonadb.context.SedonaContext.create_data_frame],
+    reading a file with
+    [`read_parquet()`][sedonadb.context.SedonaContext.read_parquet] or
+    [`read_pyogrio()`][sedonadb.context.SedonaContext.read_pyogrio], or executing
+    SQL with [`sql()`][sedonadb.context.SedonaContext.sql]. Once created, a
+    DataFrame can be modified using the Python API (e.g.,
+    [`select()`][sedonadb.dataframe.DataFrame.select],
+    [`filter()`][sedonadb.dataframe.DataFrame.filter],
+    [`sort()`][sedonadb.dataframe.DataFrame.sort], or
+    [`limit()`][sedonadb.dataframe.DataFrame.limit]) or by creating a temporary
+    view with [`to_view()`][sedonadb.dataframe.DataFrame.to_view] and querying
+    the resulting view using
+    [`sql()`][sedonadb.context.SedonaContext.sql]. The Python API aims to provide
     a minimal subset of functionality derived primarily from Ibis and
     DuckDB's relational APIs.
 
@@ -1303,6 +1313,48 @@ class DataFrame:
         """
         return self._impl.count()
 
+    def item(self) -> Any:
+        """Execute and return the value of a result with one row and one column
+
+        This is useful for a query expected to give a single value, such as an
+        aggregate or a filter that leaves one row. The value is returned as a
+        Python object (e.g., an `int` for an integer, `None` for a null). A
+        geometry or geography is returned as a `ScalarGeometry`, which keeps its
+        CRS and can be passed back to a query, and a raster as a `Raster`. So are
+        the geometries and rasters in a list, a struct or a map that came in with
+        their types; the engine's own `make_array()`, `named_struct()`, `map()`
+        and `array_agg()` hold them as `binary`, which comes back as WKB bytes.
+
+        Raises a `ValueError` if the result does not have exactly one column and
+        one row.
+
+        Examples:
+
+            >>> sd = sedona.db.connect()
+            >>> sd.sql("SELECT 1 + 1 AS value").item()
+            2
+            >>> sd.sql("SELECT ST_Point(0, 1) AS geom").item()
+            ScalarGeometry geometry<Wkb>
+            <POINT (0 1)>
+
+        """
+        columns = self.columns
+        if len(columns) != 1:
+            raise ValueError(
+                f"item() requires exactly one column, got {len(columns)}: {columns}"
+            )
+
+        # Two rows are enough to tell one row from more than one
+        table = self.limit(2).to_arrow_table()
+        if table.num_rows != 1:
+            got = "none" if table.num_rows == 0 else "more than one"
+            raise ValueError(f"item() requires exactly one row, got {got}")
+
+        from sedonadb.expr.literal import _resolve_py_value
+
+        column = table.column(0)
+        return _resolve_py_value(next(chunk for chunk in column.chunks if len(chunk)))
+
     def with_params(self, *args: List[Any], **kwargs: Dict[str, Any]):
         """Replace unbound parameters in this query
 
@@ -1532,6 +1584,7 @@ class DataFrame:
         single_file_output: Optional[bool] = None,
         geoparquet_version: Literal["1.0", "1.1", "2.0", "none", None] = None,
         overwrite_bbox_columns: Optional[bool] = None,
+        write_bbox_columns: Optional[bool] = None,
         max_row_group_size: Optional[int] = None,
         compression: Optional[str] = None,
     ):
@@ -1543,12 +1596,16 @@ class DataFrame:
         subset of the file is needed for a given query.
 
         Args:
-            path: A filename or directory to which parquet file(s) should be written.
+            path: A filename, directory, or URL (e.g., `s3://bucket/path.parquet`) to
+                which parquet file(s) should be written.
             options: Key/value options to be used when constructing a parquet writer.
                 Common options are exposed as other arguments to `to_parquet()`; however,
                 this argument allows setting any DataFusion Parquet writer option. If
                 an option is specified here and by an argument to this function, the
-                value specified as a keyword argument takes precedence.
+                value specified as a keyword argument takes precedence. Options for
+                the object store a remote `path` is written to are passed here too,
+                as for `read_parquet()` (e.g., `{"aws.region": "us-west-2"}`); their
+                keys start with `aws.`, `gcp.`, or `azure.`.
             partition_by: A vector of column names to partition by. If non-empty,
                 applies hive-style partitioning to the output.
             sort_by: A vector of column names to sort by. Currently only ascending
@@ -1576,6 +1633,12 @@ class DataFrame:
                 that already exist in the input. This is useful in a read -> modify
                 -> write scenario to ensure these columns are up-to-date. If `False`
                 (the default), an error will be raised if a bbox column already exists.
+            write_bbox_columns: Use `True` or `False` to explicitly request or omit
+                bounding box (covering) columns, independent of `geoparquet_version`.
+                By default, these columns are written only for GeoParquet 1.1. Bounding
+                box columns can be requested for GeoParquet 1.1 or 2.0 (GeoParquet 1.0
+                cannot declare them, so requesting them with 1.0 or "none" raises an
+                error).
             max_row_group_size: Target maximum number of rows in each row group. Defaults
                 to the global configuration value (1M rows).
             compression: Sets the Parquet compression codec. Valid values are: uncompressed,
@@ -1592,7 +1655,8 @@ class DataFrame:
 
         """
 
-        path = Path(path)
+        # A str, not a Path: Path() collapses the `//` of a URL like s3://...
+        path = os.fspath(path)
 
         if options is not None:
             options = {k: str(v) for k, v in options.items()}
@@ -1610,6 +1674,9 @@ class DataFrame:
 
         if overwrite_bbox_columns is not None:
             options["overwrite_bbox_columns"] = str(overwrite_bbox_columns)
+
+        if write_bbox_columns is not None:
+            options["write_bbox_columns"] = str(write_bbox_columns)
 
         if single_file_output is None:
             single_file_output = partition_by is None and str(path).endswith(".parquet")

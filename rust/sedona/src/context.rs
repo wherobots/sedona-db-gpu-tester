@@ -19,18 +19,23 @@ use std::{
     sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use crate::exec::create_plan_from_sql;
-use crate::object_storage::ensure_object_store_registered_with_options;
+use crate::exec::{create_plan_from_sql, resolve_sedona_catalog_ddl};
+use crate::object_storage::{
+    ensure_object_store_registered_with_options, register_object_store_and_config_extensions,
+};
+use crate::read::{read_provider, resolve_read_format};
 use crate::url_table::install_sedona_url_table;
 use crate::{
-    catalog::DynamicObjectStoreCatalog,
+    catalog::SedonaCatalogRegistry,
     random_geometry_provider::RandomGeometryFunction,
     show::{show_batches, DisplayTableOptions},
 };
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
-use datafusion::datasource::file_format::format_as_file_type;
+use datafusion::datasource::file_format::{format_as_file_type, FileFormatFactory};
+use datafusion::datasource::{provider_as_source, MemTable, TableProvider};
+use datafusion::physical_optimizer::sanity_checker::SanityCheckPlan;
 use datafusion::{
     common::plan_err,
     error::{DataFusionError, Result},
@@ -45,12 +50,16 @@ use datafusion::{
 use datafusion::{dataframe::DataFrameWriteOptions, execution::memory_pool::MemoryLimit};
 use datafusion_common::config::{CsvOptions, JsonOptions};
 use datafusion_common::not_impl_err;
+use datafusion_common::TableReference;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::sqlparser::dialect::{dialect_from_str, Dialect};
-use datafusion_expr::{AggregateUDFImpl, LogicalPlan, LogicalPlanBuilder, ScalarUDFImpl, SortExpr};
+use datafusion_expr::{
+    AggregateUDFImpl, LogicalPlan, LogicalPlanBuilder, ScalarUDF, ScalarUDFImpl, SortExpr,
+};
 use parking_lot::Mutex;
+use sedona_catalog::SedonaCatalogList;
 use sedona_common::{sedona_internal_datafusion_err, SedonaOptions};
-use sedona_datasource::provider::external_table;
+use sedona_datasource::format::ExternalFormatFactory;
 use sedona_datasource::spec::ExternalFormatSpec;
 use sedona_expr::scalar_udf::{IntoScalarKernelRefs, SedonaScalarUDF};
 use sedona_expr::{
@@ -72,13 +81,19 @@ use sedona_schema::schema::SedonaSchema;
 #[cfg(feature = "gpu")]
 use sedona_spatial_join_gpu::options::GpuOptions;
 
+use datafusion_execution::memory_pool::arrow::ArrowMemoryPool;
+use datafusion_execution::memory_pool::MemoryConsumer;
+use sedona_common::option::DEFAULT_RASTER_CACHE_MAX_BYTES;
 use sedona_query_planner::{
     optimizer::{
-        register_ensure_loaded_optimizer, register_spatial_join_logical_optimizer,
-        register_vendored_optimizer_rules,
+        register_ensure_loaded_optimizer, register_sedona_analyzer_rules,
+        register_spatial_join_logical_optimizer, register_vendored_optimizer_rules,
     },
     query_planner::SedonaQueryPlanner,
+    raster_materialization::RasterMaterializationRule,
 };
+use sedona_raster::chunk_cache::{InMemoryChunkCache, RasterChunkCache};
+use sedona_raster::io_budget::RasterIoBudget;
 use sedona_raster::raster_loader::{AsyncRasterLoader, RasterLoaderConfig, RasterLoaderRegistry};
 
 /// Sedona SessionContext wrapper
@@ -89,6 +104,7 @@ use sedona_raster::raster_loader::{AsyncRasterLoader, RasterLoaderConfig, Raster
 /// interface for configuring the behaviour of
 pub struct SedonaContext {
     pub ctx: SessionContext,
+    catalogs: Arc<SedonaCatalogRegistry>,
     functions: RwLock<FunctionSet>,
     /// Per-session registry of async raster byte loaders, keyed by
     /// `outdb_format`. Held behind an `Arc<RwLock<…>>` so the registered
@@ -96,6 +112,14 @@ pub struct SedonaContext {
     /// entry points observe the same map. See
     /// [`SedonaContext::register_raster_loader`].
     raster_loader_registry: Arc<RwLock<RasterLoaderRegistry>>,
+    /// Per-session cache of loaded OutDb band bytes, shared with the
+    /// `RS_EnsureLoaded` UDF through the same config extension as the
+    /// registry. See [`SedonaContext::raster_chunk_cache`].
+    raster_chunk_cache: Arc<dyn RasterChunkCache>,
+    /// The session's budget of blocking raster file operations, shared by
+    /// the GDAL loader's pixel reads and `RS_FromPath`'s header opens. See
+    /// [`SedonaContext::raster_io_budget`].
+    raster_io_budget: RasterIoBudget,
 }
 
 impl SedonaContext {
@@ -107,7 +131,8 @@ impl SedonaContext {
         // DataFusion #22620 workaround tracked by
         // https://github.com/apache/sedona-db/issues/1232.
         let state_builder = register_vendored_optimizer_rules(state_builder).unwrap();
-        Self::finish_new(SessionContext::new_with_state(state_builder.build())).unwrap()
+        let state_builder = register_sedona_analyzer_rules(state_builder).unwrap();
+        Self::finish_new(SessionContext::new_with_state(state_builder.build()), false).unwrap()
     }
 
     /// Creates a new context with default interactive options
@@ -149,11 +174,33 @@ impl SedonaContext {
         // large spilled batches.
         const SPILLED_BATCH_THRESHOLD_PERCENT_DIVISOR: usize = 20; // 5% == 1 / 20
         const MIN_SPILLED_BATCH_IN_MEMORY_THRESHOLD_BYTES: usize = 10 * 1024 * 1024; // 10MB
+
+        // Likewise scale the byte budget for one batch of materialized rasters
+        // (`sedona.raster.max_batch_bytes`, applied per partition) to 1/8 of the
+        // per-partition limit, floored at 16MB and never above the unbounded
+        // default: 16 GiB on 16 partitions gives a 1 GiB share and a 128 MiB
+        // budget; 2 GiB on 16 partitions hits the 16 MiB floor. A later
+        // `SET sedona.raster.max_batch_bytes` overrides this.
+        const RASTER_BATCH_BUDGET_DIVISOR: usize = 8;
+        const MIN_RASTER_MAX_BATCH_BYTES: usize = 16 * 1024 * 1024; // 16MB
+
+        // The raster chunk cache keeps loaded OutDb bytes across queries. Its
+        // budget only counts entries that no batch references, and every
+        // entry is claimed from the memory pool, so under a memory limit it is
+        // capped at an eighth of the limit rather than the unbounded default.
+        // Provisional, to be tuned with the rest of bounded execution.
+        const RASTER_CACHE_LIMIT_DIVISOR: usize = 8;
         if let MemoryLimit::Finite(memory_limit) = runtime_env.memory_pool.memory_limit() {
             let per_partition_memory_limit = memory_limit.div_ceil(target_partitions);
             opts.spatial_join.spilled_batch_in_memory_size_threshold = per_partition_memory_limit
                 .div_ceil(SPILLED_BATCH_THRESHOLD_PERCENT_DIVISOR)
                 .max(MIN_SPILLED_BATCH_IN_MEMORY_THRESHOLD_BYTES);
+            opts.raster.max_batch_bytes = (per_partition_memory_limit
+                / RASTER_BATCH_BUDGET_DIVISOR)
+                .max(MIN_RASTER_MAX_BATCH_BYTES)
+                .min(opts.raster.max_batch_bytes);
+            opts.raster.cache_max_bytes =
+                DEFAULT_RASTER_CACHE_MAX_BYTES.min(memory_limit / RASTER_CACHE_LIMIT_DIVISOR);
         }
 
         // Register the spatial join planner extension
@@ -245,8 +292,18 @@ impl SedonaContext {
         // DataFusion #22620 workaround tracked by
         // https://github.com/apache/sedona-db/issues/1232.
         state_builder = register_vendored_optimizer_rules(state_builder)?;
+        state_builder = register_sedona_analyzer_rules(state_builder)?;
         state_builder = register_spatial_join_logical_optimizer(state_builder)?;
         state_builder = register_ensure_loaded_optimizer(state_builder)?;
+        // Plan raster materialization: byte-bounded load batches, spread by
+        // raster source (see `sedona_query_planner::raster_materialization`).
+        state_builder =
+            state_builder.with_physical_optimizer_rule(Arc::new(RasterMaterializationRule));
+        // It runs after DataFusion's own `SanityCheckPlan`, so check again:
+        // a rewrite that broke a parent's ordering or distribution
+        // requirement fails at planning rather than returning wrong rows.
+        state_builder =
+            state_builder.with_physical_optimizer_rule(Arc::new(SanityCheckPlan::new()));
         state_builder = state_builder.with_query_planner(Arc::new(planner));
 
         let mut state = state_builder.build();
@@ -270,28 +327,48 @@ impl SedonaContext {
         // Load the configured catalogs before finishing context setup below.
         ctx.refresh_catalogs().await?;
 
-        let out = Self::finish_new(ctx)?;
+        // Install URL resolution before the session catalog registry so it is
+        // part of the built-in fallback rather than another outer wrapper.
+        install_sedona_url_table(&ctx);
 
-        // Install state-dependent catalog wrappers after context setup so
-        // their weak references point at the live SessionState.
-        install_sedona_url_table(&out.ctx);
-
-        // The provider stores a weak reference to SessionState, so install it
-        // only after the context is fully initialized.
-        out.ctx
-            .register_catalog_list(Arc::new(DynamicObjectStoreCatalog::new(
-                out.ctx.state().catalog_list().clone(),
-                out.ctx.state_weak_ref(),
-            )));
-
-        Ok(out)
+        Self::finish_new(ctx, true)
     }
 
-    fn finish_new(ctx: SessionContext) -> Result<Self> {
+    fn finish_new(ctx: SessionContext, dynamic_object_store: bool) -> Result<Self> {
+        // The cache's budget comes from `sedona.raster.cache_max_bytes`
+        // (derived above under a memory limit, the default otherwise) and
+        // is re-read at every `RS_EnsureLoaded` call, so `SET` applies
+        // live. Every cached allocation is claimed from the session's
+        // memory pool for as long as any holder keeps it alive.
+        let cache_max_bytes = ctx
+            .state()
+            .config()
+            .options()
+            .extensions
+            .get::<SedonaOptions>()
+            .map(|opts| opts.raster.cache_max_bytes)
+            .unwrap_or(DEFAULT_RASTER_CACHE_MAX_BYTES);
+        let pool = ArrowMemoryPool::new(
+            Arc::clone(&ctx.runtime_env().memory_pool),
+            MemoryConsumer::new("RasterChunkCache"),
+        );
+        let raster_chunk_cache: Arc<dyn RasterChunkCache> =
+            Arc::new(InMemoryChunkCache::new(cache_max_bytes).with_memory_pool(Arc::new(pool)));
+
+        let catalogs = Arc::new(SedonaCatalogRegistry::new(
+            ctx.state().catalog_list().clone(),
+            ctx.state_weak_ref(),
+            dynamic_object_store,
+        ));
+        ctx.register_catalog_list(catalogs.clone());
+
         let mut out = Self {
             ctx,
+            catalogs,
             functions: RwLock::new(FunctionSet::new()),
             raster_loader_registry: Arc::new(RwLock::new(RasterLoaderRegistry::new())),
+            raster_chunk_cache,
+            raster_io_budget: RasterIoBudget::default(),
         };
 
         // Work around https://github.com/apache/datafusion/issues/24933:
@@ -335,8 +412,8 @@ impl SedonaContext {
 
         // Stash a clone of the shared registry handle inside
         // `ConfigOptions` via the `RasterLoaderConfig` extension. The
-        // RS_EnsureLoaded async UDF reads from there at dispatch time —
-        // `AsyncScalarUDFImpl::invoke_async_with_args` only receives
+        // RS_EnsureLoaded UDF reads from there at dispatch time —
+        // `ScalarUDFImpl::invoke_with_args` only receives
         // `Arc<ConfigOptions>`, so this is the path that keeps the
         // registry reachable at the UDF's invocation site. Mirrors how
         // `SedonaRuntime` works inside `SedonaOptions`.
@@ -345,23 +422,31 @@ impl SedonaContext {
         // mutates the Arc held in `out.raster_loader_registry`) are immediately
         // visible to UDF reads through this config extension because
         // both handles share the same `RwLock`.
-        extensions.insert(RasterLoaderConfig::from_handle(Arc::clone(
-            &out.raster_loader_registry,
-        )));
+        //
+        // The same extension carries the session's I/O budget, which the GDAL
+        // loader registered below also draws on, so `RS_FromPath`'s header
+        // opens and the loader's pixel reads are capped together. Its limit
+        // starts at `sedona.raster.io_concurrency` and is re-read at every
+        // call that uses it, so `SET` applies live.
+        if let Some(opts) = extensions.get::<SedonaOptions>() {
+            out.raster_io_budget.set_limit(opts.raster.io_concurrency);
+        }
+        extensions.insert(
+            RasterLoaderConfig::from_handle(Arc::clone(&out.raster_loader_registry))
+                .with_cache(Arc::clone(&out.raster_chunk_cache))
+                .with_io_budget(out.raster_io_budget.clone()),
+        );
         drop(state);
 
-        // Register the RS_EnsureLoaded async UDF. It pulls the registry
-        // out of `args.config_options` at dispatch time, so it doesn't
-        // need to close over the Arc itself — the UDF instance is
+        // Register the RS_EnsureLoaded UDF. It pulls the registry out of
+        // `args.config_options` at dispatch time, so it doesn't need to
+        // close over the Arc itself — the UDF instance is
         // session-agnostic. The logical optimizer rule registered above
         // (`register_ensure_loaded_optimizer`) resolves this UDF from the
         // function registry at rewrite time, so it must be registered
         // before any query is planned.
-        {
-            use datafusion_expr::async_udf::AsyncScalarUDF;
-            let udf = AsyncScalarUDF::new(Arc::new(RsEnsureLoaded::new()));
-            out.ctx.register_udf(udf.into_scalar_udf());
-        };
+        out.ctx
+            .register_udf(ScalarUDF::new_from_impl(RsEnsureLoaded::new()));
 
         // Register the GDAL raster byte loader. `sedona-raster-gdal` is a
         // mandatory dep on `sedona`, but libgdal itself is dlopen'd
@@ -370,7 +455,9 @@ impl SedonaContext {
         // the loader's `load()` call will surface a clean "libgdal not
         // found" error when first invoked, but registration and import
         // succeed regardless.
-        out.register_raster_loader(Arc::new(sedona_raster_gdal::GdalLoader::new()));
+        out.register_raster_loader(Arc::new(
+            sedona_raster_gdal::GdalLoader::new().with_budget(out.raster_io_budget.clone()),
+        ));
 
         // Register table functions
         out.ctx.register_udtf(
@@ -387,9 +474,9 @@ impl SedonaContext {
         #[cfg(feature = "geos")]
         out.register_scalar_kernels(sedona_geos::register::scalar_kernels().into_iter())?;
 
-        // Register geos aggregate kernels if built with geos support
+        // Register geos aggregate UDFs if built with geos support
         #[cfg(feature = "geos")]
-        out.register_aggregate_kernels(sedona_geos::register::aggregate_kernels().into_iter())?;
+        out.register_aggregate_udfs(sedona_geos::register::aggregate_udfs().into_iter())?;
 
         // Register geo kernels if built with geo support
         #[cfg(feature = "geo")]
@@ -398,9 +485,9 @@ impl SedonaContext {
         #[cfg(feature = "tg")]
         out.register_scalar_kernels(sedona_tg::register::scalar_kernels().into_iter())?;
 
-        // Register geo aggregate kernels if built with geo support
+        // Register geo aggregate UDFs if built with geo support
         #[cfg(feature = "geo")]
-        out.register_aggregate_kernels(sedona_geo::register::aggregate_kernels().into_iter())?;
+        out.register_aggregate_udfs(sedona_geo::register::aggregate_udfs().into_iter())?;
 
         // Register s2geography scalar kernels if built with s2geography support
         #[cfg(feature = "s2geography")]
@@ -422,9 +509,7 @@ impl SedonaContext {
             sd_order_lnglat::OrderLngLat::new(sedona_s2geography::utils::s2_cell_id_from_lnglat);
         self.register_scalar_kernels([("sd_order", sd_order_kernel)].into_iter())?;
 
-        self.register_aggregate_kernels(
-            sedona_s2geography::register::aggregate_kernels().into_iter(),
-        )?;
+        self.register_aggregate_udfs(sedona_s2geography::register::aggregate_udfs().into_iter())?;
 
         Ok(())
     }
@@ -449,6 +534,65 @@ impl SedonaContext {
         if let Ok(mut guard) = self.raster_loader_registry.write() {
             guard.register(loader);
         }
+    }
+
+    /// Register a foreign catalog list for this session.
+    ///
+    /// Later registrations take precedence over earlier foreign catalogs and
+    /// DataFusion's built-in catalogs when names overlap in Sedona SQL. Foreign
+    /// objects are not exposed through the synchronous DataFusion catalog API.
+    pub fn register_catalog_list(&self, catalogs: Arc<dyn SedonaCatalogList>) {
+        self.catalogs.register_foreign(catalogs);
+    }
+
+    /// Return the registry used to resolve built-in and foreign catalogs.
+    pub fn catalog_registry(&self) -> &SedonaCatalogRegistry {
+        &self.catalogs
+    }
+
+    /// Return the provider for a table resolved with Sedona catalog precedence.
+    ///
+    /// This is the catalog-aware counterpart to
+    /// [`SessionContext::table_provider`]. Foreign catalogs registered later
+    /// take precedence over earlier registrations and built-in catalogs.
+    pub async fn table_provider(
+        &self,
+        table_ref: impl Into<TableReference>,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let table_ref = table_ref.into();
+        self.catalogs
+            .table(table_ref.clone())
+            .await?
+            .ok_or_else(|| DataFusionError::Plan(format!("No table named '{}'", table_ref.table())))
+    }
+
+    /// Return a [`DataFrame`] for a table resolved with Sedona catalog precedence.
+    ///
+    /// Unlike [`SessionContext::table`], this also resolves tables from foreign
+    /// [`SedonaCatalogList`] implementations.
+    pub async fn table(&self, table_ref: impl Into<TableReference>) -> Result<DataFrame> {
+        let table_ref = table_ref.into();
+        let provider = self.table_provider(table_ref.clone()).await?;
+        let plan =
+            LogicalPlanBuilder::scan(table_ref, provider_as_source(provider), None)?.build()?;
+        Ok(DataFrame::new(self.ctx.state(), plan))
+    }
+
+    /// The session's cache of loaded OutDb band bytes: inspect its
+    /// [`stats`](RasterChunkCache::stats) or [`clear`](RasterChunkCache::clear)
+    /// it. Its budget is `sedona.raster.cache_max_bytes`.
+    pub fn raster_chunk_cache(&self) -> &Arc<dyn RasterChunkCache> {
+        &self.raster_chunk_cache
+    }
+
+    /// The session's budget of blocking raster file operations in flight:
+    /// the GDAL loader's pixel reads and `RS_FromPath`'s header opens both
+    /// take a permit from it per file. Its limit follows
+    /// `sedona.raster.io_concurrency`, applied at the next call that uses it.
+    /// Exposed for observability ([`in_use`](RasterIoBudget::in_use),
+    /// [`peak_in_use`](RasterIoBudget::peak_in_use)).
+    pub fn raster_io_budget(&self) -> &RasterIoBudget {
+        &self.raster_io_budget
     }
 
     fn functions(&self) -> Result<RwLockReadGuard<'_, FunctionSet>> {
@@ -512,6 +656,15 @@ impl SedonaContext {
         Ok(())
     }
 
+    /// Append overloads after validating metadata and volatility against the existing UDF.
+    pub fn append_sedona_scalar_udf(&self, udf: SedonaScalarUDF) -> Result<()> {
+        let mut functions = self.functions_mut()?;
+        let udf = functions.add_scalar_udf(udf)?.clone();
+        drop(functions);
+        self.ctx.register_udf(udf.into());
+        Ok(())
+    }
+
     pub fn register_sedona_aggregate_udf(&self, udf: SedonaAggregateUDF) -> Result<()> {
         let name = udf.name().to_string();
         let mut functions = self.functions_mut()?;
@@ -567,6 +720,19 @@ impl SedonaContext {
         Ok(())
     }
 
+    pub fn register_aggregate_udfs(
+        &mut self,
+        udfs: impl Iterator<Item = SedonaAggregateUDF>,
+    ) -> Result<()> {
+        let mut functions = self.functions_mut()?;
+        for udf in udfs {
+            let udf = functions.add_aggregate_udf(udf)?;
+            self.ctx.register_udaf(udf.clone().into());
+        }
+
+        Ok(())
+    }
+
     /// Creates a [`DataFrame`] from SQL query text that may contain one or more
     /// statements
     pub async fn multi_sql(&self, sql: &str) -> Result<Vec<DataFrame>> {
@@ -578,7 +744,18 @@ impl SedonaContext {
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
             let plan = create_plan_from_sql(self, statement.clone()).await?;
-            let df = self.ctx.execute_logical_plan(plan).await?;
+            let df = if let Some(plan) = resolve_sedona_catalog_ddl(self, &plan, &statement).await?
+            {
+                // Like DataFusion's built-in DDL, finish catalog mutations before
+                // planning the next statement. Return results that can be collected
+                // repeatedly without executing the DDL again.
+                let schema = plan.schema();
+                let batches = datafusion_physical_plan::collect(plan, self.ctx.task_ctx()).await?;
+                let table = MemTable::try_new(schema, vec![batches])?;
+                self.ctx.read_table(Arc::new(table))?
+            } else {
+                self.ctx.execute_logical_plan(plan).await?
+            };
             results.push(df);
         }
 
@@ -629,6 +806,44 @@ impl SedonaContext {
         self.ctx.read_table(Arc::new(provider))
     }
 
+    /// Creates a [`DataFrame`] from a file format factory.
+    ///
+    /// When `format` is `None`, a registered factory is resolved from the path
+    /// extension. A supplied factory does not need to be registered. Reader
+    /// options are passed to [`FileFormatFactory::create`] using the same
+    /// key/value convention as SQL `CREATE EXTERNAL TABLE`; object-store options
+    /// such as `aws.*` configure the store for each path. Formats that declare
+    /// themselves single-object formats are scanned without listing contents.
+    /// Directory listings are always filtered using an explicitly supplied
+    /// factory's extension. For individual paths, `check_extension` controls
+    /// whether extension-derived settings such as compression are applied.
+    pub async fn read<P: DataFilePaths>(
+        &self,
+        table_paths: P,
+        options: &HashMap<String, String>,
+        format: Option<Arc<dyn FileFormatFactory>>,
+        check_extension: bool,
+    ) -> Result<DataFrame> {
+        self.read_with_partitioning(table_paths, options, format, check_extension, None)
+            .await
+    }
+
+    /// Internal variant of [`Self::read`] retaining the bindings' existing
+    /// hive-partitioning override.
+    pub async fn read_with_partitioning<P: DataFilePaths>(
+        &self,
+        table_paths: P,
+        options: &HashMap<String, String>,
+        format: Option<Arc<dyn FileFormatFactory>>,
+        check_extension: bool,
+        partitioning: Option<Vec<(String, DataType)>>,
+    ) -> Result<DataFrame> {
+        let urls = table_paths.to_urls()?;
+        let format = resolve_read_format(&self.ctx.state(), &urls, format, check_extension)?;
+        let provider = read_provider(&self.ctx, urls, options, format, partitioning).await?;
+        self.ctx.read_table(provider)
+    }
+
     /// Creates a [`DataFrame`] for reading a [ExternalFormatSpec]
     ///
     /// The `partitioning` parameter controls hive-style partition discovery:
@@ -644,30 +859,10 @@ impl SedonaContext {
         partitioning: Option<Vec<(String, DataType)>>,
     ) -> Result<DataFrame> {
         let urls = table_paths.to_urls()?;
-
-        // Pre-register object store with our custom options before creating GeoParquetReadOptions
-        if !urls.is_empty() {
-            // Extract the table options from GeoParquetReadOptions for object store registration
-            ensure_object_store_registered_with_options(
-                &mut self.ctx.state(),
-                urls[0].as_str(),
-                options,
-            )
-            .await?;
-        }
-
-        let provider = if let Some(options) = options {
-            // Strip the filesystem-based options
-            let options_without_filesystems = options
-                .iter()
-                .filter(|(k, _)| !k.starts_with("gcs.") && !k.starts_with("aws."))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<HashMap<String, String>>();
-            let spec = spec.with_options(&options_without_filesystems)?;
-            external_table(spec, &self.ctx, urls, check_extension, partitioning).await?
-        } else {
-            external_table(spec, &self.ctx, urls, check_extension, partitioning).await?
-        };
+        let factory = Arc::new(ExternalFormatFactory::new(spec));
+        let format = resolve_read_format(&self.ctx.state(), &urls, Some(factory), check_extension)?;
+        let options = options.cloned().unwrap_or_default();
+        let provider = read_provider(&self.ctx, urls, &options, format, partitioning).await?;
 
         self.ctx.read_table(provider)
     }
@@ -824,6 +1019,12 @@ impl SedonaDataFrame for DataFrame {
             );
         }
 
+        // A remote output path (e.g., s3://) needs its object store registered.
+        // SQL COPY ... TO registers it while planning the statement
+        // (create_plan_from_sql); this plan is built directly, so the store is
+        // registered here, the same way.
+        register_object_store_and_config_extensions(ctx, &[path], &options.storage_options).await?;
+
         let format = if let Some(parquet_opts) = writer_options {
             Arc::new(GeoParquetFormatFactory::new_with_options(parquet_opts))
         } else {
@@ -920,6 +1121,9 @@ pub struct SedonaWriteOptions {
     /// Sets which columns should be used for sorting the output by name.
     /// Can be set to empty vec![] for non-sorted writes.
     pub sort_by: Vec<SortExpr>,
+    /// Options for the object store a remote output path is written to (e.g.,
+    /// `aws.region`), as for reading
+    pub storage_options: HashMap<String, String>,
 }
 
 impl From<SedonaWriteOptions> for DataFrameWriteOptions {
@@ -940,6 +1144,7 @@ impl SedonaWriteOptions {
             single_file_output: false,
             partition_by: vec![],
             sort_by: vec![],
+            storage_options: HashMap::new(),
         }
     }
 
@@ -964,6 +1169,12 @@ impl SedonaWriteOptions {
     /// Sets the sort_by columns for output sorting
     pub fn with_sort_by(mut self, sort_by: Vec<SortExpr>) -> Self {
         self.sort_by = sort_by;
+        self
+    }
+
+    /// Sets the options for the object store a remote output path is written to
+    pub fn with_storage_options(mut self, storage_options: HashMap<String, String>) -> Self {
+        self.storage_options = storage_options;
         self
     }
 }
@@ -1007,14 +1218,10 @@ mod tests {
 
     use arrow_array::{create_array, ArrayRef, RecordBatchIterator, RecordBatchReader};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::assert_batches_eq;
+    use datafusion::{assert_batches_eq, datasource::file_format::csv::CsvFormatFactory};
     use sedona_datasource::spec::{Object, OpenReaderArgs};
     use sedona_geometry::types::Edges;
-    use sedona_schema::{
-        crs::{deserialize_crs, lnglat},
-        datatypes::SedonaType,
-        schema::SedonaSchema,
-    };
+    use sedona_schema::{crs::deserialize_crs, datatypes::SedonaType, schema::SedonaSchema};
     use sedona_testing::data::test_geoparquet;
     use tempfile::tempdir;
 
@@ -1057,6 +1264,67 @@ mod tests {
         assert_eq!(
             batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_sedona_aggregates_respect_order_sensitivity() {
+        let ctx = SedonaContext::new();
+
+        let values = "FROM (VALUES (2, ST_Point(2, 2)), (1, ST_Point(1, 1))) AS t(x, g)";
+
+        let sql = format!("SELECT ST_Collect_Agg(g ORDER BY x) {values}");
+        let err = ctx.sql(&sql).await.unwrap().collect().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ORDER BY is not supported for aggregate function st_collect_agg"),
+            "unexpected error: {err}"
+        );
+
+        for function in [
+            "ST_Analyze_Agg",
+            "ST_Envelope_Agg",
+            "ST_ConvexHull_Agg",
+            "ST_Intersection_Agg",
+            "ST_Union_Agg",
+            "ST_Polygonize_Agg",
+        ] {
+            let sql = format!("SELECT {function}(g ORDER BY x) {values}");
+            ctx.sql(&sql)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap_or_else(|err| panic!("{function} unexpectedly failed: {err}"));
+        }
+
+        // DataFusion's own ordered aggregates remain available.
+        ctx.sql("SELECT array_agg(x ORDER BY x) FROM (VALUES (2), (1)) AS t(x)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordered_sedona_aggregates_in_subqueries_are_rejected() {
+        let ctx = SedonaContext::new();
+
+        let sql = r#"
+            SELECT ST_AsText((
+                SELECT ST_Collect_Agg(g ORDER BY x)
+                FROM (VALUES
+                    (2, ST_Point(2, 2)),
+                    (1, ST_Point(1, 1))
+                ) AS t(x, g)
+            ))
+        "#;
+        let err = ctx.sql(sql).await.unwrap().collect().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ORDER BY is not supported for aggregate function st_collect_agg"),
+            "unexpected error: {err}"
         );
     }
 
@@ -1137,6 +1405,135 @@ mod tests {
             udf.is_some(),
             "RS_EnsureLoaded should be registered by SedonaContext::new()"
         );
+    }
+
+    #[tokio::test]
+    async fn rs_ensureloaded_batches_are_bounded_by_raster_max_batch_bytes() {
+        use arrow_array::{ArrayRef, RecordBatch};
+        use arrow_buffer::Buffer;
+        use arrow_schema::{Field, Schema};
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        use datafusion::datasource::MemTable;
+        use sedona_raster::builder::{RasterBuilder, StartBandArgs};
+        use sedona_raster::raster_loader::{
+            AsyncRasterLoader, RasterLoadRequest, RasterLoadResult,
+        };
+        use sedona_schema::datatypes::SedonaType;
+        use sedona_schema::raster::BandDataType;
+        use std::sync::Mutex;
+
+        /// Records how many requests each `load()` carried and returns
+        /// correctly sized zero buffers.
+        #[derive(Debug, Default)]
+        struct CountingLoader {
+            calls: Mutex<Vec<usize>>,
+        }
+        #[async_trait]
+        impl AsyncRasterLoader for CountingLoader {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            fn supports_format(&self, format: Option<&str>) -> bool {
+                format == Some("mock")
+            }
+            async fn load(
+                &self,
+                reqs: &[&RasterLoadRequest],
+            ) -> std::result::Result<Vec<RasterLoadResult>, arrow_schema::ArrowError> {
+                self.calls.lock().unwrap().push(reqs.len());
+                Ok(reqs
+                    .iter()
+                    .map(|req| {
+                        let elements: i64 = req.source_shape.iter().product();
+                        let len = elements as usize * req.data_type.byte_size();
+                        RasterLoadResult::unresolved(Buffer::from_vec(vec![0u8; len]), req)
+                    })
+                    .collect())
+            }
+        }
+
+        // The interactive constructor is the one that installs the planner
+        // rules (`new()` only wraps an existing SessionContext).
+        let ctx = SedonaContext::new_local_interactive().await.unwrap();
+        let loader = Arc::new(CountingLoader::default());
+        ctx.register_raster_loader(loader.clone());
+
+        // Six 16 × 16 UInt8 OutDb rasters: 256 bytes each once loaded. Each
+        // has its own URI: identical requests are deduplicated within a
+        // slice and served from the chunk cache across slices, and this test
+        // measures slicing and bundling, not that.
+        let mut b = RasterBuilder::new(6);
+        for i in 0..6 {
+            let uri = format!("mock://tile/{i}");
+            b.start_raster_nd(
+                &[0.0, 1.0, 0.0, 0.0, 0.0, -1.0],
+                &["y", "x"],
+                &[16, 16],
+                None,
+            )
+            .unwrap();
+            b.start_band(StartBandArgs {
+                outdb_uri: Some(&uri),
+                outdb_format: Some("mock"),
+                ..StartBandArgs::new(&["y", "x"], &[16, 16], BandDataType::UInt8)
+            })
+            .unwrap();
+            b.band_data_writer().append_value([0u8; 0]);
+            b.finish_band().unwrap();
+            b.finish_raster().unwrap();
+        }
+        let rasters: ArrayRef = Arc::new(b.finish().unwrap());
+        let raster_field = SedonaType::Raster.to_storage_field("rast", true).unwrap();
+        let field = Field::new("rast", rasters.data_type().clone(), true)
+            .with_metadata(raster_field.metadata().clone());
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![rasters]).unwrap();
+        // An empty batch ahead of the rows: it must pass through without an
+        // invocation (scans after pruning produce these).
+        let table = MemTable::try_new(
+            Arc::clone(&schema),
+            vec![vec![RecordBatch::new_empty(schema), batch]],
+        )
+        .unwrap();
+        ctx.ctx.register_table("tiles", Arc::new(table)).unwrap();
+
+        // One partition keeps the observed batch sequence deterministic (the
+        // projection above the exec preserves batch boundaries).
+        ctx.sql("SET datafusion.execution.target_partitions = 1")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        // A 600-byte budget fits two 256-byte rasters per slice.
+        ctx.sql("SET sedona.raster.max_batch_bytes = 600")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let explain = ctx
+            .sql("EXPLAIN SELECT RS_EnsureLoaded(rast) AS r FROM tiles")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let plan = pretty_format_batches(&explain).unwrap().to_string();
+        assert!(plan.contains("RasterBatchSplitExec"), "{plan}");
+
+        let batches = ctx
+            .sql("SELECT RS_EnsureLoaded(rast) AS r FROM tiles")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(rows, vec![2, 2, 2]);
+        // Each slice reaches the loader as one bundled call carrying its rows.
+        assert_eq!(*loader.calls.lock().unwrap(), vec![2, 2, 2]);
     }
 
     #[tokio::test]
@@ -1341,6 +1738,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_geoparquet_local_and_file_url() {
+        let tmpdir = tempdir().unwrap();
+        let ctx = SedonaContext::new();
+        let path = tmpdir.path().join("local.parquet");
+        let url = format!("file://{}", tmpdir.path().join("url.parquet").display());
+        for target in [path.to_string_lossy().to_string(), url] {
+            ctx.sql("SELECT 1 as one")
+                .await
+                .unwrap()
+                .write_geoparquet(&ctx, &target, SedonaWriteOptions::new(), None)
+                .await
+                .unwrap();
+        }
+        assert!(path.exists());
+        assert!(tmpdir.path().join("url.parquet").exists());
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn write_geoparquet_registers_the_remote_object_store() {
+        // The store for a remote output path is registered with the given
+        // options before writing (an invalid one is rejected by the store's
+        // configuration, without any network access); without registration
+        // the write found no object store at all.
+        let ctx = SedonaContext::new();
+        let options = SedonaWriteOptions::new().with_storage_options(HashMap::from([(
+            "aws.not_an_option".to_string(),
+            "true".to_string(),
+        )]));
+        let err = ctx
+            .sql("SELECT 1 as one")
+            .await
+            .unwrap()
+            .write_geoparquet(&ctx, "s3://bucket/out.parquet", options, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not_an_option") && err.contains("AwsOptions"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_geoparquet_applies_options_to_a_registered_store() {
+        // A store registered earlier for the bucket (by an anonymous read, say)
+        // must not swallow the write's own options: the invalid one here is
+        // only rejected if they are applied.
+        let ctx = SedonaContext::new();
+        let anonymous = HashMap::from([
+            ("aws.skip_signature".to_string(), "true".to_string()),
+            ("aws.region".to_string(), "us-west-2".to_string()),
+        ]);
+        ensure_object_store_registered_with_options(
+            &mut ctx.ctx.state(),
+            "s3://bucket/in.parquet",
+            Some(&anonymous),
+        )
+        .await
+        .unwrap();
+        let options = SedonaWriteOptions::new().with_storage_options(HashMap::from([(
+            "aws.not_an_option".to_string(),
+            "true".to_string(),
+        )]));
+        let err = ctx
+            .sql("SELECT 1 as one")
+            .await
+            .unwrap()
+            .write_geoparquet(&ctx, "s3://bucket/out.parquet", options, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not_an_option") && err.contains("AwsOptions"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn geoparquet_format() {
         // Make sure that our context can be set up to identify and read
         // GeoParquet files
@@ -1354,10 +1830,8 @@ mod tests {
             .unwrap();
         assert_eq!(sedona_types.len(), 2);
         assert_eq!(sedona_types[0], SedonaType::Arrow(DataType::Utf8View));
-        assert_eq!(
-            sedona_types[1],
-            SedonaType::WkbView(Edges::Planar, lnglat())
-        );
+        // The example fixture explicitly declares `"crs": null`.
+        assert_eq!(sedona_types[1], SedonaType::WkbView(Edges::Planar, None));
 
         // Ensure read_parquet() works
         let df = ctx
@@ -1371,9 +1845,156 @@ mod tests {
             .unwrap();
         assert_eq!(sedona_types.len(), 2);
         assert_eq!(sedona_types[0], SedonaType::Arrow(DataType::Utf8View));
+        assert_eq!(sedona_types[1], SedonaType::WkbView(Edges::Planar, None));
+
+        // The generic read path resolves the same registered GeoParquet
+        // factory used by SQL URL tables.
+        let df = ctx
+            .read(example, &HashMap::new(), None, false)
+            .await
+            .unwrap();
         assert_eq!(
-            sedona_types[1],
-            SedonaType::WkbView(Edges::Planar, lnglat())
+            df.schema().sedona_types().nth(1).unwrap().unwrap(),
+            SedonaType::WkbView(Edges::Planar, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_csv_with_format_options() {
+        use datafusion::datasource::file_format::csv::CsvFormatFactory;
+
+        let tmpdir = tempdir().unwrap();
+        let csv = tmpdir.path().join("values.csv");
+        std::fs::write(&csv, "id;value\n1;one\n2;two\n").unwrap();
+        let ctx = SedonaContext::new_local_interactive().await.unwrap();
+        let options = HashMap::from([("delimiter".to_string(), ";".to_string())]);
+
+        let batches = ctx
+            .read(csv.to_string_lossy().to_string(), &options, None, false)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_batches_eq!(
+            [
+                "+----+-------+",
+                "| id | value |",
+                "+----+-------+",
+                "| 1  | one   |",
+                "| 2  | two   |",
+                "+----+-------+",
+            ],
+            &batches
+        );
+
+        // An explicit factory is usable without resolving it from the session
+        // registry, including for a path whose suffix does not identify it.
+        let extensionless = tmpdir.path().join("values.data");
+        std::fs::write(&extensionless, "id;value\n3;three\n").unwrap();
+        let batches = ctx
+            .read(
+                extensionless.to_string_lossy().to_string(),
+                &options,
+                Some(Arc::new(CsvFormatFactory::new())),
+                false,
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_batches_eq!(
+            [
+                "+----+-------+",
+                "| id | value |",
+                "+----+-------+",
+                "| 3  | three |",
+                "+----+-------+",
+            ],
+            &batches
+        );
+    }
+
+    #[tokio::test]
+    async fn read_directory_with_explicit_format_filters_by_extension() {
+        let tmpdir = tempdir().unwrap();
+        std::fs::write(tmpdir.path().join("included.csv"), "id,value\n1,one\n").unwrap();
+        std::fs::write(tmpdir.path().join("ignored.txt"), "id,value\n2,two\n").unwrap();
+
+        let ctx = SedonaContext::new_local_interactive().await.unwrap();
+        let path = tmpdir.path().to_string_lossy().to_string();
+        let format = || Some(Arc::new(CsvFormatFactory::new()) as Arc<dyn FileFormatFactory>);
+
+        let batches = ctx
+            .read(path, &HashMap::new(), format(), false)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        assert_batches_eq!(
+            [
+                "+----+-------+",
+                "| id | value |",
+                "+----+-------+",
+                "| 1  | one   |",
+                "+----+-------+",
+            ],
+            &batches
+        );
+    }
+
+    #[tokio::test]
+    async fn read_explicit_json_and_parquet_without_expected_extension() {
+        let tmpdir = tempdir().unwrap();
+        let ctx = SedonaContext::new_local_interactive().await.unwrap();
+
+        let json = tmpdir.path().join("records");
+        std::fs::write(&json, "{\"id\":1,\"value\":\"one\"}\n").unwrap();
+        let json_format = ctx.ctx.state().get_file_format_factory("json").unwrap();
+        let batches = ctx
+            .read(
+                json.to_string_lossy().to_string(),
+                &HashMap::new(),
+                Some(json_format),
+                false,
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_batches_eq!(
+            [
+                "+----+-------+",
+                "| id | value |",
+                "+----+-------+",
+                "| 1  | one   |",
+                "+----+-------+",
+            ],
+            &batches
+        );
+
+        let source = test_geoparquet("example", "geometry").unwrap();
+        let parquet = tmpdir.path().join("items");
+        std::fs::copy(source, &parquet).unwrap();
+        let parquet_format = ctx.ctx.state().get_file_format_factory("parquet").unwrap();
+        let df = ctx
+            .read(
+                parquet.to_string_lossy().to_string(),
+                &HashMap::new(),
+                Some(parquet_format),
+                false,
+            )
+            .await
+            .unwrap();
+        // The example fixture explicitly declares `"crs": null`.
+        assert_eq!(
+            df.schema().sedona_types().nth(1).unwrap().unwrap(),
+            SedonaType::WkbView(Edges::Planar, None)
         );
     }
 
@@ -1540,6 +2161,52 @@ mod tests {
         assert_eq!(opts.spatial_join.spilled_batch_in_memory_size_threshold, 0);
     }
 
+    #[tokio::test]
+    async fn raster_cache_budget_follows_the_memory_limit() {
+        use crate::context_builder::SedonaContextBuilder;
+        use sedona_common::option::SedonaOptions;
+
+        // 1 GiB limit: an eighth of it, below the 512 MiB default.
+        let ctx = SedonaContextBuilder::new()
+            .with_memory_limit(1024 * 1024 * 1024)
+            .build()
+            .await
+            .unwrap();
+        let state = ctx.ctx.state();
+        let opts = state
+            .config_options()
+            .extensions
+            .get::<SedonaOptions>()
+            .unwrap();
+        assert_eq!(opts.raster.cache_max_bytes, 128 * 1024 * 1024);
+        assert_eq!(ctx.raster_chunk_cache().max_bytes(), 128 * 1024 * 1024);
+
+        // 16 GiB limit: capped at the default.
+        let ctx = SedonaContextBuilder::new()
+            .with_memory_limit(16 * 1024 * 1024 * 1024)
+            .build()
+            .await
+            .unwrap();
+        let state = ctx.ctx.state();
+        let opts = state
+            .config_options()
+            .extensions
+            .get::<SedonaOptions>()
+            .unwrap();
+        assert_eq!(opts.raster.cache_max_bytes, DEFAULT_RASTER_CACHE_MAX_BYTES);
+
+        // No limit: the default.
+        let ctx = SedonaContextBuilder::new()
+            .without_memory_limit()
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.raster_chunk_cache().max_bytes(),
+            DEFAULT_RASTER_CACHE_MAX_BYTES
+        );
+    }
+
     /// Test geography literal bounding via the WkbBounder2DFactory → SpatialFilterFactory path.
     ///
     /// This covers antimeridian wraparound, distance expansion (~100km), and NULL handling.
@@ -1691,5 +2358,143 @@ mod tests {
             "noop pipeline should preserve coordinates: {:?}",
             coord2
         );
+    }
+
+    /// Builds a one-row table `t(rast)` whose raster has one OutDb band
+    /// served by `format`, registered on `ctx`.
+    async fn register_outdb_table(ctx: &SedonaContext, uri: &str, format: &str) {
+        use arrow_array::RecordBatch;
+        use sedona_raster::builder::{RasterBuilder, StartBandArgs};
+        use sedona_schema::raster::BandDataType;
+
+        let mut b = RasterBuilder::new(1);
+        b.start_raster_nd(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0], &["y", "x"], &[4, 8], None)
+            .unwrap();
+        b.start_band(StartBandArgs {
+            name: Some("band0"),
+            outdb_uri: Some(uri),
+            outdb_format: Some(format),
+            ..StartBandArgs::new(&["y", "x"], &[4, 8], BandDataType::UInt8)
+        })
+        .unwrap();
+        b.band_data_writer().append_value([0u8; 0]);
+        b.finish_band().unwrap();
+        b.finish_raster().unwrap();
+        let rasters: ArrayRef = Arc::new(b.finish().unwrap());
+        let field = SedonaType::Raster.to_storage_field("rast", true).unwrap();
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema, vec![rasters]).unwrap();
+        ctx.ctx.register_batch("t", batch).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raster_io_budget_is_shared_and_follows_the_session_setting() {
+        let ctx = SedonaContext::new();
+        let budget = ctx.raster_io_budget().clone();
+        assert_eq!(
+            budget.limit(),
+            sedona_common::option::DEFAULT_RASTER_IO_CONCURRENCY
+        );
+        let state = ctx.ctx.state();
+        let extension = state
+            .config()
+            .options()
+            .extensions
+            .get::<RasterLoaderConfig>()
+            .unwrap();
+        assert!(extension.io_budget().ptr_eq(&budget));
+
+        let path = sedona_testing::data::test_raster("test4.tiff").unwrap();
+        let run = |sql: String| {
+            let ctx = ctx.ctx.clone();
+            async move { ctx.sql(&sql).await.unwrap().collect().await.unwrap() }
+        };
+
+        // RS_FromPath applies the setting before it opens.
+        run("SET sedona.raster.io_concurrency = 3".to_string()).await;
+        run(format!("SELECT RS_Width(RS_FromPath('{path}'))")).await;
+        assert_eq!(budget.limit(), 3);
+        assert!(budget.peak_in_use() >= 1);
+
+        // So does RS_EnsureLoaded, before the GDAL loader reads pixels.
+        run("SET sedona.raster.io_concurrency = 5".to_string()).await;
+        run(format!("SELECT RS_EnsureLoaded(RS_FromPath('{path}'))")).await;
+        assert_eq!(budget.limit(), 5);
+        assert_eq!(budget.in_use(), 0);
+        assert_eq!(budget.available(), 5);
+    }
+
+    #[tokio::test]
+    async fn rs_ensureloaded_serves_repeated_queries_from_the_chunk_cache() {
+        use arrow_buffer::Buffer;
+        use sedona_raster::raster_loader::{
+            AsyncRasterLoader, RasterLoadRequest, RasterLoadResult,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Counts the requests it serves.
+        #[derive(Debug, Default)]
+        struct CountingLoader {
+            requests: AtomicUsize,
+        }
+        #[async_trait]
+        impl AsyncRasterLoader for CountingLoader {
+            fn name(&self) -> &str {
+                "counting"
+            }
+            fn supports_format(&self, format: Option<&str>) -> bool {
+                format == Some("counting")
+            }
+            async fn load(
+                &self,
+                reqs: &[&RasterLoadRequest],
+            ) -> std::result::Result<Vec<RasterLoadResult>, arrow_schema::ArrowError> {
+                self.requests.fetch_add(reqs.len(), Ordering::Relaxed);
+                Ok(reqs
+                    .iter()
+                    .map(|req| RasterLoadResult::unresolved(Buffer::from_vec(vec![9u8; 32]), req))
+                    .collect())
+            }
+        }
+
+        let ctx = SedonaContext::new();
+        let loader = Arc::new(CountingLoader::default());
+        ctx.register_raster_loader(loader.clone());
+        register_outdb_table(&ctx, "counting://a", "counting").await;
+
+        let run = |ctx: &SedonaContext| {
+            let ctx = ctx.ctx.clone();
+            async move {
+                ctx.sql("SELECT RS_EnsureLoaded(rast) FROM t")
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // First query loads; the second is served from the cache.
+        run(&ctx).await;
+        run(&ctx).await;
+        assert_eq!(loader.requests.load(Ordering::Relaxed), 1);
+        let stats = ctx.raster_chunk_cache().stats();
+        assert_eq!((stats.inserts, stats.hits), (1, 1));
+        // The pool is charged for the cached allocation while it lives.
+        assert_eq!(ctx.ctx.runtime_env().memory_pool.reserved(), 32);
+
+        // Disabling the cache from SQL takes effect on the next call and
+        // drops what was held.
+        ctx.ctx
+            .sql("SET sedona.raster.cache_max_bytes = 0")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        run(&ctx).await;
+        assert_eq!(loader.requests.load(Ordering::Relaxed), 2);
+        assert_eq!(ctx.raster_chunk_cache().stats().entries, 0);
+        assert_eq!(ctx.ctx.runtime_env().memory_pool.reserved(), 0);
     }
 }

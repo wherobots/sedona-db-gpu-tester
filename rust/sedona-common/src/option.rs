@@ -18,10 +18,10 @@ use std::fmt::Display;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use datafusion_common::Result;
 use datafusion_common::config::{
     ConfigEntry, ConfigExtension, ConfigField, ConfigOptions, ExtensionOptions, Visit,
 };
-use datafusion_common::Result;
 use datafusion_common::{config_err, config_namespace};
 use regex::Regex;
 use sedona_geometry::bounding_box::BoundingBox;
@@ -37,6 +37,26 @@ pub const DEFAULT_SPECULATIVE_THRESHOLD: usize = 1000;
 /// Default minimum number of points per geometry to use prepared geometries for the build side.
 pub const DEFAULT_MIN_POINTS_FOR_BUILD_PREPARATION: usize = 50;
 
+/// Default `sedona.raster.cache_max_bytes` when no memory limit is
+/// configured: 512 MiB.
+pub const DEFAULT_RASTER_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+/// Default `sedona.raster.io_concurrency`: blocking raster file operations
+/// (`RS_FromPath` header opens and GDAL pixel reads together) in flight at
+/// once across a session.
+///
+/// Chosen on 640 public 1113 × 1113 uint8 COGs read unsigned from S3 over a
+/// home connection (Apple M-series, 12 cores), all in one batch. A query that
+/// only opens the files (`RS_Width(RS_FromPath(p))`) took 10.4 s at 16,
+/// 9.1-9.4 s at 32 and 9.6 s at 64. One that opens and then reads every file
+/// (`RS_SummaryStats(RS_FromPath(p), 'mean', 1)`) took 24.4-24.7 s at 16,
+/// 19.8-21.3 s at 32, 18.3-20.0 s at 64 and 22.0-24.4 s at 128. 64 is as
+/// many files as the two separate budgets of 32 this one replaced could
+/// have in flight together. Each file in flight holds a thread and an open
+/// dataset; memory in flight does not grow with the budget, since
+/// `RS_EnsureLoaded` already bounds the bytes of a batch.
+pub const DEFAULT_RASTER_IO_CONCURRENCY: usize = 64;
+
 config_namespace! {
     /// Configuration options for Sedona.
     pub struct SedonaOptions {
@@ -48,6 +68,92 @@ config_namespace! {
 
         /// Options for configuring GDAL usage
         pub gdal: GdalOptions, default = GdalOptions::default()
+
+        /// Options for raster execution
+        pub raster: RasterOptions, default = RasterOptions::default()
+
+        /// Options for exchanging tables and execution plans across FFI
+        pub ffi: FfiOptions, default = FfiOptions::default()
+    }
+}
+
+/// Default byte budget for a batch of materialized rasters when no memory
+/// limit is configured. `SedonaContext` lowers it to a fraction of the
+/// per-partition memory limit when one is.
+pub const DEFAULT_RASTER_MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
+
+config_namespace! {
+    /// Configuration options for raster execution.
+    pub struct RasterOptions {
+        /// Byte budget for one batch of materialized rasters, **per partition**.
+        /// `RS_EnsureLoaded` slices each input batch so that the estimated bytes
+        /// of the rasters it materializes (sum over bands of source shape × pixel
+        /// size, taken from band metadata) stay within this budget, emitting each
+        /// slice as its own batch instead of trusting the row-count
+        /// `datafusion.execution.batch_size`. A single row larger than the budget
+        /// is still processed, on its own. `0` disables the slicing.
+        ///
+        /// It is not a global cap: every partition streams its own batches, and a
+        /// pipeline typically holds two or three of them at once (the one being
+        /// built, the one the consumer is working on, and whatever a downstream
+        /// operator buffers), so the loaded pixels in flight across a query are
+        /// roughly `target_partitions × 3 × max_batch_bytes`.
+        ///
+        /// The default is 256 MiB. When a memory limit is configured,
+        /// `SedonaContext` derives a lower default at session construction:
+        /// `min(256 MiB, max(16 MiB, (memory_limit / target_partitions) / 8))`,
+        /// i.e. one eighth of each partition's share of the limit, floored at
+        /// 16 MiB. For example:
+        ///
+        /// | memory limit | target_partitions | per-partition share | budget  |
+        /// |--------------|-------------------|---------------------|---------|
+        /// | none         | any               | —                   | 256 MiB |
+        /// | 16 GiB       | 8                 | 2 GiB               | 256 MiB |
+        /// | 16 GiB       | 16                | 1 GiB               | 128 MiB |
+        /// | 16 GiB       | 64                | 256 MiB             | 32 MiB  |
+        /// | 2 GiB        | 16                | 128 MiB             | 16 MiB  |
+        ///
+        /// A `SET sedona.raster.max_batch_bytes = …` after connecting overrides
+        /// whichever default was derived.
+        pub max_batch_bytes: usize, default = DEFAULT_RASTER_MAX_BATCH_BYTES
+
+        /// Budget, in bytes, for the session's cache of loaded OutDb band
+        /// bytes (`RS_EnsureLoaded` results, one entry per `outdb_uri` and
+        /// data type). The budget counts only entries no in-flight batch
+        /// still references; bytes shared with a running query are the
+        /// query's cost, not the cache's, and are given back once the query
+        /// drops them. When a memory limit is configured the session lowers
+        /// the default to `min(512 MiB, limit / 8)`. Set to 0 to disable
+        /// the cache. Takes effect on the next `RS_EnsureLoaded` call.
+        ///
+        /// The cache assumes the bytes behind a URI do not change for the
+        /// life of the session. After rewriting a store that a query already
+        /// read, set this to 0 and back to drop the stale entries.
+        pub cache_max_bytes: usize, default = DEFAULT_RASTER_CACHE_MAX_BYTES
+
+        /// Most blocking raster file operations in flight at once, across
+        /// every query and partition of the session. Opening a file for
+        /// `RS_FromPath` and reading an OutDb file's pixels through GDAL
+        /// (`RS_EnsureLoaded`) each take one slot for as long as the file is
+        /// open; both draw on this one budget. On object storage each file
+        /// is a chain of round trips, so files are worked on concurrently up
+        /// to this limit. Each file in flight holds a thread and an open
+        /// dataset. Values below 1 are treated as 1. Takes effect on the next
+        /// `RS_FromPath` or `RS_EnsureLoaded` call; operations already in
+        /// flight finish before a lower limit is enforced.
+        ///
+        /// Zarr stores are read with async object-store requests rather than
+        /// blocking file operations, and have their own limit.
+        pub io_concurrency: usize, default = DEFAULT_RASTER_IO_CONCURRENCY
+    }
+}
+
+config_namespace! {
+    /// Configuration options for Sedona's FFI interfaces.
+    pub struct FfiOptions {
+        /// Use the experimental Arrow async-device stream interface when
+        /// importing a table provider or execution plan across FFI.
+        pub use_async: bool, default = false
     }
 }
 
@@ -350,9 +456,9 @@ impl ConfigField for ExecutionMode {
                     };
                     ExecutionMode::Speculative(n)
                 } else {
-                    return Err(datafusion_common::DataFusionError::Configuration(
-                        format!("Unknown execution mode: {value}. Expected formats: prepare_none, prepare_build, prepare_probe, auto, auto[number]")
-                    ));
+                    return Err(datafusion_common::DataFusionError::Configuration(format!(
+                        "Unknown execution mode: {value}. Expected formats: prepare_none, prepare_build, prepare_probe, auto, auto[number]"
+                    )));
                 }
             }
         };
@@ -712,5 +818,14 @@ mod tests {
             err_msg.contains("Can't set sedona.runtime from SQL"),
             "Unexpected error message: {err_msg}"
         );
+    }
+
+    #[test]
+    fn test_ffi_use_async_option() {
+        let mut options = SedonaOptions::default();
+        assert!(!options.ffi.use_async);
+
+        <SedonaOptions as ConfigField>::set(&mut options, "ffi.use_async", "true").unwrap();
+        assert!(options.ffi.use_async);
     }
 }

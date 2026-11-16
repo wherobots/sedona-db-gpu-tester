@@ -18,11 +18,11 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema};
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{exec_datafusion_err, DataFusionError, Result, ScalarValue};
+use datafusion_common::{DataFusionError, Result, ScalarValue, exec_datafusion_err};
 use datafusion_expr::{Expr, Operator};
 use datafusion_physical_expr::{
-    expressions::{BinaryExpr, Column, Literal},
     PhysicalExpr, ScalarFunctionExpr,
+    expressions::{BinaryExpr, Column, Literal},
 };
 use geo_traits::Dimensions;
 use sedona_common::sedona_internal_err;
@@ -36,7 +36,7 @@ use sedona_schema::{datatypes::SedonaType, schema::SedonaSchema};
 use crate::{
     metadata_preserving_column::MetadataPreservingColumn,
     statistics::GeoStatistics,
-    utils::{parse_distance_predicate, ParsedDistancePredicate},
+    utils::{ParsedDistancePredicate, parse_distance_predicate},
 };
 
 /// Simplified parsed spatial filter
@@ -96,7 +96,7 @@ impl SpatialFilter {
                 return bounds;
             }
             SpatialFilter::LiteralFalse => {
-                return BoundingBox::xy(Interval::empty(), Interval::empty())
+                return BoundingBox::xy(Interval::empty(), Interval::empty());
             }
             SpatialFilter::HasZ(_) | SpatialFilter::Unknown => {}
         }
@@ -146,12 +146,11 @@ impl SpatialFilter {
     }
 
     fn evaluate_has_z(column_stats: &GeoStatistics) -> bool {
-        if let Some(bbox) = column_stats.bbox() {
-            if let Some(z) = bbox.z() {
-                if z.is_empty() {
-                    return false;
-                }
-            }
+        if let Some(bbox) = column_stats.bbox()
+            && let Some(z) = bbox.z()
+            && z.is_empty()
+        {
+            return false;
         }
 
         if let Some(geometry_types) = column_stats.geometry_types() {
@@ -442,7 +441,9 @@ impl SpatialFilterFactory {
         };
 
         match sedona_type {
-            SedonaType::Wkb(edges, _) | SedonaType::WkbView(edges, _) => {
+            SedonaType::Wkb(edges, _)
+            | SedonaType::WkbLarge(edges, _)
+            | SedonaType::WkbView(edges, _) => {
                 self.bounder_factory.bounder_for_edge_type(edges).is_some()
             }
             _ => false,
@@ -457,11 +458,13 @@ impl SpatialFilterFactory {
         let sedona_type = SedonaType::from_storage_field(&literal_field)?;
 
         let edges = match sedona_type {
-            SedonaType::Wkb(edges, _) | SedonaType::WkbView(edges, _) => edges,
+            SedonaType::Wkb(edges, _)
+            | SedonaType::WkbLarge(edges, _)
+            | SedonaType::WkbView(edges, _) => edges,
             _ => {
                 return sedona_internal_err!(
                     "Unexpected scalar type in filter expression ({sedona_type:?})"
-                )
+                );
             }
         };
 
@@ -470,7 +473,9 @@ impl SpatialFilterFactory {
         };
 
         let wkb_bytes = match literal.value() {
-            ScalarValue::Binary(maybe_vec) | ScalarValue::BinaryView(maybe_vec) => {
+            ScalarValue::Binary(maybe_vec)
+            | ScalarValue::LargeBinary(maybe_vec)
+            | ScalarValue::BinaryView(maybe_vec) => {
                 if let Some(vec) = maybe_vec {
                     vec
                 } else {
@@ -480,7 +485,7 @@ impl SpatialFilterFactory {
             _ => {
                 return sedona_internal_err!(
                     "Unexpected scalar type in filter expression ({sedona_type:?})"
-                )
+                );
             }
         };
 
@@ -683,7 +688,7 @@ mod test {
     use arrow_schema::{DataType, Field};
     use datafusion_common::config::ConfigOptions;
     use datafusion_expr::{
-        expr::ScalarFunction, ScalarUDF, Signature, SimpleScalarUDF, Volatility,
+        ScalarUDF, Signature, SimpleScalarUDF, Volatility, expr::ScalarFunction,
     };
     use rstest::rstest;
     use sedona_geometry::{bounding_box::BoundingBox, interval::Interval};
@@ -738,21 +743,27 @@ mod test {
         );
         let col0 = Column::new("col0", 0);
 
-        assert!(SpatialFilter::Intersects(col0.clone(), bounds.clone())
-            .evaluate(&stats_no_info)
-            .unwrap());
-        assert!(SpatialFilter::Intersects(col0.clone(), bounds.clone())
-            .evaluate(&stats_intersecting)
-            .unwrap());
+        assert!(
+            SpatialFilter::Intersects(col0.clone(), bounds.clone())
+                .evaluate(&stats_no_info)
+                .unwrap()
+        );
+        assert!(
+            SpatialFilter::Intersects(col0.clone(), bounds.clone())
+                .evaluate(&stats_intersecting)
+                .unwrap()
+        );
 
         let stats_empty_bbox = TableGeoStatistics::from(
             GeoStatistics::unspecified()
                 .with_bbox(Some(BoundingBox::xy(Interval::empty(), Interval::empty()))),
         );
 
-        assert!(!SpatialFilter::Intersects(col0.clone(), bounds.clone())
-            .evaluate(&stats_empty_bbox)
-            .unwrap());
+        assert!(
+            !SpatialFilter::Intersects(col0.clone(), bounds.clone())
+                .evaluate(&stats_empty_bbox)
+                .unwrap()
+        );
 
         let unrelated_literal = Literal::new(ScalarValue::Null);
 
@@ -787,15 +798,21 @@ mod test {
         let col0 = Column::new("col0", 0);
 
         // Covers should return true when column bbox is fully contained in literal bounds
-        assert!(SpatialFilter::Covers(col0.clone(), bounds.clone())
-            .evaluate(&stats_no_info)
-            .unwrap());
-        assert!(SpatialFilter::Covers(col0.clone(), bounds.clone())
-            .evaluate(&stats_covered)
-            .unwrap());
-        assert!(!SpatialFilter::Covers(col0.clone(), bounds.clone())
-            .evaluate(&stats_not_covered)
-            .unwrap());
+        assert!(
+            SpatialFilter::Covers(col0.clone(), bounds.clone())
+                .evaluate(&stats_no_info)
+                .unwrap()
+        );
+        assert!(
+            SpatialFilter::Covers(col0.clone(), bounds.clone())
+                .evaluate(&stats_covered)
+                .unwrap()
+        );
+        assert!(
+            !SpatialFilter::Covers(col0.clone(), bounds.clone())
+                .evaluate(&stats_not_covered)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -833,47 +850,61 @@ mod test {
 
     #[test]
     fn predicate_other() {
-        assert!(!SpatialFilter::LiteralFalse
+        assert!(
+            !SpatialFilter::LiteralFalse
+                .evaluate(&TableGeoStatistics::empty())
+                .unwrap()
+        );
+        assert!(
+            SpatialFilter::Unknown
+                .evaluate(&TableGeoStatistics::empty())
+                .unwrap()
+        );
+
+        assert!(
+            SpatialFilter::And(
+                Box::new(SpatialFilter::Unknown),
+                Box::new(SpatialFilter::Unknown)
+            )
             .evaluate(&TableGeoStatistics::empty())
-            .unwrap());
-        assert!(SpatialFilter::Unknown
+            .unwrap()
+        );
+
+        assert!(
+            !SpatialFilter::And(
+                Box::new(SpatialFilter::Unknown),
+                Box::new(SpatialFilter::LiteralFalse)
+            )
             .evaluate(&TableGeoStatistics::empty())
-            .unwrap());
+            .unwrap()
+        );
 
-        assert!(SpatialFilter::And(
-            Box::new(SpatialFilter::Unknown),
-            Box::new(SpatialFilter::Unknown)
-        )
-        .evaluate(&TableGeoStatistics::empty())
-        .unwrap());
+        assert!(
+            SpatialFilter::Or(
+                Box::new(SpatialFilter::Unknown),
+                Box::new(SpatialFilter::Unknown)
+            )
+            .evaluate(&TableGeoStatistics::empty())
+            .unwrap()
+        );
 
-        assert!(!SpatialFilter::And(
-            Box::new(SpatialFilter::Unknown),
-            Box::new(SpatialFilter::LiteralFalse)
-        )
-        .evaluate(&TableGeoStatistics::empty())
-        .unwrap());
+        assert!(
+            SpatialFilter::Or(
+                Box::new(SpatialFilter::Unknown),
+                Box::new(SpatialFilter::LiteralFalse)
+            )
+            .evaluate(&TableGeoStatistics::empty())
+            .unwrap()
+        );
 
-        assert!(SpatialFilter::Or(
-            Box::new(SpatialFilter::Unknown),
-            Box::new(SpatialFilter::Unknown)
-        )
-        .evaluate(&TableGeoStatistics::empty())
-        .unwrap());
-
-        assert!(SpatialFilter::Or(
-            Box::new(SpatialFilter::Unknown),
-            Box::new(SpatialFilter::LiteralFalse)
-        )
-        .evaluate(&TableGeoStatistics::empty())
-        .unwrap());
-
-        assert!(!SpatialFilter::Or(
-            Box::new(SpatialFilter::LiteralFalse),
-            Box::new(SpatialFilter::LiteralFalse)
-        )
-        .evaluate(&TableGeoStatistics::empty())
-        .unwrap());
+        assert!(
+            !SpatialFilter::Or(
+                Box::new(SpatialFilter::LiteralFalse),
+                Box::new(SpatialFilter::LiteralFalse)
+            )
+            .evaluate(&TableGeoStatistics::empty())
+            .unwrap()
+        );
     }
 
     #[test]
@@ -1265,11 +1296,13 @@ mod test {
             Arc::new(Field::new("", DataType::Boolean, true)),
             Arc::new(ConfigOptions::default()),
         ));
-        assert!(factory
-            .try_from_expr(&expr_no_args)
-            .unwrap_err()
-            .message()
-            .contains("unexpected argument count"));
+        assert!(
+            factory
+                .try_from_expr(&expr_no_args)
+                .unwrap_err()
+                .message()
+                .contains("unexpected argument count")
+        );
 
         // Unsupported arg types
         let expr_wrong_types: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
@@ -1428,11 +1461,13 @@ mod test {
             Arc::new(Field::new("", DataType::Boolean, true)),
             Arc::new(ConfigOptions::default()),
         ));
-        assert!(factory
-            .try_from_expr(&expr_no_args)
-            .unwrap_err()
-            .message()
-            .contains("unexpected argument count"));
+        assert!(
+            factory
+                .try_from_expr(&expr_no_args)
+                .unwrap_err()
+                .message()
+                .contains("unexpected argument count")
+        );
 
         // Wrong arg types
         let expr_wrong_types: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(

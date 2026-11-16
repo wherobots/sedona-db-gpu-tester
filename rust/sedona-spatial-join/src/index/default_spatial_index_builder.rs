@@ -17,7 +17,7 @@
 
 use arrow::array::BooleanBufferBuilder;
 use arrow_schema::SchemaRef;
-use sedona_common::{sedona_internal_err, SpatialJoinOptions};
+use sedona_common::{SpatialJoinOptions, sedona_internal_err};
 use sedona_expr::statistics::GeoStatistics;
 use sedona_geometry::interval::{Interval, IntervalTrait};
 use std::sync::Arc;
@@ -26,16 +26,18 @@ use crate::index::spatial_index::SpatialIndexRef;
 use crate::index::spatial_index_builder::{SpatialIndexBuilder, SpatialJoinBuildMetrics};
 use crate::refine::{DefaultIndexQueryResultRefinerFactory, IndexQueryResultRefinerFactory};
 use crate::{
-    evaluated_batch::{evaluated_batch_stream::SendableEvaluatedBatchStream, EvaluatedBatch},
+    evaluated_batch::{EvaluatedBatch, evaluated_batch_stream::SendableEvaluatedBatchStream},
     index::{default_spatial_index::DefaultSpatialIndex, knn_adapter::KnnComponents},
     spatial_predicate::SpatialPredicate,
-    utils::join_utils::need_produce_result_in_final,
+    utils::join_utils::{
+        build_side_for_predicate, emission_join_type, need_produce_result_in_final,
+    },
 };
 use async_trait::async_trait;
-use datafusion_common::{utils::proxy::VecAllocExt, Result};
+use datafusion_common::{Result, utils::proxy::VecAllocExt};
 use datafusion_expr::JoinType;
 use futures::StreamExt;
-use geo_index::rtree::{sort::HilbertSort, RTree, RTreeBuilder, RTreeIndex};
+use geo_index::rtree::{RTree, RTreeBuilder, RTreeIndex, sort::HilbertSort};
 use parking_lot::Mutex;
 use std::sync::atomic::AtomicUsize;
 
@@ -235,7 +237,13 @@ impl DefaultSpatialIndexBuilder {
 
     /// Build visited bitmaps for tracking left-side indices in outer joins.
     fn build_visited_bitmaps(&mut self) -> Result<Option<Mutex<Vec<BooleanBufferBuilder>>>> {
-        if !need_produce_result_in_final(self.join_type) {
+        // KNN may build on the SQL right; use emission join type so visited bitmaps
+        // track unmatched *build* rows only when the outer-join preserved side is build.
+        let emission_jt = emission_join_type(
+            self.join_type,
+            build_side_for_predicate(&self.spatial_predicate),
+        );
+        if !need_produce_result_in_final(emission_jt) {
             return Ok(None);
         }
 

@@ -20,10 +20,13 @@ use std::{
 };
 
 use arrow_schema::DataType;
+use datafusion::{dataframe::DataFrame, datasource::provider_as_source};
+use datafusion_expr::LogicalPlanBuilder;
 use datafusion_expr::ScalarUDFImpl;
 use pyo3::prelude::*;
 use sedona::context::SedonaContext;
 use sedona::context_builder::SedonaContextBuilder;
+use sedona_common::SedonaOptions;
 use sedona_datasource::format::ExternalFormatFactory;
 use sedona_extension::runtime::RuntimeHandle;
 
@@ -31,7 +34,7 @@ use crate::{
     dataframe::InternalDataFrame,
     datasource::PyExternalFormat,
     error::PySedonaError,
-    import_from::import_table_provider_from_any,
+    import_from::{import_sedona_ffi_catalog_list, import_table_provider_from_any},
     raster_loader::PyRasterLoaderWrapper,
     runtime::wait_for_future,
     udf::{PyAggregateUdf, PyScalarUdf, PySedonaAggregateUdf, PySedonaScalarUdf},
@@ -54,6 +57,8 @@ fn stringify_options(
         .filter_map(|(k, v)| {
             if v.is_none(py) {
                 None
+            } else if let Ok(value) = v.extract::<bool>(py) {
+                Some((k, value.to_string()))
             } else {
                 v.bind(py)
                     .str()
@@ -122,8 +127,25 @@ impl InternalContext {
         obj: &Bound<PyAny>,
         requested_schema: Option<&Bound<PyAny>>,
     ) -> Result<InternalDataFrame, PySedonaError> {
-        let provider = import_table_provider_from_any(py, obj, requested_schema)?;
-        let df = self.inner.ctx.read_table(provider)?;
+        let use_async_execution = self
+            .inner
+            .ctx
+            .state()
+            .config_options()
+            .extensions
+            .get::<SedonaOptions>()
+            .map(|options| options.ffi.use_async)
+            .unwrap_or(false);
+        let (provider, table_reference) =
+            import_table_provider_from_any(py, obj, requested_schema, use_async_execution)?;
+        let df = if let Some(table_reference) = table_reference {
+            let plan =
+                LogicalPlanBuilder::scan(table_reference, provider_as_source(provider), None)?
+                    .build()?;
+            DataFrame::new(self.inner.ctx.state(), plan)
+        } else {
+            self.inner.ctx.read_table(provider)?
+        };
         Ok(InternalDataFrame::new(df, self.runtime.clone()))
     }
 
@@ -194,6 +216,48 @@ impl InternalContext {
             ),
         )??;
 
+        Ok(InternalDataFrame::new(df, self.runtime.clone()))
+    }
+
+    pub fn read<'py>(
+        &self,
+        py: Python<'py>,
+        table_paths: Vec<String>,
+        options: HashMap<String, Py<PyAny>>,
+        format: Option<&str>,
+        check_extension: bool,
+        partitioning: Option<Vec<String>>,
+    ) -> Result<InternalDataFrame, PySedonaError> {
+        let rust_options = stringify_options(py, options);
+        let format = format
+            .map(|format| format.trim_start_matches('.').to_lowercase())
+            .map(|format| {
+                self.inner
+                    .ctx
+                    .state()
+                    .get_file_format_factory(&format)
+                    .ok_or_else(|| {
+                        PySedonaError::SedonaPython(format!(
+                            "No format registered for extension '{format}'"
+                        ))
+                    })
+            })
+            .transpose()?;
+        let df = wait_for_future(
+            py,
+            &self.runtime,
+            self.inner.read_with_partitioning(
+                table_paths,
+                &rust_options,
+                format,
+                check_extension,
+                partitioning.map(|cols| {
+                    cols.into_iter()
+                        .map(|name| (name, DataType::Utf8View))
+                        .collect()
+                }),
+            ),
+        )??;
         Ok(InternalDataFrame::new(df, self.runtime.clone()))
     }
 
@@ -357,7 +421,16 @@ impl InternalContext {
                 .extract::<PyRasterLoaderWrapper>()?;
             self.inner.register_raster_loader(wrapper.inner);
             return Ok(());
-        } else if component.hasattr("__sedonadb_scalar_udf__")? {
+        } else if component.hasattr("__sedonadb_catalog_list__")? {
+            let foreign = Arc::new(import_sedona_ffi_catalog_list(
+                &component,
+                self.runtime.clone(),
+            )?);
+            self.inner.register_catalog_list(foreign);
+            return Ok(());
+        } else if component.hasattr("__sedonadb_scalar_udf_v2__")?
+            || component.hasattr("__sedonadb_scalar_udf__")?
+        {
             // One function's overload kernels, each a natively-compiled kernel
             // capsule (see import_sedona_ffi_scalar_kernel) all sharing this
             // function's SQL name. `sedona_native_scalar_udf` imports each
@@ -370,17 +443,24 @@ impl InternalContext {
             // function's other overloads stay reachable. This lets a plugin add
             // an overload to an existing function (e.g. an st_intersects
             // overload for a new type) without discarding its other signatures.
-            // Volatility is Immutable via this path; a plugin needing
-            // Volatile/Stable builds a PySedonaScalarUdf with
-            // sedona_native_scalar_udf(..., volatility=...) and returns it
-            // through __sedonadb_internal_udf__ instead.
+            // V2 declarations are preserved and validated when appending kernels.
+            let protocol = if component.hasattr("__sedonadb_scalar_udf_v2__")? {
+                "__sedonadb_scalar_udf_v2__"
+            } else {
+                "__sedonadb_scalar_udf__"
+            };
             let capsules = component
-                .call_method0("__sedonadb_scalar_udf__")?
+                .call_method0(protocol)?
                 .extract::<Vec<Bound<PyAny>>>()?;
-            let py_udf = crate::udf::sedona_native_scalar_udf(capsules, "immutable", None)?;
-            let name = py_udf.inner.name().to_string();
-            let kernels = py_udf.inner.kernels().to_vec();
-            self.inner.append_sedona_scalar_kernels(&name, kernels)?;
+            let py_udf = crate::udf::sedona_native_scalar_udf(capsules, None, None)?;
+            if protocol == "__sedonadb_scalar_udf_v2__" {
+                self.inner.append_sedona_scalar_udf(py_udf.inner)?;
+            } else {
+                self.inner.append_sedona_scalar_kernels(
+                    py_udf.inner.name(),
+                    py_udf.inner.kernels().to_vec(),
+                )?;
+            }
             return Ok(());
         } else if let Ok(py_raster_loader) = component.extract::<PyRasterLoaderWrapper>() {
             self.inner.register_raster_loader(py_raster_loader.inner);

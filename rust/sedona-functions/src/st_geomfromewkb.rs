@@ -18,7 +18,7 @@ use std::{sync::Arc, vec};
 
 use arrow_array::builder::{BinaryBuilder, StringViewBuilder};
 use arrow_schema::DataType;
-use datafusion_common::{error::Result, exec_datafusion_err, ScalarValue};
+use datafusion_common::{ScalarValue, error::Result, exec_datafusion_err};
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_common::sedona_internal_err;
 use sedona_expr::{
@@ -27,7 +27,9 @@ use sedona_expr::{
 };
 use sedona_geometry::{wkb_factory::WKB_MIN_PROBABLE_BYTES, wkb_header::WkbHeader};
 use sedona_schema::{
-    datatypes::{SedonaType, WKB_GEOMETRY, WKB_GEOMETRY_ITEM_CRS, WKB_VIEW_GEOGRAPHY},
+    datatypes::{
+        SedonaType, WKB_GEOMETRY, WKB_GEOMETRY_ITEM_CRS, WKB_LARGE_GEOMETRY, WKB_VIEW_GEOGRAPHY,
+    },
     matchers::ArgMatcher,
 };
 
@@ -62,16 +64,17 @@ impl SedonaScalarKernel for STGeomFromEWKB {
         let iter_type = match &arg_types[0] {
             SedonaType::Arrow(data_type) => match data_type {
                 DataType::Binary => WKB_GEOMETRY,
+                DataType::LargeBinary => WKB_LARGE_GEOMETRY,
                 DataType::BinaryView => WKB_VIEW_GEOGRAPHY,
                 DataType::Null => SedonaType::Arrow(DataType::Null),
                 _ => {
                     return sedona_internal_err!(
                         "Unexpected arguments to invoke_batch: {arg_types:?}"
-                    )
+                    );
                 }
             },
             _ => {
-                return sedona_internal_err!("Unexpected arguments to invoke_batch: {arg_types:?}")
+                return sedona_internal_err!("Unexpected arguments to invoke_batch: {arg_types:?}");
             }
         };
 
@@ -149,7 +152,10 @@ mod tests {
     }
 
     #[rstest]
-    fn udf(#[values(DataType::Binary, DataType::BinaryView)] data_type: DataType) {
+    fn udf(
+        #[values(DataType::Binary, DataType::LargeBinary, DataType::BinaryView)]
+        data_type: DataType,
+    ) {
         let udf = st_geomfromewkb_udf();
         let tester = ScalarUdfTester::new(
             udf.clone().into(),

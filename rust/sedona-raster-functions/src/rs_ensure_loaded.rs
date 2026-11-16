@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `RS_EnsureLoaded(raster) -> raster` — async UDF that materialises
+//! `RS_EnsureLoaded(raster) -> raster` — scalar UDF that materialises
 //! the pixel bytes of any OutDb bands in the input raster column.
 //!
 //! Walks every input row, identifies bands whose `data` column is empty
@@ -24,30 +24,43 @@
 //! and assembles an output `RecordBatch` of the same row count whose
 //! `data` columns are populated with the loaded bytes. InDb bands pass
 //! through unchanged. Other band/raster metadata is preserved verbatim.
+//!
+//! The loaders are async ([`AsyncRasterLoader`]), but the UDF is an
+//! ordinary synchronous `ScalarUDFImpl`: it runs the load on a dedicated
+//! tokio runtime (see [`loader_runtime`]) and blocks the calling thread
+//! until the batch is loaded. A sync UDF is planned and evaluated like any
+//! other scalar function, so it works in every expression position (nested
+//! in another call, in a join filter, in a `CASE` branch) and keeps lazy
+//! evaluation where the enclosing expression is lazy. DataFusion's async
+//! UDFs are restricted to projections, filters and aggregates and are
+//! always evaluated for every row of the batch.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, mpsc};
 
 use arrow_array::{Array, ArrayRef, StructArray};
+use arrow_buffer::Buffer;
 use arrow_schema::{DataType, FieldRef};
-use async_trait::async_trait;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{plan_err, Result};
-use datafusion_expr::async_udf::AsyncScalarUDFImpl;
+use datafusion_common::{Result, plan_err};
 use datafusion_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
+use sedona_common::option::SedonaOptions;
 use sedona_common::{sedona_internal_datafusion_err, sedona_internal_err};
 use sedona_raster::array::RasterStructArray;
 use sedona_raster::builder::{RasterBuilder, RasterOverrides};
+use sedona_raster::chunk_cache::{CachedChunk, ChunkKey, NoChunkCache, RasterChunkCache};
 use sedona_raster::raster_loader::{
     AsyncRasterLoader, RasterLoadRequest, RasterLoadResult, RasterLoaderConfig,
-    RasterLoaderRegistry,
+    RasterLoaderRegistry, io_budget_from_config,
 };
 use sedona_raster::traits::{BandOverrides, Override, RasterRef};
 use sedona_raster::view_entries::ViewEntries;
 use sedona_schema::raster::BandDataType;
+use tokio::runtime::{Builder, Handle, Runtime, RuntimeFlavor};
 
 /// `SedonaScalarUDF` metadata key marking a UDF whose kernels read raster
 /// pixel bytes. A raster function sets it (value `"true"`) via
@@ -63,23 +76,20 @@ pub const NEEDS_PIXELS_METADATA_KEY: &str = "needs_pixels";
 /// already fully materialised in-database. A raster function sets it (value
 /// `"true"`) via `with_metadata`; the `RS_EnsureLoaded` optimizer rule keys
 /// off it to skip wrapping an argument that is itself such a call (its result
-/// is already loaded, so a wrap would be redundant — and, being async, would
-/// nest unhoistably; see apache/datafusion#20031).
+/// is already loaded, so a wrap would be redundant).
 ///
 /// Only set this on functions that guarantee in-database output for loaded
 /// input. Like [`NEEDS_PIXELS_METADATA_KEY`], the optimizer rule carries a
 /// duplicate of the string literal — keep the two in sync.
 pub const RETURNS_BYTES_METADATA_KEY: &str = "returns_bytes";
 
-/// Async UDF that resolves OutDb bands by dispatching through the
+/// Scalar UDF that resolves OutDb bands by dispatching through the
 /// [`RasterLoaderRegistry`] stashed in `ConfigOptions` as a
 /// [`RasterLoaderConfig`] extension. The UDF instance itself is
 /// session-agnostic — it pulls the registry handle out of
 /// `args.config_options.extensions.get::<RasterLoaderConfig>()` at
-/// dispatch time. This matches DataFusion's
-/// `AsyncScalarUDFImpl::invoke_async_with_args` surface (only
-/// `Arc<ConfigOptions>` is reachable from the async fn) and mirrors how
-/// `SedonaRuntime` flows through the session's options.
+/// dispatch time, which mirrors how `SedonaRuntime` flows through the
+/// session's options.
 #[derive(Debug)]
 pub struct RsEnsureLoaded {
     signature: Signature,
@@ -96,20 +106,118 @@ impl RsEnsureLoaded {
         Self {
             // `any(1, ...)` accepts whatever single-arg type the caller
             // passes; we validate "argument is a Raster Struct" in
-            // `return_type` and at runtime. Using `Signature::any` (vs.
-            // `Signature::user_defined`) sidesteps DataFusion's
-            // `coerce_types` call path, which `AsyncScalarUDF` doesn't
-            // delegate to the inner impl.
+            // `return_field_from_args` and at runtime.
             //
             // `Stable` (not `Volatile`) so DataFusion's CSE pass can
             // deduplicate identical RS_EnsureLoaded(col) calls injected
-            // by the analyzer rule. Semantic: within a single query the
+            // by the optimizer rule. Semantic: within a single query the
             // byte materialisation is deterministic for fixed inputs;
             // across queries the underlying storage may change, so the
-            // result isn't `Immutable`.
+            // result isn't `Immutable`. Note that the simplifier does fold
+            // `Stable` calls whose arguments are constant, so a call over a
+            // constant raster is evaluated at plan time; OutDb references
+            // come from `RS_FromPath`, which is `Volatile` and never folded.
             signature: Signature::any(1, Volatility::Stable),
         }
     }
+}
+
+/// The process-wide tokio runtime the loaders run on.
+///
+/// `invoke_with_args` is synchronous and is called on whatever thread
+/// DataFusion evaluates the expression on — usually a worker of the
+/// session's own runtime. The loader futures cannot be driven there: a
+/// worker that blocks waiting on its own runtime deadlocks once every
+/// worker is waiting. So the loads run on this separate runtime, whose
+/// workers are never blocked by query execution, and the calling thread
+/// only waits for the result (see [`block_on_loader_runtime`]).
+///
+/// Multi-threaded with tokio's default worker count: a load fans out over
+/// many chunks (`buffer_unordered` in the Zarr loader), decodes on the
+/// worker that fetched them, and GDAL and Python loaders hop to the
+/// blocking pool, so one partition's load keeps several workers busy. The
+/// threads sit idle while nothing is loading.
+///
+/// Like any tokio runtime held in a Python process, the workers do not
+/// survive `fork()`: a forked child that inherits an initialised runtime
+/// must not call `RS_EnsureLoaded`. Spawn-start multiprocessing is
+/// unaffected.
+fn loader_runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        Builder::new_multi_thread()
+            .thread_name("sedona-raster-loader")
+            .enable_all()
+            .build()
+            .expect("build the raster loader runtime")
+    })
+}
+
+/// Run `fut` on the [`loader_runtime`] and block until it completes.
+///
+/// When the calling thread is a worker of a multi-threaded tokio runtime,
+/// the wait goes through `block_in_place`, which hands the worker's other
+/// tasks to another thread for the duration so the session's runtime keeps
+/// making progress. On a current-thread runtime, or outside any runtime,
+/// the thread simply blocks. The loader runtime is separate, so the wait
+/// cannot deadlock as long as a loader needs nothing from the caller's
+/// runtime: every loader runs its blocking work and I/O on the loader
+/// runtime (`spawn_blocking` inside a loader lands there too). A loader
+/// that awaited a task living on the caller's runtime would hang a
+/// current-thread caller.
+///
+/// The future is detached: once spawned it runs to completion even if the
+/// query that asked for it is dropped, and the caller cannot be
+/// interrupted while it waits. Cancellation therefore happens between
+/// slices, never inside a load.
+fn block_on_loader_runtime<F>(fut: F) -> Result<ArrayRef>
+where
+    F: Future<Output = Result<ArrayRef>> + Send + 'static,
+{
+    let (tx, rx) = mpsc::sync_channel(1);
+    loader_runtime().spawn(async move {
+        // The receiver only goes away when the caller gave up waiting,
+        // which it never does; nothing to do if the send fails.
+        let _ = tx.send(fut.await);
+    });
+    let wait = move || {
+        rx.recv().unwrap_or_else(|_| {
+            sedona_internal_err!(
+                "RS_EnsureLoaded: the load task ended without a result (it panicked)"
+            )
+        })
+    };
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
+    }
+}
+
+/// True if any band of any row of `rasters` is OutDb (has no bytes yet).
+fn has_outdb_band(rasters: &RasterStructArray<'_>) -> Result<bool> {
+    for raster_idx in 0..rasters.len() {
+        if rasters.is_null(raster_idx) {
+            continue;
+        }
+        let raster = rasters.get(raster_idx).map_err(|e| {
+            sedona_internal_datafusion_err!(
+                "RS_EnsureLoaded: bad input raster row {raster_idx}: {e}"
+            )
+        })?;
+        for band_idx in 0..raster.num_bands() {
+            let band = raster.band(band_idx).map_err(|e| {
+                sedona_internal_datafusion_err!(
+                    "RS_EnsureLoaded: bad input band ({raster_idx},{band_idx}): {e}"
+                )
+            })?;
+            if !band.is_indb() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Pull the shared registry handle out of a `ConfigOptions`. Returns a
@@ -142,6 +250,27 @@ fn lookup_loader(
     })?;
     // The registry owns format resolution + the missing-loader diagnostic.
     guard.get_or_error(format)
+}
+
+/// The session's chunk cache, with `sedona.raster.cache_max_bytes` applied
+/// so a `SET` takes effect on the next call. A session without one (a bare
+/// DataFusion context, or a loader config built without a cache) gets a
+/// [`NoChunkCache`], so the load path never branches on it.
+fn chunk_cache_from_config(config: &ConfigOptions) -> Arc<dyn RasterChunkCache> {
+    let cache: Arc<dyn RasterChunkCache> = match config.extensions.get::<RasterLoaderConfig>() {
+        Some(loader_config) => loader_config.cache(),
+        None => Arc::new(NoChunkCache),
+    };
+    if let Some(opts) = config.extensions.get::<SedonaOptions>() {
+        let budget = opts.raster.cache_max_bytes;
+        if cache.max_bytes() != budget {
+            cache.set_max_bytes(budget);
+        }
+    }
+    // Entries go idle when earlier batches drop, which the cache cannot
+    // observe, so this is where a hit-only session gives memory back.
+    cache.trim();
+    cache
 }
 
 // One RsEnsureLoaded per session by construction — equality and hash
@@ -203,33 +332,42 @@ impl ScalarUDFImpl for RsEnsureLoaded {
         Ok(Arc::clone(field))
     }
 
-    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        // DataFusion routes async UDFs through `invoke_async_with_args`
-        // on the AsyncFuncExec node; this sync entry should never be
-        // called for an `AsyncScalarUDF`-wrapped impl.
-        sedona_internal_err!(
-            "RS_EnsureLoaded is async; AsyncFuncExec should have dispatched to invoke_async_with_args"
-        )
-    }
-}
-
-#[async_trait]
-impl AsyncScalarUDFImpl for RsEnsureLoaded {
-    /// Materialising OutDb bytes is per-row I/O, so favour larger input
-    /// batches over DataFusion's default to amortise loader dispatch and
-    /// keep the async pipeline fed.
-    fn ideal_batch_size(&self) -> Option<usize> {
-        Some(1024)
-    }
-
-    async fn invoke_async_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         if args.args.len() != 1 {
             return sedona_internal_err!("RS_EnsureLoaded() expects a single argument");
         }
 
         let input_array = args.args[0].to_array(args.number_rows)?;
+        // Already loaded (or nothing to load): the raster is returned as is.
+        // This is the common case for a redundant call, such as a user's
+        // explicit `RS_EnsureLoaded` under a pixel function the planner
+        // wraps again, and costs one pass over the band metadata.
+        let input_struct = input_array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                sedona_internal_datafusion_err!(
+                    "RS_EnsureLoaded: expected StructArray input, got {:?}",
+                    input_array.data_type()
+                )
+            })?;
+        if !has_outdb_band(&RasterStructArray::try_new(input_struct)?)? {
+            return Ok(ColumnarValue::Array(input_array));
+        }
+
         let registry = registry_handle_from_config(&args.config_options)?;
-        let output = ensure_loaded(&input_array, |format| lookup_loader(&registry, format)).await?;
+        let cache = chunk_cache_from_config(&args.config_options);
+        // Apply `sedona.raster.io_concurrency` to the session's I/O budget
+        // before the loaders below take permits from it.
+        io_budget_from_config(&args.config_options);
+        let output = block_on_loader_runtime(async move {
+            ensure_loaded(
+                &input_array,
+                |format| lookup_loader(&registry, format),
+                cache.as_ref(),
+            )
+            .await
+        })?;
         Ok(ColumnarValue::Array(output))
     }
 }
@@ -241,6 +379,10 @@ enum BandBytes {
     InDb,
     /// OutDb: result `pos` of the bundled `load()` issued for loader `group`.
     OutDb { group: usize, pos: usize },
+    /// OutDb, served from the session's [`RasterChunkCache`]: whole-source
+    /// bytes from an earlier load, laid out in `source_shape`, under the
+    /// band's own view.
+    Cached(CachedChunk),
 }
 
 /// One OutDb band's load request, owned so it can be assembled before any
@@ -292,23 +434,33 @@ fn source_order_dim_names(visible: &[&str], view: &ViewEntries) -> Vec<String> {
 ///
 /// Three passes:
 ///
-/// 1. **Plan.** Walk every raster/band and assign each OutDb band to a
-///    loader group — one group per distinct `outdb_format` (a batch can mix
-///    `None` → GDAL, `"zarr"`, and extension loaders). Each format is
-///    resolved through `lookup` once per call, not once per band.
+/// 1. **Plan.** Walk every raster/band. An OutDb band is first looked up
+///    in `cache` by `(outdb_uri, data_type)`; a hit needs no loader. A
+///    miss is assigned to a loader group — one group per distinct
+///    `outdb_format` (a batch can mix `None` → GDAL, `"zarr"`, and
+///    extension loaders), each format resolved through `lookup` once per
+///    call — unless an identical request (same key, source shape and
+///    view) is already planned, in which case it shares that slot.
 /// 2. **Load.** Issue **one** [`AsyncRasterLoader::load`] per group carrying
 ///    every request for that loader. Backends that batch (one blocking
 ///    hop, one store/array open, one Python call) only see the win when
 ///    the caller hands them the whole batch, so this is where the
 ///    bundling happens. Groups are awaited in turn; fan-out *within* a
-///    group is the loader's job.
+///    group is the loader's job. Whole-source results are then stored in
+///    `cache`, and the output is built from the cached buffer so the two
+///    share one allocation.
 /// 3. **Build.** Walk the rasters again and assemble the output: InDb
 ///    bands are derived as-is (zero-copy, view preserved); OutDb bands
-///    take the loaded bytes with the layout the loader reported.
+///    take the loaded bytes with the layout the loader reported; cached
+///    bands take the cached whole-source bytes under their own view.
 ///
 /// Peak memory is unchanged from a per-band dispatch: the output column
 /// holds every loaded buffer at once either way.
-async fn ensure_loaded<F>(input_array: &ArrayRef, mut lookup: F) -> Result<ArrayRef>
+async fn ensure_loaded<F>(
+    input_array: &ArrayRef,
+    mut lookup: F,
+    cache: &dyn RasterChunkCache,
+) -> Result<ArrayRef>
 where
     F: FnMut(Option<&str>) -> Result<Arc<dyn AsyncRasterLoader>>,
 {
@@ -333,6 +485,12 @@ where
     // the GDAL catch-all) share one `load()`.
     let mut loader_by_format: HashMap<Option<String>, Arc<dyn AsyncRasterLoader>> = HashMap::new();
     let mut group_by_loader: HashMap<usize, usize> = HashMap::new();
+    // Requests already planned in this batch, by cache key. A later band
+    // naming the same bytes shares the first's slot instead of asking the
+    // loader twice — but only when its source shape and view agree: a
+    // loader may resolve a view, so two views over one chunk are not one
+    // request.
+    let mut planned: HashMap<ChunkKey, (usize, usize)> = HashMap::new();
 
     for raster_idx in 0..rasters.len() {
         if rasters.is_null(raster_idx) {
@@ -367,6 +525,30 @@ where
             // `outdb_format` may be unset (None) — e.g. RS_FromPath emits
             // null and relies on the catch-all GDAL loader. The registry
             // resolves None against each loader's `supports_format`.
+            let key = ChunkKey {
+                uri: uri.to_string(),
+                data_type: band.data_type(),
+            };
+            let dim_names = source_order_dim_names(&band.dim_names(), band.view());
+            if let Some(chunk) = cache.get(&key) {
+                // A stale entry whose layout no longer matches the band's
+                // metadata is treated as a miss rather than trusted.
+                if chunk.source_shape == band.raw_source_shape() && chunk.dim_names == dim_names {
+                    bands.push(BandBytes::Cached(chunk));
+                    continue;
+                }
+            }
+            if let Some(&(group, pos)) = planned.get(&key) {
+                let first = &groups[group].requests[pos];
+                if first.source_shape == band.raw_source_shape()
+                    && first.dim_names == dim_names
+                    && &first.view == band.view()
+                {
+                    bands.push(BandBytes::OutDb { group, pos });
+                    continue;
+                }
+            }
+
             let outdb_format = band.outdb_format().map(str::to_string);
             let loader = match loader_by_format.get(&outdb_format) {
                 Some(loader) => Arc::clone(loader),
@@ -385,13 +567,12 @@ where
                 groups.len() - 1
             });
             let requests = &mut groups[group].requests;
-            bands.push(BandBytes::OutDb {
-                group,
-                pos: requests.len(),
-            });
+            let pos = requests.len();
+            planned.entry(key).or_insert((group, pos));
+            bands.push(BandBytes::OutDb { group, pos });
             requests.push(LoadRequestPlan {
                 uri: uri.to_string(),
-                dim_names: source_order_dim_names(&band.dim_names(), band.view()),
+                dim_names,
                 // Raw source extent plus the band's view: a loader may honour
                 // the view and return only the visible region, or ignore it
                 // and return the full source. Its `RasterLoadResult` says
@@ -445,6 +626,7 @@ where
                 request_refs.len()
             );
         }
+        let results = cache_results(cache, &group.requests, results);
         group_results.push(results);
     }
 
@@ -477,7 +659,7 @@ where
                     "RS_EnsureLoaded: bad input band ({raster_idx},{band_idx}): {e}"
                 )
             })?;
-            match *bytes {
+            match bytes {
                 BandBytes::InDb => {
                     band.copy_into(&mut builder, BandOverrides::default())
                         .map_err(|e| {
@@ -487,8 +669,37 @@ where
                             )
                         })?;
                 }
+                BandBytes::Cached(chunk) => {
+                    // Whole-source bytes shared with the cache (and with
+                    // every other batch that hit), laid out in
+                    // `chunk.source_shape`; the band's own view stays.
+                    if expected_bytes(&chunk.source_shape, band.data_type())
+                        != Some(chunk.bytes.len())
+                    {
+                        return sedona_internal_err!(
+                            "RS_EnsureLoaded: cached entry for band ({raster_idx},{band_idx}) \
+                             holds {} bytes for shape {:?}",
+                            chunk.bytes.len(),
+                            chunk.source_shape
+                        );
+                    }
+                    band.copy_into(
+                        &mut builder,
+                        BandOverrides {
+                            source_shape: Some(&chunk.source_shape),
+                            data: Override::Set(&chunk.bytes),
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|e| {
+                        sedona_internal_datafusion_err!(
+                            "RS_EnsureLoaded: cached derive failed at \
+                             ({raster_idx},{band_idx}): {e}"
+                        )
+                    })?;
+                }
                 BandBytes::OutDb { group, pos } => {
-                    let result = &group_results[group][pos];
+                    let result = &group_results[*group][*pos];
                     // `result.source_shape` + `result.view` describe the bytes
                     // the loader actually produced (full source with the
                     // band's view echoed, or the visible region under an
@@ -566,14 +777,63 @@ where
     Ok(Arc::new(output_struct) as ArrayRef)
 }
 
+/// Bytes a whole-source load of `shape` × `data_type` must produce.
+fn expected_bytes(shape: &[i64], data_type: BandDataType) -> Option<usize> {
+    shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(usize::try_from(d).ok()?))
+        .and_then(|elems| elems.checked_mul(data_type.byte_size()))
+}
+
+/// Store each whole-source result in `cache` and switch it to the cached
+/// buffer, so the output batch and the cache share one allocation. A
+/// result whose layout differs from its request (a loader that resolved
+/// the view) is not the full source and is left alone; so is one whose
+/// byte count is wrong, which pass 3 then reports. All of a load's
+/// results go in as one batch so the cache scans its idle bytes once.
+fn cache_results(
+    cache: &dyn RasterChunkCache,
+    requests: &[LoadRequestPlan],
+    mut results: Vec<RasterLoadResult>,
+) -> Vec<RasterLoadResult> {
+    let mut positions = Vec::new();
+    let mut entries = Vec::new();
+    for (pos, (result, plan)) in results.iter_mut().zip(requests).enumerate() {
+        let whole_source = result.source_shape == plan.source_shape && result.view == plan.view;
+        let sized = expected_bytes(&plan.source_shape, plan.data_type) == Some(result.bytes.len());
+        if !(whole_source && sized) {
+            continue;
+        }
+        let bytes = std::mem::replace(&mut result.bytes, Buffer::from_vec(Vec::<u8>::new()));
+        positions.push(pos);
+        entries.push((
+            ChunkKey {
+                uri: plan.uri.clone(),
+                data_type: plan.data_type,
+            },
+            CachedChunk {
+                bytes,
+                source_shape: result.source_shape.clone(),
+                dim_names: plan.dim_names.clone(),
+            },
+        ));
+    }
+    for (pos, bytes) in positions.into_iter().zip(cache.insert_batch(entries)) {
+        results[pos].bytes = bytes;
+    }
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sedona_raster::chunk_cache::{ChunkCacheStats, InMemoryChunkCache};
     use sedona_raster::view_entries::ViewEntry;
     use std::sync::Mutex;
 
     use arrow_array::Array;
     use arrow_buffer::Buffer;
+    use async_trait::async_trait;
     use sedona_raster::array::RasterStructArray;
     use sedona_raster::builder::{RasterBuilder, StartBandArgs};
     use sedona_raster::raster_loader::{RasterLoadResult, RasterLoaderRegistry};
@@ -726,9 +986,13 @@ mod tests {
         let loader_dyn: Arc<dyn AsyncRasterLoader> = loader.clone();
         let reg = registry_with(loader_dyn);
 
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
 
         let out_struct = out.as_any().downcast_ref::<StructArray>().unwrap();
         let out_rasters = RasterStructArray::try_new(out_struct).unwrap();
@@ -762,9 +1026,13 @@ mod tests {
         let loader_dyn: Arc<dyn AsyncRasterLoader> = loader.clone();
         let reg = registry_with(loader_dyn);
 
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
 
         let out_struct = out.as_any().downcast_ref::<StructArray>().unwrap();
         let out_rasters = RasterStructArray::try_new(out_struct).unwrap();
@@ -799,9 +1067,13 @@ mod tests {
         let loader_dyn: Arc<dyn AsyncRasterLoader> = loader.clone();
         let reg = registry_with(loader_dyn);
 
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
 
         let out_struct = out.as_any().downcast_ref::<StructArray>().unwrap();
         let out_rasters = RasterStructArray::try_new(out_struct).unwrap();
@@ -856,9 +1128,13 @@ mod tests {
         let loader_dyn: Arc<dyn AsyncRasterLoader> = Arc::new(StableBufferLoader { buffer });
         let reg = registry_with(loader_dyn);
 
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
 
         let out_struct = out.as_any().downcast_ref::<StructArray>().unwrap();
         let out_rasters = RasterStructArray::try_new(out_struct).unwrap();
@@ -882,9 +1158,13 @@ mod tests {
         let reg: Arc<RwLock<RasterLoaderRegistry>> =
             Arc::new(RwLock::new(RasterLoaderRegistry::new()));
 
-        let err = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap_err();
+        let err = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("zarr"),
@@ -923,9 +1203,13 @@ mod tests {
         let loader_dyn: Arc<dyn AsyncRasterLoader> = Arc::new(ShortLoader);
         let reg = registry_with(loader_dyn);
 
-        let err = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap_err();
+        let err = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("expected") && msg.contains("loader returned"),
@@ -983,9 +1267,13 @@ mod tests {
         let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
         let reg = registry_with(loader.clone());
 
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
 
         let out_struct = out.as_any().downcast_ref::<StructArray>().unwrap();
         let out_rasters = RasterStructArray::try_new(out_struct).unwrap();
@@ -1041,9 +1329,13 @@ mod tests {
 
         let input = build_viewed_input(None);
         let reg = registry_with(Arc::new(ResolvingLoader));
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
 
         let out_struct = out.as_any().downcast_ref::<StructArray>().unwrap();
         let out_rasters = RasterStructArray::try_new(out_struct).unwrap();
@@ -1074,9 +1366,13 @@ mod tests {
         let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
         let reg = registry_with(loader.clone());
 
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
 
         let out_struct = out.as_any().downcast_ref::<StructArray>().unwrap();
         let out_rasters = RasterStructArray::try_new(out_struct).unwrap();
@@ -1120,9 +1416,13 @@ mod tests {
         let loader_dyn: Arc<dyn AsyncRasterLoader> = Arc::new(RecordingLoader::default());
         let reg = registry_with(loader_dyn);
 
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(out.len(), 2);
         assert!(!out.is_null(0));
@@ -1257,9 +1557,13 @@ mod tests {
         let loader = Arc::new(MarkerLoader::new("marker", &["mock"]));
         let reg = registry_with(loader.clone());
 
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
 
         let calls = loader.calls.lock().unwrap();
         assert_eq!(
@@ -1307,10 +1611,14 @@ mod tests {
         reg.register(beta.clone());
 
         let mut lookups = 0usize;
-        let out = ensure_loaded(&input, |fmt| {
-            lookups += 1;
-            reg.get_or_error(fmt)
-        })
+        let out = ensure_loaded(
+            &input,
+            |fmt| {
+                lookups += 1;
+                reg.get_or_error(fmt)
+            },
+            &NoChunkCache,
+        )
         .await
         .unwrap();
 
@@ -1345,9 +1653,13 @@ mod tests {
         let loader = Arc::new(MarkerLoader::new("marker", &["mock"]));
         let reg = registry_with(loader.clone());
 
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             *loader.calls.lock().unwrap(),
@@ -1385,10 +1697,14 @@ mod tests {
 
         let input = build_rows(&[Some(vec![outdb("mock", 1)])]);
         let reg = registry_with(Arc::new(ExtraResultLoader));
-        let err = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("returned 2 result(s) for 1 request(s)"),
             "{err}"
@@ -1417,10 +1733,14 @@ mod tests {
 
         let input = build_rows(&[Some(vec![outdb("mock", 1)]), Some(vec![outdb("mock", 2)])]);
         let reg = registry_with(Arc::new(FailingLoader));
-        let err = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("loader 'failing' failed loading 2 band(s)") && err.contains("boom"),
             "{err}"
@@ -1494,10 +1814,14 @@ mod tests {
         }
 
         let reg = registry_with(Arc::new(IdentityViewLoader));
-        let err = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("visible shape [3, 1, 8], expected [1, 1, 8]"),
             "{err}"
@@ -1540,9 +1864,13 @@ mod tests {
 
         let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
         let reg = registry_with(loader.clone());
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
 
         let seen = loader.seen.lock().unwrap();
         assert_eq!(seen[0].1, vec![4, 8]);
@@ -1592,9 +1920,13 @@ mod tests {
         let input: ArrayRef = Arc::new(RasterBuilder::new(0).finish().unwrap());
         let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
         let reg = registry_with(loader.clone());
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.len(), 0);
         assert!(loader.seen.lock().unwrap().is_empty());
     }
@@ -1608,14 +1940,517 @@ mod tests {
         let input: ArrayRef = Arc::new(b.finish().unwrap());
         let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
         let reg = registry_with(loader.clone());
-        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt))
-            .await
-            .unwrap();
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
         let out_struct = out.as_any().downcast_ref::<StructArray>().unwrap();
         let out_rasters = RasterStructArray::try_new(out_struct).unwrap();
         assert_eq!(out_rasters.len(), 1);
         assert!(!out.is_null(0));
         assert_eq!(out_rasters.get(0).unwrap().num_bands(), 0);
         assert!(loader.seen.lock().unwrap().is_empty());
+    }
+
+    /// `uris.len()` rows, each one OutDb `UInt8` band of `source_shape`
+    /// under the `"mock"` format.
+    fn build_outdb_rows(uris: &[&str], source_shape: &[i64]) -> ArrayRef {
+        build_outdb_rows_typed(uris, source_shape, BandDataType::UInt8)
+    }
+
+    fn build_outdb_rows_typed(
+        uris: &[&str],
+        source_shape: &[i64],
+        dtype: BandDataType,
+    ) -> ArrayRef {
+        let mut b = RasterBuilder::new(uris.len());
+        for uri in uris {
+            b.start_raster_nd(
+                &[0.0, 1.0, 0.0, 0.0, 0.0, -1.0],
+                &["y", "x"],
+                source_shape,
+                None,
+            )
+            .unwrap();
+            b.start_band(StartBandArgs {
+                name: Some("band0"),
+                outdb_uri: Some(uri),
+                outdb_format: Some("mock"),
+                ..StartBandArgs::new(&["y", "x"], source_shape, dtype)
+            })
+            .unwrap();
+            b.band_data_writer().append_value([0u8; 0]);
+            b.finish_band().unwrap();
+            b.finish_raster().unwrap();
+        }
+        Arc::new(b.finish().unwrap())
+    }
+
+    /// The visible bytes of band 0 of `row`, and the address they live at.
+    fn band_bytes_and_ptr(out: &ArrayRef, row: usize) -> (Vec<u8>, usize) {
+        let out_struct = out.as_any().downcast_ref::<StructArray>().unwrap();
+        let rasters = RasterStructArray::try_new(out_struct).unwrap();
+        let r = rasters.get(row).unwrap();
+        let band = r.band(0).unwrap();
+        let nd = band.nd_buffer().unwrap();
+        let bytes = nd.as_contiguous().unwrap();
+        (bytes.to_vec(), bytes.as_ptr() as usize)
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_serves_repeated_requests_from_the_cache() {
+        let input = build_outdb_rows(&["mock://a"], &[4, 8]);
+        let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
+        let reg = registry_with(loader.clone());
+        let cache = InMemoryChunkCache::new(1 << 20);
+
+        let first = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt), &cache)
+            .await
+            .unwrap();
+        let second = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt), &cache)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            loader.seen.lock().unwrap().len(),
+            1,
+            "second call must not load"
+        );
+        let (a, ptr_a) = band_bytes_and_ptr(&first, 0);
+        let (b, ptr_b) = band_bytes_and_ptr(&second, 0);
+        assert_eq!(a, b);
+        assert_eq!(ptr_a, ptr_b, "a hit must share the cached allocation");
+        let stats = cache.stats();
+        assert_eq!((stats.inserts, stats.hits, stats.misses), (1, 1, 1));
+        // Both outputs still hold the block, so it is shared, not idle.
+        assert_eq!((stats.shared_bytes, stats.idle_bytes), (32, 0));
+        drop(first);
+        drop(second);
+        assert_eq!(cache.stats().idle_bytes, 32);
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_dedupes_identical_requests_within_a_batch() {
+        // Dedupe is independent of the cache: identical requests reach the
+        // loader once and share one buffer, cache or not.
+        let input = build_outdb_rows(&["mock://a", "mock://a", "mock://b"], &[4, 8]);
+        let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
+        let reg = registry_with(loader.clone());
+
+        let out = ensure_loaded(
+            &input,
+            |fmt| reg.read().unwrap().get_or_error(fmt),
+            &NoChunkCache,
+        )
+        .await
+        .unwrap();
+
+        let seen: Vec<String> = loader
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(uri, ..)| uri.clone())
+            .collect();
+        assert_eq!(seen, vec!["mock://a".to_string(), "mock://b".to_string()]);
+        let (_, p0) = band_bytes_and_ptr(&out, 0);
+        let (_, p1) = band_bytes_and_ptr(&out, 1);
+        let (_, p2) = band_bytes_and_ptr(&out, 2);
+        assert_eq!(p0, p1, "duplicate rows share the one loaded buffer");
+        assert_ne!(p0, p2);
+    }
+
+    /// Like [`row1_view`] but selecting row 2 of the `[4, 8]` source.
+    fn row2_view() -> ViewEntries {
+        ViewEntries::new(vec![
+            ViewEntry {
+                source_axis: 0,
+                start: 2,
+                step: 1,
+                steps: 1,
+            },
+            ViewEntry {
+                source_axis: 1,
+                start: 0,
+                step: 1,
+                steps: 8,
+            },
+        ])
+    }
+
+    /// One row per view, each an OutDb band over the same `mock://v`
+    /// `[4, 8]` source with that view.
+    fn build_viewed_rows(views: &[ViewEntries]) -> ArrayRef {
+        let mut b = RasterBuilder::new(views.len());
+        for view in views {
+            b.start_raster_nd(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0], &["y", "x"], &[1, 8], None)
+                .unwrap();
+            b.start_band(StartBandArgs {
+                name: Some("band0"),
+                view: Some(view),
+                outdb_uri: Some("mock://v"),
+                outdb_format: Some("mock"),
+                ..StartBandArgs::new(&["y", "x"], &[4, 8], BandDataType::UInt8)
+            })
+            .unwrap();
+            b.band_data_writer().append_value([0u8; 0]);
+            b.finish_band().unwrap();
+            b.finish_raster().unwrap();
+        }
+        Arc::new(b.finish().unwrap())
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_keeps_each_bands_view_over_one_cached_chunk() {
+        // Two views over the same chunk are two requests to the loader (a
+        // loader may resolve a view), but one cache entry: the second call
+        // hits for both and each band keeps its own view over the full
+        // source bytes.
+        let input = build_viewed_rows(&[row1_view(), row2_view()]);
+        let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
+        let reg = registry_with(loader.clone());
+        let cache = InMemoryChunkCache::new(1 << 20);
+
+        ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt), &cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            loader.seen.lock().unwrap().len(),
+            2,
+            "views differ: no dedupe"
+        );
+        assert_eq!(cache.stats().inserts, 1, "one chunk behind both views");
+
+        let out = ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt), &cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            loader.seen.lock().unwrap().len(),
+            2,
+            "both served from cache"
+        );
+        assert_eq!(cache.stats().hits, 2);
+
+        let full: Vec<u8> = (0..32).collect();
+        let out_struct = out.as_any().downcast_ref::<StructArray>().unwrap();
+        let rasters = RasterStructArray::try_new(out_struct).unwrap();
+        for (row, (view, expected)) in [(row1_view(), &full[8..16]), (row2_view(), &full[16..24])]
+            .into_iter()
+            .enumerate()
+        {
+            let r = rasters.get(row).unwrap();
+            let band = r.band(0).unwrap();
+            assert_eq!(band.view(), &view);
+            assert_eq!(band.raw_source_shape(), &[4, 8]);
+            assert_eq!(band.nd_buffer().unwrap().as_contiguous().unwrap(), expected);
+        }
+        let (_, p0) = band_bytes_and_ptr(&out, 0);
+        let (_, p1) = band_bytes_and_ptr(&out, 1);
+        // Same block, different offsets into it.
+        assert_eq!(p1 - p0, 8);
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_does_not_cache_a_loader_resolved_result() {
+        // A loader that returns only the visible region did not produce the
+        // full source, so its result must not be stored under the key.
+        #[derive(Debug, Default)]
+        struct ResolvingLoader {
+            calls: Mutex<usize>,
+        }
+        #[async_trait]
+        impl AsyncRasterLoader for ResolvingLoader {
+            fn name(&self) -> &str {
+                "resolving"
+            }
+            fn supports_format(&self, _format: Option<&str>) -> bool {
+                true
+            }
+            async fn load(
+                &self,
+                reqs: &[&RasterLoadRequest],
+            ) -> Result<Vec<RasterLoadResult>, arrow_schema::ArrowError> {
+                *self.calls.lock().unwrap() += 1;
+                Ok(reqs
+                    .iter()
+                    .map(|req| {
+                        let visible = req.view.visible_shape();
+                        RasterLoadResult {
+                            bytes: Buffer::from_vec((100u8..108).collect()),
+                            view: ViewEntries::identity_for_shape(&visible),
+                            source_shape: visible,
+                        }
+                    })
+                    .collect())
+            }
+        }
+
+        let input = build_viewed_input(None);
+        let loader = Arc::new(ResolvingLoader::default());
+        let reg = registry_with(loader.clone());
+        let cache = InMemoryChunkCache::new(1 << 20);
+        for _ in 0..2 {
+            ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt), &cache)
+                .await
+                .unwrap();
+        }
+        assert_eq!(*loader.calls.lock().unwrap(), 2);
+        assert_eq!(cache.stats().inserts, 0);
+    }
+
+    #[test]
+    fn chunk_cache_from_config_applies_the_session_budget() {
+        let reg = registry_with(Arc::new(RecordingLoader::default()));
+        let cache: Arc<dyn RasterChunkCache> = Arc::new(InMemoryChunkCache::new(1 << 20));
+
+        // No loader config at all: a cache that keeps nothing, not an error.
+        let mut config = ConfigOptions::default();
+        let none = chunk_cache_from_config(&config);
+        assert_eq!(none.max_bytes(), 0);
+        assert_eq!(none.stats(), ChunkCacheStats::default());
+
+        // A loader config without a cache attached behaves the same.
+        config
+            .extensions
+            .insert(RasterLoaderConfig::from_handle(Arc::clone(&reg)));
+        assert_eq!(chunk_cache_from_config(&config).max_bytes(), 0);
+
+        config
+            .extensions
+            .insert(RasterLoaderConfig::from_handle(reg).with_cache(cache.clone()));
+        let mut opts = SedonaOptions::default();
+        opts.raster.cache_max_bytes = 123;
+        config.extensions.insert(opts);
+
+        let found = chunk_cache_from_config(&config);
+        assert!(Arc::ptr_eq(&found, &cache));
+        assert_eq!(cache.max_bytes(), 123);
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_keeps_one_entry_per_data_type_for_a_uri() {
+        // Same URI, two dtypes: two keys, two loads, two entries.
+        let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
+        let reg = registry_with(loader.clone());
+        let cache = InMemoryChunkCache::new(1 << 20);
+        for dtype in [BandDataType::UInt8, BandDataType::UInt16] {
+            let input = build_outdb_rows_typed(&["mock://a"], &[4, 8], dtype);
+            for _ in 0..2 {
+                ensure_loaded(&input, |fmt| reg.read().unwrap().get_or_error(fmt), &cache)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(loader.seen.lock().unwrap().len(), 2);
+        let stats = cache.stats();
+        assert_eq!((stats.entries, stats.inserts, stats.hits), (2, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_ignores_the_cache_for_indb_bands_and_null_rows() {
+        let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
+        let reg = registry_with(loader.clone());
+        let cache = InMemoryChunkCache::new(1 << 20);
+
+        let data: Vec<u8> = (0..32).collect();
+        let indb: ArrayRef = Arc::new(build_indb_input(&[4, 8], &data));
+        let out = ensure_loaded(&indb, |fmt| reg.read().unwrap().get_or_error(fmt), &cache)
+            .await
+            .unwrap();
+        assert_eq!(band_bytes_and_ptr(&out, 0).0, data);
+
+        let mut b = RasterBuilder::new(1);
+        b.append_null().unwrap();
+        let nulls: ArrayRef = Arc::new(b.finish().unwrap());
+        let out = ensure_loaded(&nulls, |fmt| reg.read().unwrap().get_or_error(fmt), &cache)
+            .await
+            .unwrap();
+        assert!(out.is_null(0));
+
+        assert!(loader.seen.lock().unwrap().is_empty());
+        assert_eq!(cache.stats(), ChunkCacheStats::default());
+    }
+
+    /// `ScalarFunctionArgs` for one call of the UDF over `input`, with
+    /// `registry` installed in the config as a `SedonaContext` would.
+    fn scalar_args(
+        input: ArrayRef,
+        registry: Arc<RwLock<RasterLoaderRegistry>>,
+    ) -> ScalarFunctionArgs {
+        let mut config = ConfigOptions::default();
+        config
+            .extensions
+            .insert(RasterLoaderConfig::from_handle(registry));
+        let field: FieldRef = Arc::new(
+            sedona_schema::datatypes::SedonaType::Raster
+                .to_storage_field("rast", true)
+                .unwrap(),
+        );
+        ScalarFunctionArgs {
+            number_rows: input.len(),
+            args: vec![ColumnarValue::Array(input)],
+            arg_fields: vec![Arc::clone(&field)],
+            return_field: field,
+            config_options: Arc::new(config),
+        }
+    }
+
+    #[test]
+    fn invoke_loads_outdb_bands_outside_any_runtime() {
+        let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
+        let input: ArrayRef = Arc::new(build_outdb_input("rec://a", "recording", &[2, 3]));
+        let out = RsEnsureLoaded::new()
+            .invoke_with_args(scalar_args(input, registry_with(loader.clone())))
+            .unwrap()
+            .to_array(1)
+            .unwrap();
+        assert_eq!(
+            band_bytes_and_ptr(&out, 0).0,
+            (0..6).map(|i| (i % 251) as u8).collect::<Vec<u8>>()
+        );
+        assert_eq!(loader.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invoke_loads_outdb_bands_from_a_current_thread_runtime() {
+        // The calling thread owns a current-thread runtime and blocks it
+        // while waiting; the load still completes on the loader runtime.
+        let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
+        let input: ArrayRef = Arc::new(build_outdb_input("rec://a", "recording", &[2, 3]));
+        let out = RsEnsureLoaded::new()
+            .invoke_with_args(scalar_args(input, registry_with(loader.clone())))
+            .unwrap()
+            .to_array(1)
+            .unwrap();
+        assert_eq!(band_bytes_and_ptr(&out, 0).0.len(), 6);
+        assert_eq!(loader.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn invoke_waits_without_parking_a_multi_thread_runtime_worker() {
+        // A one-worker session runtime, as a DataFusion partition runs on.
+        // The loader only completes once a second task on that runtime has
+        // fired its gate, and that task is only polled after the loader
+        // started waiting, so this passes only if the wait inside
+        // `invoke_with_args` hands the worker's core to another thread
+        // (`block_in_place`) instead of parking it.
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+
+        #[derive(Debug)]
+        struct GatedLoader {
+            started: Mutex<Option<oneshot::Sender<()>>>,
+            gate: Mutex<Option<oneshot::Receiver<()>>>,
+        }
+        #[async_trait]
+        impl AsyncRasterLoader for GatedLoader {
+            fn name(&self) -> &str {
+                "gated"
+            }
+            fn supports_format(&self, _format: Option<&str>) -> bool {
+                true
+            }
+            async fn load(
+                &self,
+                reqs: &[&RasterLoadRequest],
+            ) -> Result<Vec<RasterLoadResult>, arrow_schema::ArrowError> {
+                let started = self.started.lock().unwrap().take().expect("one load");
+                let gate = self.gate.lock().unwrap().take().expect("one load");
+                let _ = started.send(());
+                gate.await
+                    .map_err(|_| arrow_schema::ArrowError::ExternalError("gate dropped".into()))?;
+                Ok(reqs
+                    .iter()
+                    .map(|req| RasterLoadResult::unresolved(Buffer::from_vec(vec![0u8; 6]), req))
+                    .collect())
+            }
+        }
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let registry = registry_with(Arc::new(GatedLoader {
+            started: Mutex::new(Some(started_tx)),
+            gate: Mutex::new(Some(gate_rx)),
+        }));
+        let input: ArrayRef = Arc::new(build_outdb_input("gated://a", "gated", &[2, 3]));
+
+        let session = Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = session.handle().clone();
+        std::thread::spawn(move || {
+            let result = handle.block_on(async move {
+                tokio::spawn(async move {
+                    started_rx.await.unwrap();
+                    gate_tx.send(()).unwrap();
+                });
+                tokio::spawn(async move {
+                    RsEnsureLoaded::new()
+                        .invoke_with_args(scalar_args(input, registry))
+                        .and_then(|value| value.to_array(1))
+                })
+                .await
+                .unwrap()
+            });
+            let _ = done_tx.send(result);
+        });
+        match done_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(out) => assert_eq!(band_bytes_and_ptr(&out.unwrap(), 0).0.len(), 6),
+            Err(_) => {
+                // The worker is parked for good; don't wait for it on drop.
+                session.shutdown_background();
+                panic!("the wait parked the only worker of the session runtime");
+            }
+        }
+        session.shutdown_background();
+    }
+
+    #[test]
+    fn invoke_returns_the_input_as_is_when_nothing_is_outdb() {
+        let loader: Arc<RecordingLoader> = Arc::new(RecordingLoader::default());
+        let input: ArrayRef = Arc::new(build_indb_input(&[2, 2], &[1, 2, 3, 4]));
+        let out = RsEnsureLoaded::new()
+            .invoke_with_args(scalar_args(
+                Arc::clone(&input),
+                registry_with(loader.clone()),
+            ))
+            .unwrap()
+            .to_array(1)
+            .unwrap();
+        assert!(Arc::ptr_eq(&input, &out), "in-db input must pass through");
+        assert!(loader.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invoke_reports_a_loader_error_instead_of_hanging() {
+        #[derive(Debug)]
+        struct FailingLoader;
+        #[async_trait]
+        impl AsyncRasterLoader for FailingLoader {
+            fn name(&self) -> &str {
+                "failing"
+            }
+            fn supports_format(&self, _format: Option<&str>) -> bool {
+                true
+            }
+            async fn load(
+                &self,
+                _reqs: &[&RasterLoadRequest],
+            ) -> Result<Vec<RasterLoadResult>, arrow_schema::ArrowError> {
+                Err(arrow_schema::ArrowError::ExternalError("boom".into()))
+            }
+        }
+        let input: ArrayRef = Arc::new(build_outdb_input("rec://a", "failing", &[2, 3]));
+        let err = RsEnsureLoaded::new()
+            .invoke_with_args(scalar_args(input, registry_with(Arc::new(FailingLoader))))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("loader 'failing' failed"), "{err}");
     }
 }

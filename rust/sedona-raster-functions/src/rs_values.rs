@@ -44,7 +44,7 @@ use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::DataType;
 use datafusion_common::cast::as_int32_array;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{exec_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::array::RasterStructArray;
@@ -179,7 +179,7 @@ impl RsValues {
                         }
                     }
                 } else {
-                    default_band("RS_Values", raster.num_bands())?
+                    default_band("RS_Values", "2-argument", raster.num_bands())?
                 };
 
                 // Resolve the band buffer, nodata, and affine transform once for
@@ -342,7 +342,7 @@ impl RsValues {
         let const_band = if self.with_band {
             const_band
         } else {
-            Some(default_band("RS_Values", raster.num_bands())?)
+            Some(default_band("RS_Values", "2-argument", raster.num_bands())?)
         };
 
         // Phase 2 — sample. A constant band resolves its buffer/nodata/2-D

@@ -66,7 +66,9 @@ impl SedonaScalarKernel for STDWithin {
         executor.execute_wkb_wkb_void(|maybe0, maybe1| {
             match (maybe0, maybe1, arg2_iter.next().unwrap()) {
                 (Some(a), Some(b), Some(bound)) => {
-                    builder.append_value(point_or_wkb_distance(a, b) <= bound);
+                    builder.append_value(
+                        point_or_wkb_distance(a, b).is_some_and(|distance| distance <= bound),
+                    );
                 }
                 _ => builder.append_null(),
             }
@@ -80,7 +82,7 @@ impl SedonaScalarKernel for STDWithin {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{create_array as arrow_array, ArrayRef};
+    use arrow_array::{ArrayRef, create_array as arrow_array};
     use datafusion_common::scalar::ScalarValue;
     use rstest::rstest;
     use sedona_expr::scalar_udf::SedonaScalarUDF;
@@ -168,11 +170,29 @@ mod tests {
             &right_sedona_type,
         );
         let distance = arrow_array!(Int32, [Some(1), Some(1), Some(1), Some(1)]);
-        let expected: ArrayRef = arrow_array!(Boolean, [Some(true), Some(false), None, Some(true)]);
+        let expected: ArrayRef =
+            arrow_array!(Boolean, [Some(true), Some(false), None, Some(false)]);
         assert_array_equal(
             &tester.invoke_arrays(vec![arg1, arg2, distance]).unwrap(),
             &expected,
         );
+
+        let result = tester
+            .invoke_scalar_scalar_scalar(
+                create_scalar(Some("POINT EMPTY"), &left_sedona_type),
+                point_3_4.clone(),
+                distance_5.clone(),
+            )
+            .unwrap();
+        assert_eq!(result, ScalarValue::Boolean(Some(false)));
+        let result = tester
+            .invoke_scalar_scalar_scalar(
+                point_0_0,
+                create_scalar(Some("POLYGON EMPTY"), &right_sedona_type),
+                distance_5,
+            )
+            .unwrap();
+        assert_eq!(result, ScalarValue::Boolean(Some(false)));
     }
 
     #[rstest]
@@ -198,5 +218,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, ScalarValue::Boolean(Some(true)));
+    }
+
+    #[rstest]
+    // A line string of one coord has the distances of its point
+    #[case("LINESTRING (1 1)", "POINT (4 5)", 4.9, false)]
+    #[case("LINESTRING (1 1)", "POINT (4 5)", 5.0, true)]
+    #[case("LINESTRING (1 1)", "LINESTRING (4 5, 4 9)", 4.9, false)]
+    #[case("LINESTRING (1 1)", "POLYGON ((4 5, 6 5, 6 7, 4 7, 4 5))", 4.9, false)]
+    // The squared length of the segment overflows
+    #[case("POINT (3 5e199)", "LINESTRING (0 0, 0 1e200)", 1.0, false)]
+    fn degenerate_and_huge_line_strings(
+        #[case] lhs: &str,
+        #[case] rhs: &str,
+        #[case] distance: f64,
+        #[case] expected: bool,
+    ) {
+        let tester = ScalarUdfTester::new(
+            SedonaScalarUDF::from_impl("st_dwithin", st_dwithin_impl()).into(),
+            vec![
+                WKB_GEOMETRY,
+                WKB_GEOMETRY,
+                SedonaType::Arrow(DataType::Float64),
+            ],
+        );
+        let result = tester
+            .invoke_scalar_scalar_scalar(
+                create_scalar(Some(lhs), &WKB_GEOMETRY),
+                create_scalar(Some(rhs), &WKB_GEOMETRY),
+                distance,
+            )
+            .unwrap();
+        assert_eq!(result, ScalarValue::Boolean(Some(expected)));
     }
 }

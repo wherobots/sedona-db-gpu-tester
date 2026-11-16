@@ -24,7 +24,7 @@ use arrow_schema::DataType;
 use datafusion_common::cast::{as_boolean_array, as_float64_array, as_string_array};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
-use datafusion_common::{exec_datafusion_err, exec_err, ScalarValue};
+use datafusion_common::{ScalarValue, exec_datafusion_err, exec_err};
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_common::SedonaOptions;
 use sedona_expr::{
@@ -40,10 +40,11 @@ use sedona_raster::builder::RasterBuilder;
 use sedona_raster::error::RasterResultExt;
 use sedona_raster::traits::RasterRef;
 use sedona_raster_functions::{
-    crs_utils::{align_wkb_to_crs, resolve_crs},
     RasterExecutor,
+    crs_utils::{align_wkb_to_crs, resolve_crs},
+    pixel_type::parse_pixel_type,
 };
-use sedona_schema::datatypes::{SedonaType, RASTER};
+use sedona_schema::datatypes::{RASTER, SedonaType};
 use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::BandDataType;
 
@@ -266,25 +267,6 @@ impl SedonaScalarKernel for RsAsRaster {
 
         let result: ArrayRef = Arc::new(builder.finish()?);
         executor.finish(result)
-    }
-}
-
-fn parse_pixel_type(value: &str) -> Result<BandDataType> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "d" | "float64" => Ok(BandDataType::Float64),
-        "f" | "float32" => Ok(BandDataType::Float32),
-        "i" | "int32" => Ok(BandDataType::Int32),
-        "ui" | "uint32" => Ok(BandDataType::UInt32),
-        "s" | "int16" => Ok(BandDataType::Int16),
-        "us" | "uint16" => Ok(BandDataType::UInt16),
-        "b" | "uint8" => Ok(BandDataType::UInt8),
-        "i8" | "int8" => Ok(BandDataType::Int8),
-        "u64" | "uint64" => Ok(BandDataType::UInt64),
-        "i64" | "int64" => Ok(BandDataType::Int64),
-        other => exec_err!(
-            "Unsupported pixelType: {} (expected one of D/F/I/UI/S/US/B/I8/U64/I64 or int8/uint8/int16/uint16/int32/uint32/int64/uint64/float32/float64)",
-            other
-        ),
     }
 }
 
@@ -638,7 +620,7 @@ mod tests {
     use sedona_schema::datatypes::RASTER;
     use sedona_schema::datatypes::WKB_GEOMETRY;
     use sedona_schema::raster::BandDataType;
-    use sedona_testing::raster_spec::{assert_rasters_equal, RasterSpec};
+    use sedona_testing::raster_spec::{RasterSpec, assert_rasters_equal};
     use sedona_testing::{
         create::{create_array, create_array_item_crs, make_wkb},
         testers::ScalarUdfTester,
@@ -659,26 +641,6 @@ mod tests {
         let raster_array = reference_raster_spec().build();
         let raster_struct = RasterStructArray::try_new(&raster_array).unwrap();
         Grid::from_raster(&raster_struct.get(0).unwrap()).unwrap()
-    }
-
-    #[test]
-    fn test_parse_pixel_type() {
-        assert_eq!(parse_pixel_type("D").unwrap(), BandDataType::Float64);
-        assert_eq!(parse_pixel_type("f").unwrap(), BandDataType::Float32);
-        assert_eq!(parse_pixel_type("I").unwrap(), BandDataType::Int32);
-        assert_eq!(parse_pixel_type("S").unwrap(), BandDataType::Int16);
-        assert_eq!(parse_pixel_type("US").unwrap(), BandDataType::UInt16);
-        assert_eq!(parse_pixel_type("B").unwrap(), BandDataType::UInt8);
-        assert_eq!(parse_pixel_type("I8").unwrap(), BandDataType::Int8);
-        assert_eq!(parse_pixel_type("uint32").unwrap(), BandDataType::UInt32);
-        assert_eq!(parse_pixel_type("U64").unwrap(), BandDataType::UInt64);
-        assert_eq!(parse_pixel_type("I64").unwrap(), BandDataType::Int64);
-        assert_eq!(parse_pixel_type("float64").unwrap(), BandDataType::Float64);
-        assert_eq!(parse_pixel_type("float32").unwrap(), BandDataType::Float32);
-        assert_eq!(parse_pixel_type("int16").unwrap(), BandDataType::Int16);
-        assert_eq!(parse_pixel_type("uint16").unwrap(), BandDataType::UInt16);
-        assert_eq!(parse_pixel_type("int32").unwrap(), BandDataType::Int32);
-        assert_eq!(parse_pixel_type("uint8").unwrap(), BandDataType::UInt8);
     }
 
     #[test]

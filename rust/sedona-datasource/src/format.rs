@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use datafusion::{
     config::ConfigOptions,
     datasource::{
-        file_format::{file_compression_type::FileCompressionType, FileFormat, FileFormatFactory},
+        file_format::{FileFormat, FileFormatFactory, file_compression_type::FileCompressionType},
         listing::PartitionedFile,
         physical_plan::{
             FileGroupPartitioner, FileOpenFuture, FileOpener, FileScanConfig, FileSinkConfig,
@@ -32,20 +32,23 @@ use datafusion::{
         table_schema::TableSchema,
     },
 };
-use datafusion_catalog::{memory::DataSourceExec, Session};
-use datafusion_common::{not_impl_err, plan_err, DataFusionError, GetExt, Result, Statistics};
+use datafusion_catalog::{Session, memory::DataSourceExec};
+use datafusion_common::{
+    DataFusionError, GetExt, Result, Statistics, not_impl_err, plan_err,
+    tree_node::TreeNodeRecursion,
+};
 use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
 use datafusion_physical_expr::{
-    projection::ProjectionExprs, LexOrdering, LexRequirement, PhysicalExpr,
+    LexOrdering, LexRequirement, PhysicalExpr, projection::ProjectionExprs,
 };
 use datafusion_physical_plan::{
+    ExecutionPlan,
     filter_pushdown::{FilterPushdownPropagation, PushedDown},
     metrics::ExecutionPlanMetricsSet,
-    ExecutionPlan,
 };
 use futures::{
-    lock::{Mutex, OwnedMutexGuard},
     StreamExt, TryStreamExt,
+    lock::{Mutex, OwnedMutexGuard},
 };
 use object_store::{ObjectMeta, ObjectStore};
 
@@ -81,9 +84,28 @@ impl FileFormatFactory for ExternalFormatFactory {
         _state: &dyn Session,
         format_options: &HashMap<String, String>,
     ) -> Result<Arc<dyn FileFormat>> {
-        Ok(Arc::new(ExternalFileFormat {
-            spec: self.spec.with_options(format_options)?,
-        }))
+        // Match DataFusion's CREATE EXTERNAL TABLE convention: reader options
+        // live in the `format` namespace, while other dotted namespaces belong
+        // to table extensions such as object stores. Keep accepting unprefixed
+        // keys for callers that construct factories directly.
+        let spec_options: HashMap<String, String> = format_options
+            .iter()
+            .filter_map(|(key, value)| {
+                if let Some(key) = key.strip_prefix("format.") {
+                    Some((key.to_string(), value.clone()))
+                } else if !key.contains('.') {
+                    Some((key.clone(), value.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let spec = if spec_options.is_empty() {
+            self.spec.clone()
+        } else {
+            self.spec.with_options(&spec_options)?
+        };
+        Ok(Arc::new(ExternalFileFormat { spec }))
     }
 
     fn default(&self) -> Arc<dyn FileFormat> {
@@ -100,13 +122,18 @@ impl GetExt for ExternalFormatFactory {
 }
 
 #[derive(Debug)]
-pub(crate) struct ExternalFileFormat {
+pub struct ExternalFileFormat {
     spec: Arc<dyn ExternalFormatSpec>,
 }
 
 impl ExternalFileFormat {
     pub fn new(spec: Arc<dyn ExternalFormatSpec>) -> Self {
         Self { spec }
+    }
+
+    /// Return the fully configured external format specification.
+    pub fn spec(&self) -> &Arc<dyn ExternalFormatSpec> {
+        &self.spec
     }
 }
 
@@ -138,7 +165,11 @@ impl FileFormat for ExternalFileFormat {
         }
 
         let schema_concurrency = if self.spec.supports_concurrent_file_reads() {
-            state.config_options().execution.meta_fetch_concurrency
+            state
+                .config_options()
+                .execution
+                .meta_fetch_concurrency
+                .get()
         } else {
             1
         };
@@ -251,6 +282,25 @@ impl ExternalFileSource {
 }
 
 impl FileSource for ExternalFileSource {
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        for filter in &self.filters {
+            if f(filter)? == TreeNodeRecursion::Stop {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        if let Some(projection) = &self.split_projection {
+            for expr in &projection.source {
+                if f(&expr.expr)? == TreeNodeRecursion::Stop {
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn create_file_opener(
         &self,
         store: Arc<dyn ObjectStore>,
@@ -321,10 +371,19 @@ impl FileSource for ExternalFileSource {
         &self,
         projection: &ProjectionExprs,
     ) -> Result<Option<Arc<dyn FileSource>>> {
+        // A projection pushed down onto one already pushed down refers to that
+        // projection's output, not to the file schema (e.g., a rename on top of
+        // column pruning), so the two are merged first, as DataFusion's own
+        // file sources do.
+        let projection = match &self.split_projection {
+            Some(existing) => existing.source.try_merge(projection)?,
+            None => projection.clone(),
+        };
+
         // Use SplitProjection to handle any projection:
         // - file_indices provides column pruning (always works)
         // - ProjectionOpener handles reordering/expressions/renames after reading
-        let split_projection = SplitProjection::new(self.table_schema.file_schema(), projection);
+        let split_projection = SplitProjection::new(self.table_schema.file_schema(), &projection);
 
         Ok(Some(Arc::new(Self {
             split_projection: Some(split_projection),
@@ -464,7 +523,7 @@ mod test {
     use datafusion::{
         assert_batches_eq,
         datasource::listing::ListingTableUrl,
-        prelude::{col, SessionConfig, SessionContext},
+        prelude::{SessionConfig, SessionContext, col},
     };
     use datafusion_common::plan_err;
     use std::{
@@ -742,6 +801,44 @@ mod test {
     }
 
     #[tokio::test]
+    async fn projection_with_a_subset_and_a_rename() {
+        // Column pruning narrows the scan first; a projection that renames a
+        // column is then pushed down on top of it, and its column indices refer
+        // to the narrowed output rather than to the file schema.
+        let spec = Arc::new(EchoSpec::default());
+        let ctx = SessionContext::new();
+        let (_temp_dir, files) = create_echo_spec_temp_dir();
+        let provider = external_table(
+            spec,
+            &ctx,
+            files
+                .iter()
+                .map(|f| ListingTableUrl::parse(f.to_string_lossy()).unwrap())
+                .collect(),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        let batches = ctx
+            .read_table(provider)
+            .unwrap()
+            .select(vec![
+                datafusion::prelude::col("filter_count"),
+                datafusion::prelude::col("option_value").alias("renamed"),
+            ])
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).name(), "filter_count");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert_eq!(schema.field(1).name(), "renamed");
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+    }
+
+    #[tokio::test]
     async fn spec_listing_table_options() {
         let spec = Arc::new(EchoSpec::default())
             .with_options(&[("option_value".to_string(), "foofy".to_string())].into())
@@ -822,9 +919,10 @@ mod test {
         .await
         .unwrap_err();
 
-        assert!(err
-            .message()
-            .ends_with("does not match the expected extension 'echospec'"));
+        assert!(
+            err.message()
+                .ends_with("does not match the expected extension 'echospec'")
+        );
 
         // ...but we should be able to turn off the error
         external_table(

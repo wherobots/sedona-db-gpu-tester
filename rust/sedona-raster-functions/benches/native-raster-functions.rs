@@ -16,15 +16,15 @@
 // under the License.
 use std::sync::Arc;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion_common::error::Result;
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_schema::{
-    crs::{lnglat, Crs},
+    crs::{Crs, lnglat},
     datatypes::SedonaType,
 };
-use sedona_testing::benchmark_util::{benchmark, BenchmarkArgSpec::*, BenchmarkArgs};
+use sedona_testing::benchmark_util::{BenchmarkArgSpec::*, BenchmarkArgs, benchmark};
 
 fn sd_apply_default_crs_udf() -> SedonaScalarUDF {
     SedonaScalarUDF::new(
@@ -49,10 +49,15 @@ impl SedonaScalarKernel for SDApplyDefaultCRS {
             SedonaType::Wkb(edges, crs) if crs.is_none() => {
                 Ok(Some(SedonaType::Wkb(*edges, self.crs.clone())))
             }
+            SedonaType::WkbLarge(edges, crs) if crs.is_none() => {
+                Ok(Some(SedonaType::WkbLarge(*edges, self.crs.clone())))
+            }
             SedonaType::WkbView(edges, crs) if crs.is_none() => {
                 Ok(Some(SedonaType::WkbView(*edges, self.crs.clone())))
             }
-            SedonaType::Wkb(..) | SedonaType::WkbView(..) => Ok(Some(args[0].clone())),
+            SedonaType::Wkb(..) | SedonaType::WkbLarge(..) | SedonaType::WkbView(..) => {
+                Ok(Some(args[0].clone()))
+            }
             _ => Ok(None),
         }
     }
@@ -114,6 +119,15 @@ fn criterion_benchmark(c: &mut Criterion) {
     );
     benchmark::scalar(c, &f, "native-raster", "rs_height", Raster(64, 64));
     benchmark::scalar(c, &f, "native-raster", "rs_numbands", Raster(64, 64));
+    // RS_MakeEmptyRaster (extent form): one 64x64 float64 band per polygon.
+    // Int64 ranges are half-open, so (1, 2) is the constant 1.
+    benchmark::scalar(
+        c,
+        &f,
+        "native-raster",
+        "rs_makeemptyraster",
+        BenchmarkArgs::ArrayArrayArrayArray(Int64(1, 2), Int64(64, 65), Int64(64, 65), Polygon(4)),
+    );
     // RS_PixelAsPoint, RS_PixelAsCentroid, RS_PixelAsPolygon
     benchmark::scalar(
         c,

@@ -19,20 +19,62 @@ use std::sync::Arc;
 use crate::ensure_loaded::EnsureLoadedOptimizerRule;
 use crate::logical_plan_node::SpatialJoinPlanNode;
 use crate::push_down_leaf_projections::PushDownLeafProjections;
+use crate::reconcile_union_crs::ReconcileUnionCrs;
 use crate::spatial_expr_utils::{
-    collect_spatial_predicate_names, find_knn_query_side, KNNJoinQuerySide,
+    KNNJoinQuerySide, collect_spatial_predicate_names, find_knn_query_side,
 };
-use crate::wrap_async_udf::WrapAsyncUdfRule;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion_common::tree_node::Transformed;
-use datafusion_common::{NullEquality, Result};
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::tree_node::{Transformed, TransformedResult};
+use datafusion_common::{NullEquality, Result, plan_err};
 use datafusion_expr::logical_plan::Extension;
 use datafusion_expr::utils::{conjunction, split_conjunction};
 use datafusion_expr::{BinaryExpr, Expr, Operator};
 use datafusion_expr::{Filter, Join, JoinType, LogicalPlan};
-use datafusion_optimizer::{ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
+use datafusion_optimizer::{AnalyzerRule, ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 use sedona_common::option::SedonaOptions;
 use sedona_common::{sedona_internal_datafusion_err, sedona_internal_err};
+use sedona_expr::aggregate_udf::SedonaAggregateUDF;
+
+/// Reject ordered Sedona aggregates unless they explicitly declare that input
+/// ordering does not affect their result.
+#[derive(Default, Debug)]
+struct RejectOrderedAggregates;
+
+impl AnalyzerRule for RejectOrderedAggregates {
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        plan.transform_up_with_subqueries(|plan| plan.map_expressions(reject_ordered_aggregate))
+            .data()
+    }
+
+    fn name(&self) -> &str {
+        "sedona.reject_ordered_aggregates"
+    }
+}
+
+fn reject_ordered_aggregate(expr: Expr) -> Result<Transformed<Expr>> {
+    if let Expr::AggregateFunction(ref aggregate) = expr
+        && let Some(udf) = aggregate.func.inner().downcast_ref::<SedonaAggregateUDF>()
+        && !aggregate.params.order_by.is_empty()
+        && !udf.order_sensitivity().is_insensitive()
+    {
+        return plan_err!(
+            "ORDER BY is not supported for aggregate function {}",
+            aggregate.func.name()
+        );
+    }
+
+    Ok(Transformed::no(expr))
+}
+
+/// Register Sedona-specific semantic validation rules.
+pub fn register_sedona_analyzer_rules(
+    session_state_builder: SessionStateBuilder,
+) -> Result<SessionStateBuilder> {
+    Ok(session_state_builder
+        .with_analyzer_rule(Arc::new(RejectOrderedAggregates))
+        .with_analyzer_rule(Arc::new(ReconcileUnionCrs)))
+}
 
 /// Replace DataFusion 54.1's leaf projection pushdown rule with the version
 /// containing the `Unnest` barrier added by DataFusion PR #22620.
@@ -120,14 +162,12 @@ pub fn register_spatial_join_logical_optimizer(
     Ok(session_state_builder)
 }
 
-/// Register the `RS_EnsureLoaded`-wrapping logical optimizer rule and the
-/// DF-22662 workaround rule that preserves async UDF return-field metadata.
+/// Register the `RS_EnsureLoaded`-wrapping logical optimizer rule.
 ///
-/// Inserts [`EnsureLoadedOptimizerRule`] and [`WrapAsyncUdfRule`] immediately
-/// before DataFusion's `common_sub_expression_eliminate` so that, in the same
-/// optimizer pass, CSE can dedupe the `RS_EnsureLoaded(col)` wraps and the
-/// `sd_restore_metadata(...)` wrappers this rule injects.
-/// Falls back to appending if CSE isn't present.
+/// Inserts [`EnsureLoadedOptimizerRule`] immediately before DataFusion's
+/// `common_sub_expression_eliminate` so that, in the same optimizer pass,
+/// CSE can dedupe the `RS_EnsureLoaded(col)` wraps it injects. Falls back to
+/// appending if CSE isn't present.
 pub fn register_ensure_loaded_optimizer(
     mut session_state_builder: SessionStateBuilder,
 ) -> Result<SessionStateBuilder> {
@@ -136,26 +176,13 @@ pub fn register_ensure_loaded_optimizer(
         .get_or_insert_with(Optimizer::new);
 
     let ensure_loaded_rule = Arc::new(EnsureLoadedOptimizerRule);
-    // DF-22662: wrap async UDFs with sd_restore_metadata to preserve field metadata.
-    let wrap_async_rule = Arc::new(WrapAsyncUdfRule);
-
     match optimizer
         .rules
         .iter()
         .position(|r| r.name() == "common_sub_expression_eliminate")
     {
-        Some(cse_pos) => {
-            // Insert in reverse order so the effective order is:
-            // 1. EnsureLoadedOptimizerRule (wraps raster args with rs_ensureloaded)
-            // 2. WrapAsyncUdfRule (wraps async UDFs with sd_restore_metadata)
-            // 3. CSE (dedupes common subexpressions)
-            optimizer.rules.insert(cse_pos, wrap_async_rule);
-            optimizer.rules.insert(cse_pos, ensure_loaded_rule);
-        }
-        None => {
-            optimizer.rules.push(ensure_loaded_rule);
-            optimizer.rules.push(wrap_async_rule);
-        }
+        Some(cse_pos) => optimizer.rules.insert(cse_pos, ensure_loaded_rule),
+        None => optimizer.rules.push(ensure_loaded_rule),
     }
 
     Ok(session_state_builder)
@@ -205,12 +232,12 @@ impl OptimizerRule for KnnJoinEarlyRewrite {
         }
 
         // Join(filter=ST_KNN(...))
-        if let LogicalPlan::Join(join) = &plan {
-            if let Some(filter) = join.filter.as_ref() {
-                let names = collect_spatial_predicate_names(filter);
-                if names.contains("st_knn") {
-                    return rewrite_join_to_spatial_join_plan_node(join);
-                }
+        if let LogicalPlan::Join(join) = &plan
+            && let Some(filter) = join.filter.as_ref()
+        {
+            let names = collect_spatial_predicate_names(filter);
+            if names.contains("st_knn") {
+                return rewrite_join_to_spatial_join_plan_node(join);
             }
         }
 
@@ -271,7 +298,8 @@ impl OptimizerRule for SpatialJoinLogicalRewrite {
             // KNN joins should have already been rewritten by KnnJoinEarlyRewrite, so we shouldn't
             // see them here.
             return sedona_internal_err!(
-                "Found KNN predicate in SpatialJoinLogicalRewrite, which should have been handled by KnnJoinEarlyRewrite");
+                "Found KNN predicate in SpatialJoinLogicalRewrite, which should have been handled by KnnJoinEarlyRewrite"
+            );
         }
 
         // Join with with equi-join condition should be planned as a regular HashJoin
@@ -396,14 +424,14 @@ impl OptimizerRule for MergeSpatialFilterIntoJoin {
         }
 
         let LogicalPlan::Join(Join {
-            ref left,
-            ref right,
-            ref on,
-            ref filter,
+            left,
+            right,
+            on,
+            filter,
             join_type,
-            ref join_constraint,
-            ref null_equality,
-            ref null_aware,
+            join_constraint,
+            null_equality,
+            null_aware,
             ..
         }) = input.as_ref()
         else {
@@ -591,7 +619,7 @@ mod test {
     use datafusion::{
         execution::SessionStateBuilder,
         functions::core::expr_fn::get_field,
-        prelude::{col, SessionContext},
+        prelude::{SessionContext, col},
     };
 
     use super::*;

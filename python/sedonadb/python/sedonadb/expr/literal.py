@@ -15,11 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
-from sedonadb.utility import sedona  # noqa: F401
+from sedonadb._lib import PySedonaType
+from sedonadb.utility import register_pyarrow_extension_types, sedona  # noqa: F401
 
 if TYPE_CHECKING:
+    import geoarrow.types as gat
     from sedonadb_expr import GeoMethods, RasterMethods
 
     from sedonadb.expr import Expr
@@ -55,7 +57,7 @@ class Literal:
         return resolved_lit.__arrow_c_array__(requested_schema=requested_schema)
 
     def __repr__(self):
-        return f"<Literal>\n{repr(self._value)}"
+        return f"<Literal>\n{self._value!r}"
 
     @property
     def funcs(self) -> "Functions":
@@ -124,6 +126,92 @@ def lit(value: Any, ctx: Any = None) -> Literal:
         return Literal(value, ctx)
 
 
+class ScalarGeometry:
+    """A geometry or geography value
+
+    This is how a single geometry or geography value comes back to Python (e.g.,
+    from `DataFrame.item()`). Unlike a Shapely geometry, it keeps the CRS of the
+    value and whether it is a geometry or a geography, so it can be passed back
+    to a query as a literal.
+
+    Args:
+        array: A GeoArrow extension array.
+        i: The index of the value in the array.
+
+    Examples:
+
+        >>> sd = sedona.db.connect()
+        >>> point = sd.sql("SELECT ST_SetSRID(ST_Point(0, 1), 3857) AS geom").item()
+        >>> point
+        ScalarGeometry geometry<Wkb(epsg:3857)>
+        <POINT (0 1)>
+        >>> point.to_shapely()
+        <POINT (0 1)>
+        >>> sd.sql("SELECT ST_SRID($1) AS srid", params=(point,)).item()
+        3857
+    """
+
+    def __init__(self, array, i=0):
+        # Use slice directly - pa.array() would copy
+        self._array = array.slice(i, 1)
+
+    @property
+    def crs(self) -> Optional["gat.Crs"]:
+        """The CRS of this value, or None if it has none"""
+        return self._array.type.crs
+
+    @property
+    def wkb(self) -> bytes:
+        """This value as well-known binary (WKB)"""
+        return self._array[0].wkb
+
+    def to_shapely(self):
+        """Convert this value to a Shapely geometry, which drops its CRS"""
+        import shapely
+
+        return shapely.from_wkb(self.wkb)
+
+    @property
+    def __geo_interface__(self) -> dict:
+        return self.to_shapely().__geo_interface__
+
+    def __arrow_c_array__(self, requested_schema=None):
+        """Implement the array protocol so this works with lit()"""
+        return self._array.__arrow_c_array__(requested_schema=requested_schema)
+
+    def __eq__(self, other) -> bool:
+        """Two values are equal if their WKB, their CRS (as the engine compares
+        CRSes) and whether they are a geometry or a geography are"""
+        if not isinstance(other, ScalarGeometry):
+            return NotImplemented
+        return self.wkb == other.wkb and self._kind() == other._kind()
+
+    def __hash__(self) -> int:
+        # Equal values can spell their CRS differently but share their WKB
+        return hash(self.wkb)
+
+    def _kind(self) -> PySedonaType:
+        # The edges and the CRS without the storage of the WKB, which can differ
+        # for the same value (e.g., binary_view from a Parquet file); pyarrow's
+        # comparison of GeoArrow types leaves out the edges and the CRS
+        import geoarrow.pyarrow as ga
+
+        value_type = self._array.type
+        return PySedonaType(
+            ga.wkb().with_crs(value_type.crs).with_edge_type(value_type.edge_type)
+        )
+
+    def __repr__(self) -> str:
+        sedona_type = repr(PySedonaType(self._array.type)).removeprefix("SedonaType ")
+        try:
+            wkt = self.to_shapely().wkt
+        except ImportError:
+            return f"ScalarGeometry {sedona_type}"
+        if len(wkt) > 70:
+            wkt = wkt[:67] + "..."
+        return f"ScalarGeometry {sedona_type}\n<{wkt}>"
+
+
 def _resolve_arrow_lit(obj: Any):
     qualified_name = _qualified_type_name(obj)
     if qualified_name in SPECIAL_CASED_LITERALS:
@@ -145,6 +233,201 @@ def _resolve_arrow_lit(obj: Any):
         raise ValueError(
             f"Can't create SedonaDB literal from object of type {qualified_name}"
         ) from e
+
+
+def _resolve_py_value(array, i=0):
+    """Resolve the value at index i of an Arrow array to a Python object
+
+    This is the reverse of `_resolve_arrow_lit`. A value is what pyarrow's
+    `as_py()` gives, except that a geometry or geography is a `ScalarGeometry`,
+    which keeps its CRS, and a raster is a `Raster` that refers to the array
+    rather than a copy of it. The items of a list, the fields of a struct and the
+    entries of a map are resolved in the same way: in them, `as_py()` gives a
+    geometry as WKB.
+    """
+    import geoarrow.pyarrow as ga
+    import pyarrow as pa
+
+    if array.slice(i, 1).null_count:
+        return None
+
+    value_type = array.type
+    if isinstance(value_type, ga.GeometryExtensionType):
+        return ScalarGeometry(array, i)
+    elif isinstance(value_type, pa.ExtensionType):
+        if value_type.extension_name == "sedona.raster":
+            from sedonadb.raster import Raster
+
+            return Raster(array, i)
+    elif pa.types.is_map(value_type):
+        # A map's keys and items are those of every row, which its offsets index
+        start, end = array.offsets[i].as_py(), array.offsets[i + 1].as_py()
+        keys = array.keys.slice(start, end - start)
+        items = array.items.slice(start, end - start)
+        return [
+            (_resolve_py_value(keys, j), _resolve_py_value(items, j))
+            for j in range(len(keys))
+        ]
+    elif (
+        pa.types.is_list(value_type)
+        or pa.types.is_large_list(value_type)
+        or pa.types.is_fixed_size_list(value_type)
+        or pa.types.is_list_view(value_type)
+        or pa.types.is_large_list_view(value_type)
+    ):
+        items = array.slice(i, 1).flatten()
+        return [_resolve_py_value(items, j) for j in range(len(items))]
+    elif pa.types.is_struct(value_type):
+        value = array.slice(i, 1)
+        return {
+            field.name: _resolve_py_value(value.field(k))
+            for k, field in enumerate(value_type)
+        }
+
+    return array[i].as_py()
+
+
+def _resolve_arrow_array(values, type):
+    """Resolve Python values to an array, with extension-specific handling.
+
+    This is the array counterpart of `_resolve_arrow_lit`, spiritually equivalent
+    to `_resolve_arrow_lit` except (1) arrays that are resolved do not have to have
+    a length of 1 and (2) iterables resolve to their element form (e.g., lists) instead
+    of as a list of elements.
+
+    This is currently limited to UDF handling, where there is always a target type
+    available (the return type, which has already been calculated), and the values
+    list is always a Python list, and arrow arrays because they are relatively
+    straightforward.
+    """
+    import pyarrow as pa
+
+    register_pyarrow_extension_types()
+
+    if type is None:
+        raise ValueError(
+            "Resolving an array without a target type is not yet supported"
+        )
+
+    target_sedona_type = PySedonaType(type)
+    target_pyarrow_type = pa.DataType._import_from_c_capsule(
+        target_sedona_type.__arrow_c_schema__()
+    )
+
+    # Special case arrow arrays first
+    if hasattr(values, "__arrow_c_array__"):
+        schema, array = values.__arrow_c_array__()
+        source_sedona_type = PySedonaType(schema)
+
+        # Use == on the PySedonaType to handle geometry type CRS differences.
+        if target_sedona_type == source_sedona_type:
+            return pa.Array._import_from_c_capsule(
+                target_sedona_type.__arrow_c_schema__(), array
+            )
+
+        source_pyarrow_array = pa.Array._import_from_c_capsule(
+            source_sedona_type.__arrow_c_schema__(), array
+        )
+
+        # Use SedonaType's extension name to avoid pyarrow's stripping of
+        # unrecognized extensions
+        if target_sedona_type.extension_name is None:
+            return source_pyarrow_array.cast(target_pyarrow_type)
+        elif target_sedona_type.extension_name == "geoarrow.wkb":
+            return _resolve_geometry_array(source_pyarrow_array, target_pyarrow_type)
+        else:
+            raise TypeError(f"Unsupported cast to extension {target_sedona_type!r}")
+
+    # The destination type gets to handle conversion
+    if target_sedona_type is None or target_sedona_type.extension_name is None:
+        return pa.array(values, target_pyarrow_type)
+    elif target_sedona_type.extension_name == "geoarrow.wkb":
+        return _resolve_geometry_array(values, target_pyarrow_type)
+    elif target_sedona_type.extension_name == "sedona.raster":
+        return _resolve_raster_array(values, target_pyarrow_type)
+    else:
+        raise TypeError(f"Unsupported cast to extension {target_sedona_type!r}")
+
+
+def _resolve_geometry_array(values, target_pyarrow_type):
+    """Resolve WKB storage or Shapely objects to the declared geometry type."""
+    import geoarrow.pyarrow as ga
+    import pyarrow as pa
+
+    # We can't quite use ga.array() or ga.as_geoarrow() here because of some bugs
+    # https://github.com/geoarrow/geoarrow-python/pull/84
+    if isinstance(values, pa.ExtensionArray):
+        if values.type.extension_name != "geoarrow.wkb":
+            raise TypeError(
+                f"Unsupported cast from {values.type} to {target_pyarrow_type}"
+            )
+
+        # Normalize storage to compare metadata using Sedona's CRS equality.
+        source_type = ga.wkb().with_metadata(values.type.__arrow_ext_serialize__())
+        target_type = ga.wkb().with_metadata(
+            target_pyarrow_type.__arrow_ext_serialize__()
+        )
+        if PySedonaType(source_type) != PySedonaType(target_type):
+            raise TypeError(
+                f"Can't cast geometry with different CRS or edge type: "
+                f"{values.type} to {target_pyarrow_type}"
+            )
+        storage = values.storage.cast(target_pyarrow_type.storage_type)
+    elif isinstance(values, pa.Array):
+        storage = values.cast(target_pyarrow_type.storage_type)
+    elif isinstance(values, list):
+        # For lists, we find the first non-null element and choose the conversion
+        # based on that. This doesn't support mixed types in the list; however,
+        # adds significant overhead (~2x slower) for lists of small objects like
+        # Shapely points. For now, we just support a single element type in a
+        # list.
+        first_value = next((value for value in values if value is not None), None)
+        qualified_name = _qualified_type_name(first_value)
+        if qualified_name in ("builtins.bytes", "builtins.NoneType"):
+            # Empty and all-null lists also convert directly to WKB storage.
+            wkb_storage = values
+        elif qualified_name in (
+            "geoarrow.pyarrow._scalar.WkbScalar",
+            "geoarrow.pyarrow._scalar.WktScalar",
+            "geoarrow.pyarrow._scalar.GeometryExtensionScalar",
+        ):
+            wkb_storage = (
+                None if value is None or not value.is_valid else value.wkb
+                for value in values
+            )
+        else:
+            import shapely
+
+            wkb_storage = shapely.to_wkb(values, flavor="iso")
+        storage = pa.array(wkb_storage, target_pyarrow_type.storage_type)
+    else:
+        raise TypeError(f"Can't create geometry array from {type(values).__name__}")
+
+    return target_pyarrow_type.wrap_array(storage)
+
+
+def _resolve_raster_array(values, target_pyarrow_type):
+    import pyarrow as pa
+
+    from sedonadb.raster import Raster
+
+    # The equal array type should already have been handled, this is just
+    # from a list of Raster (or None) objects.
+    if not isinstance(values, list):
+        raise TypeError("Expected a list of Raster or None objects")
+
+    storage_type = target_pyarrow_type.storage_type
+    arrays = []
+    for value in values:
+        if value is None:
+            arrays.append(pa.nulls(1, storage_type))
+        elif isinstance(value, Raster):
+            arrays.append(pa.array(value).storage)
+        else:
+            raise TypeError("Expected a list of Raster or None objects")
+
+    storage = pa.concat_arrays(arrays) if arrays else pa.nulls(0, storage_type)
+    return target_pyarrow_type.wrap_array(storage)
 
 
 def _lit_from_geoarrow_scalar(obj):

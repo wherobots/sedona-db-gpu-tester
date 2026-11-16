@@ -73,6 +73,27 @@ SEXP savvy_configure_proj_shared__impl(SEXP c_arg__shared_library_path,
   return handle_result(res);
 }
 
+SEXP savvy_configure_gdal_prefix_native__impl(SEXP c_arg__prefix) {
+  return handle_result(savvy_configure_gdal_prefix_native__ffi(c_arg__prefix));
+}
+
+SEXP savvy_configure_gdal_shared__impl(SEXP c_arg__shared_library_path) {
+  return handle_result(
+      savvy_configure_gdal_shared__ffi(c_arg__shared_library_path));
+}
+
+SEXP savvy_configure_gdal_system_native__impl(void) {
+  return handle_result(savvy_configure_gdal_system_native__ffi());
+}
+
+SEXP savvy_configure_proj_prefix_native__impl(SEXP c_arg__prefix) {
+  return handle_result(savvy_configure_proj_prefix_native__ffi(c_arg__prefix));
+}
+
+SEXP savvy_configure_proj_system_native__impl(void) {
+  return handle_result(savvy_configure_proj_system_native__ffi());
+}
+
 SEXP savvy_init_r_runtime__impl(DllInfo *c_arg___dll_info) {
   SEXP res = savvy_init_r_runtime__ffi(c_arg___dll_info);
   return handle_result(res);
@@ -123,8 +144,29 @@ SEXP savvy_InternalContext_new__impl(SEXP c_arg__option_keys,
   return handle_result(res);
 }
 
-SEXP savvy_InternalContext_read_parquet__impl(SEXP self__, SEXP c_arg__paths) {
-  SEXP res = savvy_InternalContext_read_parquet__ffi(self__, c_arg__paths);
+SEXP savvy_InternalContext_read__impl(SEXP self__, SEXP c_arg__paths,
+                                      SEXP c_arg__option_keys,
+                                      SEXP c_arg__option_values,
+                                      SEXP c_arg__partitioning,
+                                      SEXP c_arg__partitioning_set,
+                                      SEXP c_arg__check_extension,
+                                      SEXP c_arg__format) {
+  SEXP res = savvy_InternalContext_read__ffi(
+      self__, c_arg__paths, c_arg__option_keys, c_arg__option_values,
+      c_arg__partitioning, c_arg__partitioning_set, c_arg__check_extension,
+      c_arg__format);
+  return handle_result(res);
+}
+
+SEXP savvy_InternalContext_read_parquet__impl(SEXP self__, SEXP c_arg__paths,
+                                              SEXP c_arg__option_keys,
+                                              SEXP c_arg__option_values,
+                                              SEXP c_arg__geometry_columns,
+                                              SEXP c_arg__validate,
+                                              SEXP c_arg__partitioning) {
+  SEXP res = savvy_InternalContext_read_parquet__ffi(
+      self__, c_arg__paths, c_arg__option_keys, c_arg__option_values,
+      c_arg__geometry_columns, c_arg__validate, c_arg__partitioning);
   return handle_result(res);
 }
 
@@ -383,6 +425,16 @@ static const R_CallMethodDef CallEntries[] = {
      (DL_FUNC)&savvy_apply_crses_to_sf_stream__impl, 4},
     {"savvy_configure_proj_shared__impl",
      (DL_FUNC)&savvy_configure_proj_shared__impl, 3},
+    {"savvy_configure_gdal_prefix_native__impl",
+     (DL_FUNC)&savvy_configure_gdal_prefix_native__impl, 1},
+    {"savvy_configure_gdal_shared__impl",
+     (DL_FUNC)&savvy_configure_gdal_shared__impl, 1},
+    {"savvy_configure_gdal_system_native__impl",
+     (DL_FUNC)&savvy_configure_gdal_system_native__impl, 0},
+    {"savvy_configure_proj_prefix_native__impl",
+     (DL_FUNC)&savvy_configure_proj_prefix_native__impl, 1},
+    {"savvy_configure_proj_system_native__impl",
+     (DL_FUNC)&savvy_configure_proj_system_native__impl, 0},
     {"savvy_init_r_runtime_interrupts__impl",
      (DL_FUNC)&savvy_init_r_runtime_interrupts__impl, 2},
     {"savvy_sedonadb_adbc_init_func__impl",
@@ -397,8 +449,10 @@ static const R_CallMethodDef CallEntries[] = {
      (DL_FUNC)&savvy_InternalContext_list_functions__impl, 1},
     {"savvy_InternalContext_new__impl",
      (DL_FUNC)&savvy_InternalContext_new__impl, 2},
+    {"savvy_InternalContext_read__impl",
+     (DL_FUNC)&savvy_InternalContext_read__impl, 8},
     {"savvy_InternalContext_read_parquet__impl",
-     (DL_FUNC)&savvy_InternalContext_read_parquet__impl, 2},
+     (DL_FUNC)&savvy_InternalContext_read_parquet__impl, 7},
     {"savvy_InternalContext_register_scalar_udf__impl",
      (DL_FUNC)&savvy_InternalContext_register_scalar_udf__impl, 2},
     {"savvy_InternalContext_scalar_udf_xptr__impl",

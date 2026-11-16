@@ -93,8 +93,7 @@ jobs:
           VCPKG_DEFAULT_TRIPLET: x64-windows-dynamic-release
           VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-bincache
           CMAKE_TOOLCHAIN_FILE: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
-          CIBW_BUILD: "*-win_amd64"
-          CIBW_TEST_REQUIRES: pytest adbc_driver_manager geoarrow-pyarrow geopandas
+          CIBW_BUILD: "cp310-win_amd64"
           # Test command exits 0 even on failure so CIBW continues building all wheels;
           # failures are recorded in .test_failed and checked after upload.
           # We use Python here to be absolutely sure there are no shell escaping issues.
@@ -113,7 +112,8 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: release-wheels-windows-x86_64
-          path: python/sedonadb/dist/*.whl
+          path: python/sedonadb/dist/*-cp310-abi3-*.whl
+          if-no-files-found: error
 
       - name: Fail if tests failed
         run: python -c "import sys,pathlib; f=pathlib.Path('.test_failed'); print(f'Checking for {f.absolute()}, exists={f.exists()}'); sys.exit(1 if f.exists() else 0)"
@@ -164,7 +164,6 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
           VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-bincache
-          CIBW_TEST_REQUIRES: pytest adbc_driver_manager geoarrow-pyarrow geopandas duckdb
           # Test command exits 0 even on failure so CIBW continues building all wheels;
           # failures are recorded in .test_failed and checked after upload.
           CIBW_TEST_COMMAND: "pytest {package}/tests -vv -o faulthandler_timeout=600 || touch {project}/.test_failed"
@@ -179,7 +178,8 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: release-wheels-macOS-arm64
-          path: python/sedonadb/dist/*.whl
+          path: python/sedonadb/dist/*-cp310-abi3-*.whl
+          if-no-files-found: error
 
       - name: Fail if tests failed
         run: test ! -f .test_failed
@@ -230,7 +230,6 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
           VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-bincache
-          CIBW_TEST_REQUIRES: pytest adbc_driver_manager geoarrow-pyarrow geopandas duckdb
           # Test command exits 0 even on failure so CIBW continues building all wheels;
           # failures are recorded in .test_failed and checked after upload.
           CIBW_TEST_COMMAND: "pytest {package}/tests -vv -o faulthandler_timeout=600 || touch {project}/.test_failed"
@@ -246,7 +245,8 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: release-wheels-macOS-amd64
-          path: python/sedonadb/dist/*.whl
+          path: python/sedonadb/dist/*-cp310-abi3-*.whl
+          if-no-files-found: error
 
       - name: Fail if tests failed
         run: test ! -f .test_failed
@@ -294,7 +294,6 @@ jobs:
           CIBW_SKIP: "*musllinux*"
           VCPKG_BINARY_CACHE_HOST: ${{ github.workspace }}/vcpkg-bincache
           HOST_WORKSPACE: ${{ github.workspace }}
-          CIBW_TEST_REQUIRES: pytest adbc_driver_manager geoarrow-pyarrow geopandas duckdb
           # Test command exits 0 even on failure so CIBW continues building all wheels;
           # failures are recorded in .test_failed and checked after upload. The
           # marker goes to the bind-mounted /host-workspace rather than {project}:
@@ -312,7 +311,8 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: release-wheels-${{ matrix.config.label }}
-          path: python/sedonadb/dist/*.whl
+          path: python/sedonadb/dist/*-cp310-abi3-*.whl
+          if-no-files-found: error
 
       - name: Fail if tests failed
         run: test ! -f .test_failed

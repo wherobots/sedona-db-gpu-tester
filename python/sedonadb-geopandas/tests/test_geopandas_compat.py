@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import operator
 import sys
 
 import geoarrow.pyarrow as ga
@@ -150,6 +151,120 @@ def test_filter_matches_geopandas(cities):
     assert_geopandas_expr_equal(cities, lambda df: df[df["pop"] > 150], sort_by="name")
 
 
+_COMPARED = """
+SELECT f, g, CAST(i AS BIGINT) AS i, s, CAST(t AS TIMESTAMP) AS t,
+    ST_Point(0, 0) AS geometry
+FROM (VALUES
+    (1.5, 1.5, 1, 'a', '2020-01-01'),
+    (CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE), 2, 'b', '2020-01-02'),
+    (NULL, 2.0, NULL, NULL, NULL),
+    (CAST('-0.0' AS DOUBLE), 0.0, 0, 'a', '2020-01-01')
+) AS v(f, g, i, s, t)
+"""
+
+
+@pytest.mark.parametrize("op", ["gt", "ge", "lt", "le", "eq", "ne"])
+@pytest.mark.parametrize(
+    "left, right",
+    [
+        ("f", 1.5),
+        ("f", 0),
+        ("f", -0.0),
+        ("f", np.nan),
+        ("f", None),
+        ("f", "g"),
+        ("i", 1),
+        ("i", "f"),
+        ("t", pd.Timestamp("2020-01-01")),
+    ],
+)
+def test_comparisons_follow_pandas(op, left, right):
+    # A missing value on either side (null, or NaN in a float column) compares
+    # False, and True for !=; -0.0 equals 0.0. The engine alone answers null
+    # for a null, puts NaN above every number, and -0.0 below 0.0.
+    gdf = GeoDataFrame(sgpd.default_context().sql(_COMPARED))
+    frame = gdf.to_geopandas()
+    ours_right = gdf[right] if right in ("f", "g") else right
+    theirs_right = frame[right] if right in ("f", "g") else right
+    got = getattr(operator, op)(gdf[left], ours_right).to_pandas().tolist()
+    assert got == getattr(operator, op)(frame[left], theirs_right).tolist()
+
+
+@pytest.mark.parametrize("op", ["gt", "ge", "lt", "le", "eq", "ne"])
+@pytest.mark.parametrize("value", [-0.0, 0.0, 1.5, np.nan, None])
+def test_comparisons_with_literals_follow_pandas(op, value):
+    # A lit() operand compares as the value it holds: its -0.0 equals 0.0,
+    # and a missing one compares False (True for !=).
+    gdf = GeoDataFrame(sgpd.default_context().sql(_COMPARED))
+    got = getattr(operator, op)(gdf["f"], lit(value)).to_pandas().tolist()
+    assert got == getattr(operator, op)(gdf.to_geopandas()["f"], value).tolist()
+
+
+@pytest.mark.parametrize("encode", ["dictionary", "run_end"])
+@pytest.mark.parametrize("value", [-0.0, 1.5, np.nan, None])
+def test_encoded_literals_compare_as_their_value(encode, value):
+    plain = pa.array([value], pa.float64())
+    if encode == "dictionary":
+        encoded = plain.dictionary_encode()
+    else:
+        encoded = pa.RunEndEncodedArray.from_arrays(pa.array([1], pa.int32()), plain)
+    gdf = GeoDataFrame(sgpd.default_context().sql(_COMPARED))
+    frame = gdf.to_geopandas()
+    for op in (operator.eq, operator.ne, operator.lt):
+        got = op(gdf["f"], lit(encoded)).to_pandas().tolist()
+        assert got == op(frame["f"], value).tolist()
+
+
+@pytest.mark.parametrize("values", [[-0.0, 1.0], []])
+def test_literals_of_other_than_one_value_are_rejected(values):
+    # Not compared against the first value, nor failing to find one.
+    gdf = GeoDataFrame(sgpd.default_context().sql(_COMPARED))
+    with pytest.raises(ValueError, match=f"resolving to {len(values)} values"):
+        gdf["f"] == lit(pa.array(values, pa.float64()))
+
+
+@pytest.mark.parametrize("type", [pa.float32(), pa.float64()])
+@pytest.mark.parametrize("encode", ["dictionary", "run_end"])
+def test_encoded_float_columns_compare_as_plain_ones(type, encode):
+    # isnan(), behind the missing-value checks, accepts no encoded type.
+    values = pa.array([1.0, np.nan, None, -0.0], type)
+    if encode == "dictionary":
+        encoded = values.dictionary_encode()
+    else:
+        ends = pa.array(range(1, len(values) + 1), pa.int32())
+        encoded = pa.RunEndEncodedArray.from_arrays(ends, values)
+    ctx = sgpd.default_context()
+    ours = GeoDataFrame(ctx.create_data_frame(pa.table({"x": encoded})))["x"]
+    plain = GeoDataFrame(ctx.create_data_frame(pa.table({"x": values})))["x"]
+    for f in [
+        lambda s: s == 1.0,
+        lambda s: s != 1.0,
+        lambda s: s <= 0.0,
+        lambda s: s == s,
+        lambda s: s.isna(),
+    ]:
+        assert f(ours).to_pandas().tolist() == f(plain).to_pandas().tolist()
+    assert ours.isin([np.nan]).to_pandas().tolist() == [False, True, True, False]
+
+
+def test_string_equality_with_missing_values():
+    gdf = GeoDataFrame(sgpd.default_context().sql(_COMPARED))
+    assert (gdf["s"] == "a").to_pandas().tolist() == [True, False, False, True]
+    assert (gdf["s"] != "a").to_pandas().tolist() == [False, True, True, False]
+
+
+def test_masks_with_missing_values_select_the_rows_pandas_does():
+    gdf = GeoDataFrame(sgpd.default_context().sql(_COMPARED))
+    frame = gdf.to_geopandas()
+    for ours, theirs in [
+        (gdf["f"] > 100, frame["f"] > 100),
+        (~(gdf["f"] > 100), ~(frame["f"] > 100)),
+        (gdf["f"] == gdf["f"], frame["f"] == frame["f"]),
+        ((gdf["f"] != 1.5) & (gdf["i"] > 0), (frame["f"] != 1.5) & (frame["i"] > 0)),
+    ]:
+        assert len(gdf[ours].to_geopandas()) == int(theirs.sum())
+
+
 def test_to_crs_matches_geopandas(cities):
     # Exercises CRS propagation through an operation (asserted via check_crs).
     assert_geopandas_expr_equal(
@@ -189,7 +304,7 @@ def test_repr_is_lazy(cities):
 
 def test_operand_rejects_arraylike(cities):
     gdf = sgpd.from_geopandas(cities)
-    with pytest.raises(TypeError, match="array-like"):
+    with pytest.raises(TypeError, match="isn't supported"):
         gdf["pop"] > cities["pop"]  # a real pandas Series
 
 
@@ -1035,6 +1150,26 @@ def test_geoarrow_scalars_to_new_columns():
     assert plain._geometry_name == "g"
 
 
+def test_valid_non_wkb_geoarrow_scalar_assigns():
+    # A GeoArrow scalar in native (non-WKB) storage becomes a geometry literal
+    # with its own CRS; a CRS-less one takes the destination column's.
+    points = gpd.GeoDataFrame(
+        {"v": [1, 2]}, geometry=gpd.points_from_xy([0, 5], [0, 5]), crs=3857
+    )
+    native = ga.as_geoarrow(["POINT (1 2)"], coord_type=ga.CoordType.SEPARATED)
+    for scalar, crs in (
+        (native[0], "EPSG:3857"),
+        (ga.with_crs(native, "EPSG:4326")[0], "EPSG:4326"),
+    ):
+        gdf = sgpd.from_geopandas(points)
+        gdf["geometry"] = scalar
+        gdf["fresh"] = scalar
+        result = gdf.to_geopandas()
+        assert result.geometry.tolist() == [Point(1, 2)] * 2
+        assert result["fresh"].tolist() == [Point(1, 2)] * 2
+        assert result.crs == crs
+
+
 def test_non_wkb_geoarrow_null_keeps_its_own_crs():
     # The metadata-rebuilt null stamped str(StringCrs(...)) into ST_SetCRS,
     # which is not PROJJSON and failed deserialization; the canonical
@@ -1283,7 +1418,7 @@ def test_tz_aware_timestamp_scalars_keep_nanoseconds_and_zone():
         crs=3857,
     )
     gdf = sgpd.from_geopandas(points)
-    stamp = pd.Timestamp("2026-01-01 00:00:00.000000001", tz="US/Pacific")
+    stamp = pd.Timestamp("2026-01-01 00:00:00.000000001", tz="America/Los_Angeles")
     gdf["ts"] = stamp
     got = gdf.to_geopandas()["ts"]
     assert got.dt.tz is not None
@@ -1310,3 +1445,844 @@ def test_nat_assigns_as_datetime_missing():
     gdf["geometry"] = pd.NaT
     assert gdf._geometry_name == "geometry"
     assert gdf.to_geopandas()["geometry"].isna().all()
+
+
+def points():
+    """A small frame in a projected CRS, shared across the tests."""
+    return gpd.GeoDataFrame(
+        {"name": ["A", "B", "C"], "v": [1, 2, 3]},
+        geometry=gpd.GeoSeries.from_wkt(["POINT (0 0)", "POINT (5 5)", "POINT (9 9)"]),
+        crs="EPSG:3857",
+    )
+
+
+def parcels():
+    """Overlapping polygons per zone, so a dissolve has something to union."""
+    return gpd.GeoDataFrame(
+        {"zone": ["A", "A", "B"], "v": [1, 2, 3]},
+        geometry=gpd.GeoSeries.from_wkt(
+            [
+                "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))",
+                "POLYGON ((1 1, 3 1, 3 3, 1 3, 1 1))",
+                "POLYGON ((5 5, 7 5, 7 7, 5 7, 5 5))",
+            ]
+        ),
+        crs="EPSG:3857",
+    )
+
+
+def test_dissolve_matches_geopandas():
+    parcels = gpd.GeoDataFrame(
+        {"zone": ["A", "A", "B"], "v": [1, 2, 3]},
+        geometry=gpd.GeoSeries.from_wkt(
+            [
+                "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))",
+                "POLYGON ((1 1, 3 1, 3 3, 1 3, 1 1))",
+                "POLYGON ((5 5, 7 5, 7 7, 5 7, 5 5))",
+            ]
+        ),
+        crs="EPSG:3857",
+    )
+    got = (
+        sgpd.from_geopandas(parcels)
+        .dissolve(by="zone")
+        .to_geopandas()
+        .sort_values("zone")
+    )
+    expected = parcels.dissolve(by="zone")
+    # Unioned geometry per group, and non-geometry columns aggregated as "first",
+    # both matching GeoPandas.
+    assert got.area.round(6).tolist() == expected.area.round(6).tolist()
+    assert got["v"].tolist() == expected["v"].tolist()
+    # The group key stays a column here rather than becoming the index.
+    assert "zone" in got.columns
+
+
+def test_dissolve_without_by():
+    parcels = gpd.GeoDataFrame(
+        {"zone": ["A", "A", "B"], "v": [1, 2, 3]},
+        geometry=gpd.GeoSeries.from_wkt(
+            [
+                "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))",
+                "POLYGON ((1 1, 3 1, 3 3, 1 3, 1 1))",
+                "POLYGON ((5 5, 7 5, 7 7, 5 7, 5 5))",
+            ]
+        ),
+        crs="EPSG:3857",
+    )
+    got = sgpd.from_geopandas(parcels).dissolve().to_geopandas()
+    assert len(got) == len(parcels.dissolve()) == 1
+
+
+def test_dissolve_multiple_keys():
+    parcels = gpd.GeoDataFrame(
+        {"zone": ["A", "A", "B"], "v": [1, 2, 3]},
+        geometry=gpd.GeoSeries.from_wkt(
+            [
+                "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))",
+                "POLYGON ((1 1, 3 1, 3 3, 1 3, 1 1))",
+                "POLYGON ((5 5, 7 5, 7 7, 5 7, 5 5))",
+            ]
+        ),
+        crs="EPSG:3857",
+    )
+    got = sgpd.from_geopandas(parcels).dissolve(by=["zone"]).to_geopandas()
+    assert sorted(got["zone"]) == ["A", "B"]
+
+
+def test_dissolve_validation():
+    parcels = gpd.GeoDataFrame(
+        {"zone": ["A", "A", "B"], "v": [1, 2, 3]},
+        geometry=gpd.GeoSeries.from_wkt(
+            [
+                "POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))",
+                "POLYGON ((1 1, 3 1, 3 3, 1 3, 1 1))",
+                "POLYGON ((5 5, 7 5, 7 7, 5 7, 5 5))",
+            ]
+        ),
+        crs="EPSG:3857",
+    )
+    gdf = sgpd.from_geopandas(parcels)
+    with pytest.raises(NotImplementedError, match="aggfunc"):
+        gdf.dissolve(by="zone", aggfunc="sum")
+    with pytest.raises(KeyError, match="not found"):
+        gdf.dissolve(by="nope")
+    with pytest.raises(ValueError, match="active geometry"):
+        gdf[["zone", "v"]].dissolve(by="zone")
+
+
+@pytest.mark.parametrize(
+    "wkts",
+    [
+        ["POINT (0 0)", "POINT (1 1)"],
+        ["LINESTRING (0 0, 1 1)", "LINESTRING (1 1, 2 2)"],
+        ["POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))", "POLYGON ((1 1, 3 1, 3 3, 1 3, 1 1))"],
+    ],
+    ids=["points", "lines", "polygons"],
+)
+def test_dissolve_handles_every_geometry_type(wkts):
+    # ST_Union_Agg only initializes for polygonal input, so points and linestrings
+    # used to dissolve to NULL geometry.
+    g = gpd.GeoDataFrame(
+        {"zone": ["A", "A"]},
+        geometry=gpd.GeoSeries.from_wkt(wkts),
+        crs="EPSG:3857",
+    )
+    got = sgpd.from_geopandas(g).dissolve(by="zone").to_geopandas()
+    expected = g.dissolve(by="zone")
+    assert got.geometry.iloc[0] is not None
+    assert got.geometry.iloc[0].geom_type == expected.geometry.iloc[0].geom_type
+    assert got.geometry.iloc[0].equals(expected.geometry.iloc[0])
+
+
+def test_dissolve_dropna_matches_geopandas():
+    g = gpd.GeoDataFrame(
+        {"zone": ["A", None], "v": [1, 2]},
+        geometry=gpd.GeoSeries.from_wkt(
+            [
+                "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))",
+                "POLYGON ((2 2, 3 2, 3 3, 2 3, 2 2))",
+            ]
+        ),
+        crs="EPSG:3857",
+    )
+    gdf = sgpd.from_geopandas(g)
+    # GeoPandas drops the missing key by default; dropna=False keeps it.
+    assert len(gdf.dissolve(by="zone").to_geopandas()) == len(g.dissolve(by="zone"))
+    assert len(gdf.dissolve(by="zone", dropna=False).to_geopandas()) == 2
+
+
+def test_dissolve_drops_nan_group_keys():
+    # dropna has to cover IEEE NaN as well as SQL null: a float key read from
+    # pandas carries NaN, which grouping otherwise treats as its own group.
+    df = sgpd.default_context().sql(
+        "SELECT CAST('NaN' AS DOUBLE) k, ST_Point(0.0, 0.0) geometry "
+        "UNION ALL SELECT 1.0, ST_Point(1.0, 1.0)"
+    )
+    assert len(GeoDataFrame(df).dissolve(by="k").to_geopandas()) == 1
+    assert len(GeoDataFrame(df).dissolve(by="k", dropna=False).to_geopandas()) == 2
+
+
+def test_dissolve_groups_null_and_nan_keys_together():
+    # Missing-key handling only ran with dropna=True, so with dropna=False a
+    # SQL NULL and an IEEE NaN in the same float key column formed two
+    # missing groups where pandas forms one. NaN is normalized to null before
+    # grouping, in both modes.
+    tbl = pa.table(
+        {
+            "k": pa.array([None, float("nan"), 1.0], pa.float64()),
+            "geometry": ga.as_wkb(["POINT (0 0)", "POINT (1 1)", "POINT (2 2)"]),
+        }
+    )
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(tbl))
+    kept = gdf.dissolve(by="k", dropna=False).to_geopandas()
+    assert len(kept) == 2
+    assert kept["k"].isna().sum() == 1
+    missing = kept[kept["k"].isna()].geometry.iloc[0]
+    assert missing.geom_type == "MultiPoint" and len(missing.geoms) == 2
+    dropped = gdf.dissolve(by="k").to_geopandas()
+    assert dropped["k"].tolist() == [1.0]
+
+
+def test_dissolve_float32_keys_keep_their_type():
+    # The NaN gate was built as Float64, so adding it widened every Float32
+    # key column, missing values or not; the gate now takes the key's type.
+    tbl = pa.table(
+        {
+            "k": pa.array([1.0, 1.0, float("nan")], pa.float32()),
+            "geometry": ga.as_wkb(["POINT (0 0)", "POINT (1 1)", "POINT (2 2)"]),
+        }
+    )
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(tbl))
+    out = gdf.dissolve(by="k", dropna=False)
+    assert pa.schema(out._df.schema).field("k").type == pa.float32()
+    assert len(out.to_geopandas()) == 2
+
+
+def test_columns_named_self_work_everywhere():
+    # Keyword-form mutate(**{name: expr}) collides with mutate's own first
+    # parameter when the column is named "self"; every site now passes a
+    # positional alias. Covers assignment, reprojection, and dissolve keys.
+    tbl = pa.table(
+        {
+            "self": pa.array([1.0, 1.0], pa.float64()),
+            "geometry": ga.as_wkb(["POINT (0 0)", "POINT (1 1)"]),
+        }
+    )
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(tbl))
+    gdf["self"] = gdf["self"]
+    assert len(gdf.dissolve(by="self").to_geopandas()) == 1
+    reproj = GeoDataFrame(
+        sgpd.default_context().sql(
+            "SELECT ST_SetSRID(ST_Point(0.0, 0.0), 4326) AS self"
+        ),
+        geometry="self",
+    ).to_crs("EPSG:3857")
+    assert "3857" in str(reproj.crs)
+
+
+def test_dissolve_by_nested_float_column():
+    # _is_floating used to match the rendered type string, so `list<item: double>`
+    # looked like a float column and dropna called isnan() on it, failing at
+    # planning time.
+    df = sgpd.default_context().sql(
+        "SELECT [1.0, 2.0] AS k, ST_Point(0.0, 0.0) AS geometry"
+    )
+    got = GeoDataFrame(df).dissolve(by="k").to_geopandas()
+    assert len(got) == 1
+
+
+def test_dissolve_all_null_group_is_empty_geometry():
+    # GeoPandas returns GEOMETRYCOLLECTION EMPTY rather than None, which behaves
+    # differently for isna, is_empty, predicates and serialization.
+    df = sgpd.default_context().sql(
+        "SELECT 'A' AS z, "
+        "ST_SetSRID(ST_GeomFromText(CAST(NULL AS VARCHAR)), 3857) AS geometry "
+        "UNION ALL SELECT 'A', "
+        "ST_SetSRID(ST_GeomFromText(CAST(NULL AS VARCHAR)), 3857)"
+    )
+    got = GeoDataFrame(df).dissolve(by="z").to_geopandas()
+    expected = gpd.GeoDataFrame(
+        {"z": ["A", "A"]},
+        geometry=gpd.GeoSeries.from_wkt([None, None]),
+        crs="EPSG:3857",
+    ).dissolve(by="z")
+    assert got.geometry.iloc[0].equals(expected.geometry.iloc[0])
+    assert got.geometry.iloc[0].is_empty
+    assert not got.geometry.isna().any()
+
+
+def test_dissolve_rejects_empty_key_list():
+    # Matches GeoPandas: an explicit empty iterable is an error, unlike by=None.
+    points = gpd.GeoDataFrame(
+        {"name": ["A", "B", "C"], "v": [1, 2, 3]},
+        geometry=gpd.points_from_xy([0, 5, 9], [0, 5, 9]),
+        crs=3857,
+    )
+    gdf = sgpd.from_geopandas(points)
+    with pytest.raises(ValueError, match="No group keys"):
+        gdf.dissolve(by=[])
+    assert len(gdf.dissolve().to_geopandas()) == 1
+
+
+def test_dissolve_categorical_is_observed_only():
+    # Documented divergence: unused categories do not produce empty groups (the
+    # category domain does not survive a relational aggregation).
+
+    cat = gpd.GeoDataFrame(
+        {"z": pd.Categorical(["A"], categories=["A", "B"])},
+        geometry=gpd.GeoSeries.from_wkt(["POINT (0 0)"]),
+        crs="EPSG:3857",
+    )
+    assert len(cat.dissolve(by="z")) == 2  # GeoPandas observed=False default
+    assert len(sgpd.from_geopandas(cat).dissolve(by="z").to_geopandas()) == 1
+
+
+def test_is_floating_unwraps_dictionary_encoding():
+    from sedonadb_geopandas._frame import _is_floating
+
+    tbl = pa.table(
+        {
+            "k": pa.DictionaryArray.from_arrays(
+                pa.array([0, 1], type=pa.int8()), pa.array([1.0, float("nan")])
+            ),
+            "x": [1, 2],
+        }
+    )
+    df = sgpd.default_context().create_data_frame(tbl)
+    assert _is_floating(df, "k")
+
+
+def test_series_arithmetic():
+    points = gpd.GeoDataFrame(
+        {"name": ["A", "B", "C"], "v": [1, 2, 3]},
+        geometry=gpd.points_from_xy([0, 5, 9], [0, 5, 9]),
+        crs=3857,
+    )
+    gdf = sgpd.from_geopandas(points)
+    for label, series, expected in [
+        ("add", gdf["v"] + 1, (points["v"] + 1).tolist()),
+        ("radd", 1 + gdf["v"], (1 + points["v"]).tolist()),
+        ("sub", gdf["v"] - 1, (points["v"] - 1).tolist()),
+        ("rsub", 10 - gdf["v"], (10 - points["v"]).tolist()),
+        ("mul", gdf["v"] * 2, (points["v"] * 2).tolist()),
+        ("truediv", gdf["v"] / 2, (points["v"] / 2).tolist()),
+        ("neg", -gdf["v"], (-points["v"]).tolist()),
+    ]:
+        assert sorted(series.to_pandas().tolist()) == sorted(expected), label
+
+
+def test_series_arithmetic_between_columns():
+    points = gpd.GeoDataFrame(
+        {"name": ["A", "B", "C"], "v": [1, 2, 3]},
+        geometry=gpd.points_from_xy([0, 5, 9], [0, 5, 9]),
+        crs=3857,
+    )
+    gdf = sgpd.from_geopandas(points)
+    got = (gdf["v"] + gdf["v"]).to_pandas().tolist()
+    assert sorted(got) == sorted((points["v"] + points["v"]).tolist())
+
+
+def test_operators_reject_bare_expression():
+    # Same provenance hole as assignment: a bare expression built from another
+    # frame resolved against this one and silently contributed this frame's values.
+    points = gpd.GeoDataFrame(
+        {"name": ["A", "B", "C"], "v": [1, 2, 3]},
+        geometry=gpd.points_from_xy([0, 5, 9], [0, 5, 9]),
+        crs=3857,
+    )
+    gdf = sgpd.from_geopandas(points)
+    other_raw = sgpd.default_context().create_data_frame(points)
+    with pytest.raises(TypeError, match="bare expression"):
+        gdf["v"] + other_raw["v"]
+
+
+def test_operators_still_accept_literals():
+    points = gpd.GeoDataFrame(
+        {"name": ["A", "B", "C"], "v": [1, 2, 3]},
+        geometry=gpd.points_from_xy([0, 5, 9], [0, 5, 9]),
+        crs=3857,
+    )
+    gdf = sgpd.from_geopandas(points)
+    assert sorted((gdf["v"] > lit(1)).to_pandas().tolist()) == [False, True, True]
+
+
+def test_operators_accept_numpy_scalars():
+    # Operators rejected anything with __array__, including NumPy scalars, even
+    # though assignment already accepted them.
+    points = gpd.GeoDataFrame(
+        {"name": ["A", "B", "C"], "v": [1, 2, 3]},
+        geometry=gpd.points_from_xy([0, 5, 9], [0, 5, 9]),
+        crs=3857,
+    )
+    gdf = sgpd.from_geopandas(points)
+    assert sorted((gdf["v"] + np.int64(1)).to_pandas().tolist()) == [2, 3, 4]
+    assert sorted((gdf["v"] > np.float64(1)).to_pandas().tolist()) == [
+        False,
+        True,
+        True,
+    ]
+
+
+def test_operators_still_reject_arrays():
+    points = gpd.GeoDataFrame(
+        {"name": ["A", "B", "C"], "v": [1, 2, 3]},
+        geometry=gpd.points_from_xy([0, 5, 9], [0, 5, 9]),
+        crs=3857,
+    )
+    gdf = sgpd.from_geopandas(points)
+    with pytest.raises(TypeError, match="isn't supported"):
+        gdf["v"] + np.array([1, 2, 3])
+
+
+def test_numpy_array_plus_series_is_rejected_whole():
+    # Without opting out of ufunc dispatch, NumPy broadcasts element-by-element
+    # and returns an object array of lazy Series instead of an error.
+    points = gpd.GeoDataFrame(
+        {"name": ["A", "B", "C"], "v": [1, 2, 3]},
+        geometry=gpd.points_from_xy([0, 5, 9], [0, 5, 9]),
+        crs=3857,
+    )
+    gdf = sgpd.from_geopandas(points)
+    with pytest.raises(TypeError):
+        np.array([10, 20, 30]) + gdf["v"]
+    with pytest.raises(TypeError):
+        gdf["v"] + np.array([10, 20, 30])
+
+
+def test_division_preserves_decimal_exactness():
+    from decimal import Decimal
+
+    df = sgpd.default_context().create_data_frame(
+        pd.DataFrame({"d": [Decimal("1.23")]})
+    )
+    got = (GeoDataFrame(df)["d"] / Decimal("0.1")).to_pandas().tolist()
+    # Forced through double this would be 12.299999999999999.
+    assert got == [Decimal("12.300000")]
+
+
+def test_division_still_true_for_integers():
+    df = sgpd.default_context().sql("SELECT 1 AS n UNION ALL SELECT 3")
+    assert sorted((GeoDataFrame(df)["n"] / 2).to_pandas().tolist()) == [0.5, 1.5]
+
+
+def test_division_unwraps_dictionary_int():
+    # A dictionary<int64> column is integer for division purposes; it used to
+    # skip the double cast and truncate.
+
+    tbl = pa.table(
+        {
+            "k": pa.DictionaryArray.from_arrays(
+                pa.array([0, 1], type=pa.int8()), pa.array([1, 3], type=pa.int64())
+            ),
+            "x": [1, 2],
+        }
+    )
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(tbl))
+    assert sorted((gdf["k"] / 2).to_pandas().tolist()) == [0.5, 1.5]
+
+
+def test_division_unwraps_run_end_encoded_int():
+    # Run-end encoding, like dictionary encoding, changes storage rather than
+    # meaning: an encoded integer column is integer for true division.
+    ree = pa.RunEndEncodedArray.from_arrays(
+        pa.array([2, 3], pa.int32()), pa.array([1, 3], pa.int64())
+    )
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pa.table({"n": ree})))
+    assert (gdf["n"] / 2).to_pandas().tolist() == [0.5, 0.5, 1.5]
+    assert (4 / gdf["n"]).to_pandas().tolist() == [4.0, 4.0, 4 / 3]
+
+
+def test_division_by_decimal_stays_decimal():
+    # An integer divided by a Decimal must stay in decimal arithmetic; the
+    # unconditional double cast used to force a float result.
+    from decimal import Decimal
+
+    gdf = GeoDataFrame(sgpd.default_context().sql("SELECT 1 AS n"))
+    got = (gdf["n"] / Decimal("0.5")).to_pandas().tolist()
+    assert isinstance(got[0], Decimal)
+
+
+def test_division_by_wrapped_integers_is_true_division():
+    # lit(2) and pa.scalar(2) are integer operands just as 2 is.
+
+    gdf = GeoDataFrame(sgpd.default_context().sql("SELECT 1 AS n UNION ALL SELECT 3"))
+    assert sorted((gdf["n"] / lit(2)).to_pandas().tolist()) == [0.5, 1.5]
+    assert sorted((gdf["n"] / pa.scalar(2)).to_pandas().tolist()) == [0.5, 1.5]
+
+
+def test_multi_value_literal_errors_propagate():
+    # The Literal resolver's precise error (a Series of length != 1) must
+    # reach the caller instead of being swallowed by the numeric resolver.
+
+    gdf = GeoDataFrame(sgpd.default_context().sql("SELECT 4 AS n"))
+    with pytest.raises(ValueError, match="length != 1"):
+        gdf["n"] / lit(pd.Series([2, 3]))
+    with pytest.raises(ValueError, match="single value"):
+        gdf["n"] / lit(pa.array([2, 3]))
+
+
+def test_oversized_integer_literal_raises_overflow():
+    # An integer payload past int64 failed Arrow conversion inside the
+    # numeric resolver with a misleading ValueError; it is reported as the
+    # overflow it is, matching the unwrapped-integer behavior.
+
+    gdf = GeoDataFrame(sgpd.default_context().sql("SELECT 4 AS n"))
+    with pytest.raises(OverflowError):
+        gdf["n"] / lit(2**63)
+
+
+def test_unsigned_numpy_literal_divides():
+    # The oversized-integer pre-check used numbers.Integral, which np.uint64
+    # satisfies, so wrapping a perfectly valid uint64 operand in lit() turned
+    # a working division into an OverflowError. Only plain Python ints past
+    # int64 are pre-checked; NumPy integers resolve as their own Arrow type.
+    gdf = GeoDataFrame(sgpd.default_context().sql("SELECT 4 AS n"))
+    value = np.uint64(2**63)
+    unwrapped = (gdf["n"] / value).to_pandas().tolist()
+    assert (gdf["n"] / lit(value)).to_pandas().tolist() == unwrapped
+    assert (lit(value) / gdf["n"]).to_pandas().tolist() == [2**63 / 4]
+    # A plain int past int64 still reports the overflow it is.
+    with pytest.raises(OverflowError):
+        gdf["n"] / lit(2**63)
+
+
+def test_singleton_container_literals_resolve_as_numbers():
+    # SedonaDB accepts one-element containers as single-value literals; the
+    # numeric resolver must look through them like any other wrapper.
+
+    gdf = GeoDataFrame(sgpd.default_context().sql("SELECT 1 AS n UNION ALL SELECT 3"))
+    assert sorted((gdf["n"] / lit(pa.array([2]))).to_pandas().tolist()) == [0.5, 1.5]
+    assert sorted((gdf["n"] / lit(pd.Series([2]))).to_pandas().tolist()) == [0.5, 1.5]
+
+
+def test_duration_arithmetic_matches_pandas():
+    gdf = GeoDataFrame(
+        sgpd.default_context().create_data_frame(
+            pd.DataFrame({"t": [pd.Timedelta(days=2)]})
+        )
+    )
+    assert (gdf["t"] * 2).to_pandas().tolist() == [pd.Timedelta(days=4)]
+    assert (2 * gdf["t"]).to_pandas().tolist() == [pd.Timedelta(days=4)]
+    assert (gdf["t"] / 2).to_pandas().tolist() == [pd.Timedelta(days=1)]
+    with pytest.raises(TypeError, match="numeric scalars"):
+        gdf["t"] * "2"
+
+
+def test_duration_division_is_exact_for_integral_divisors():
+    # Routing an integral divisor through float64 rounded 2**53 + 1 ticks.
+
+    gdf = GeoDataFrame(
+        sgpd.default_context().create_data_frame(
+            pd.DataFrame({"t": [pd.Timedelta(2**53 + 1)]})
+        )
+    )
+    assert (gdf["t"] / 1).to_pandas().tolist()[0].value == 2**53 + 1
+
+
+def test_duration_arithmetic_accepts_wrapped_numbers():
+    gdf = GeoDataFrame(
+        sgpd.default_context().create_data_frame(
+            pd.DataFrame({"t": [pd.Timedelta(days=2)]})
+        )
+    )
+    assert (gdf["t"] * lit(2)).to_pandas().tolist() == [pd.Timedelta(days=4)]
+    assert (gdf["t"] / pa.scalar(2)).to_pandas().tolist() == [pd.Timedelta(days=1)]
+
+
+def test_duration_non_finite_results_are_nat():
+    # Pandas yields NaT for these; the int64 cast-back used to fail on inf/NaN.
+
+    gdf = GeoDataFrame(
+        sgpd.default_context().create_data_frame(
+            pd.DataFrame({"t": [pd.Timedelta(days=2)]})
+        )
+    )
+    assert (gdf["t"] / 0).to_pandas().isna().all()
+    assert (gdf["t"] * float("nan")).to_pandas().isna().all()
+
+
+def test_duration_division_by_infinity_is_zero_preserving_nulls():
+    # Blanket NaT for non-finite operands regressed /inf, which pandas defines
+    # as zero for valid rows while keeping source nulls null.
+
+    gdf = GeoDataFrame(
+        sgpd.default_context().create_data_frame(
+            pd.DataFrame({"t": [pd.Timedelta(days=2), pd.NaT]})
+        )
+    )
+    got = (gdf["t"] / float("inf")).to_pandas()
+    assert got.tolist()[0] == pd.Timedelta(0)
+    assert pd.isna(got.tolist()[1])
+
+
+def test_duration_multiplication_overflow_raises():
+    # Integer tick multiplication silently wrapped on int64 overflow:
+    # 2**62 ticks * 3 came back as a large negative duration. It raises when
+    # computed instead, as pandas 3 does, while in-range rows, the largest
+    # exactly representable product included, compute normally.
+    boundary = (2**63 - 1) // 3
+    pdf = pd.DataFrame({"t": [pd.Timedelta(boundary), pd.NaT]})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pdf))
+    got = (gdf["t"] * 3).to_pandas()
+    assert got.tolist()[0] == pd.Timedelta(boundary * 3)
+    assert pd.isna(got.tolist()[1])
+
+    pdf = pd.DataFrame({"t": [pd.Timedelta(2**62), pd.Timedelta(5)]})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pdf))
+    with pytest.raises(Exception, match="overflowed the 64-bit tick range"):
+        (gdf["t"] * 3).to_pandas()
+
+
+def test_oversized_integer_duration_operand_raises_overflow():
+    # An integer operand past the signed 64-bit tick range failed literal
+    # construction with an unrelated ValueError, aborting even the rows whose
+    # result is representable. pandas raises OverflowError for the operand
+    # itself, on multiplication and division alike; so does this layer now.
+
+    gdf = GeoDataFrame(
+        sgpd.default_context().create_data_frame(
+            pd.DataFrame({"t": [pd.Timedelta(0), pd.Timedelta(1)]})
+        )
+    )
+    for operand in (2**63, pa.scalar(2**63, pa.uint64())):
+        with pytest.raises(OverflowError):
+            gdf["t"] * operand
+        with pytest.raises(OverflowError):
+            gdf["t"] / operand
+
+
+def test_identity_float_duration_arithmetic_is_exact():
+    # `* 1.0` and `/ 1.0` return the input unchanged even at the largest
+    # tick, where the float64 round trip cannot represent the value and the
+    # cast back aborted. Only the identities ±1.0 take the exact integer
+    # path; other floats keep pandas' float64 semantics, so `* 3.0` at the
+    # largest tick overflows.
+    pdf = pd.DataFrame({"t": [pd.Timedelta(2**63 - 1)]})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pdf))
+    assert (gdf["t"] * 1.0).to_pandas().tolist()[0] == pd.Timedelta(2**63 - 1)
+    assert (gdf["t"] / 1.0).to_pandas().tolist()[0] == pd.Timedelta(2**63 - 1)
+    with pytest.raises(Exception, match="overflowed the 64-bit tick range"):
+        (gdf["t"] * 3.0).to_pandas()
+
+
+def test_float_duration_overflow_raises_readably():
+    # A finite float result past the tick range used to abort with an opaque
+    # int64 cast failure. It raises the same overflow error as the integer
+    # path, in both directions (pandas clamps positive float overflow to
+    # Timedelta.max and sends negative overflow to NaT; neither is copied).
+    for value in (pd.Timedelta(2**62), pd.Timedelta(-(2**62))):
+        pdf = pd.DataFrame({"t": [value, pd.Timedelta(5)]})
+        gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pdf))
+        with pytest.raises(Exception, match="overflowed the 64-bit tick range"):
+            (gdf["t"] / 0.5).to_pandas()
+
+    # In-range rows and source nulls are unaffected.
+    pdf = pd.DataFrame({"t": [pd.Timedelta(5), pd.NaT]})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pdf))
+    got = (gdf["t"] / 0.5).to_pandas().tolist()
+    assert got[0] == pd.Timedelta(10)
+    assert pd.isna(got[1])
+
+    # A float operand past int64 stays on the float path the way pandas keeps
+    # it in float arithmetic, rather than raising the integer-operand
+    # OverflowError up front: zero ticks survive, anything else overflows.
+    pdf = pd.DataFrame({"t": [pd.Timedelta(0), pd.NaT]})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pdf))
+    got = (gdf["t"] * 1e300).to_pandas().tolist()
+    assert got[0] == pd.Timedelta(0)
+    assert pd.isna(got[1])
+    pdf = pd.DataFrame({"t": [pd.Timedelta(5)]})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pdf))
+    with pytest.raises(Exception, match="overflowed the 64-bit tick range"):
+        (gdf["t"] * 1e300).to_pandas()
+
+
+def test_int64_min_duration_tick_is_missing():
+    # INT64_MIN is a representable Arrow duration tick but the pandas missing
+    # sentinel (Timedelta.min sits one tick above it). Treated as a value it
+    # aborted `/ -1` on arithmetic overflow, survived `* -1.0` internally by
+    # wrapping back onto the sentinel (so a chained `* 0` resurrected it as
+    # zero), and divided into real-looking results. It is null at the source.
+
+    tbl = pa.table({"t": pa.array([-(2**63), 5], pa.duration("ns"))})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(tbl))
+    got = (gdf["t"] / -1).to_pandas()
+    assert pd.isna(got.tolist()[0])
+    assert got.tolist()[1] == pd.Timedelta(-5)
+    chained = ((gdf["t"] * -1.0) * 0).to_pandas()
+    assert pd.isna(chained.tolist()[0])
+    assert chained.tolist()[1] == pd.Timedelta(0)
+    divided = (gdf["t"] / 3).to_pandas()
+    assert pd.isna(divided.tolist()[0])
+
+
+def test_float_duration_arithmetic_is_exact_for_integral_floats():
+    # An integral-valued float multiplies and divides a duration exactly, as
+    # the same integer does (and as pandas does, as of pandas 3.1): float64
+    # would lose sub-tick precision above 2**53, even on the identities ±1.0.
+    # Any other float computes in float64, as in pandas.
+    pdf = pd.DataFrame({"t": [pd.Timedelta(2**53 + 1), pd.Timedelta(-7)]})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pdf))
+    for integral in (3.0, -3.0, 1.0, -1.0, 2.0):
+        exact = int(integral)
+        assert (gdf["t"] * integral).to_pandas().tolist() == (pdf["t"] * exact).tolist()
+        assert (gdf["t"] / integral).to_pandas().tolist() == (pdf["t"] / exact).tolist()
+    for fractional in (1 / 3, 2.5, 0.5):
+        assert (gdf["t"] * fractional).to_pandas().tolist() == (
+            pdf["t"] * fractional
+        ).tolist()
+        assert (gdf["t"] / fractional).to_pandas().tolist() == (
+            pdf["t"] / fractional
+        ).tolist()
+
+
+def test_negative_float_overflow_and_exact_boundary():
+    # -2**64 is a genuine negative overflow (unlike exactly -2**63, which lands
+    # on the NaT sentinel), and (2**62 - 512) / 0.5 lands exactly on the
+    # largest float64 inside the tick range, which must stay valid.
+    pdf = pd.DataFrame({"t": [pd.Timedelta(-(2**62))]})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pdf))
+    with pytest.raises(Exception, match="overflowed the 64-bit tick range"):
+        (gdf["t"] / 0.25).to_pandas()
+    pdf = pd.DataFrame({"t": [pd.Timedelta(2**62 - 512)]})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pdf))
+    assert (gdf["t"] / 0.5).to_pandas().tolist() == [pd.Timedelta(2**63 - 1024)]
+
+
+def test_sentinel_ticks_are_missing_for_every_operator():
+    # The sentinel fix covered only * and /. Addition, subtraction, and
+    # comparisons still treated INT64_MIN as data: self-subtraction returned
+    # zero, adding one tick produced a finite Timedelta.min, subtracting one
+    # tick aborted the query on arithmetic overflow, and equality matched, so
+    # a filter retained a row that materializes as NaT. The sentinel becomes
+    # null where columns are read, covering every operator at once.
+
+    tbl = pa.table({"t": pa.array([-(2**63), 5], pa.duration("ns"))})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(tbl))
+    got = (gdf["t"] - gdf["t"]).to_pandas()
+    assert pd.isna(got.tolist()[0])
+    assert got.tolist()[1] == pd.Timedelta(0)
+    got = (gdf["t"] + pd.Timedelta(1)).to_pandas()
+    assert pd.isna(got.tolist()[0])
+    assert got.tolist()[1] == pd.Timedelta(6)
+    got = (gdf["t"] - np.timedelta64(1, "ns")).to_pandas()
+    assert pd.isna(got.tolist()[0])
+    assert got.tolist()[1] == pd.Timedelta(4)
+    kept = gdf[gdf["t"] == gdf["t"]].to_pandas()["t"]
+    assert kept.tolist() == [pd.Timedelta(5)]
+
+
+def test_sentinel_timestamp_ticks_are_missing():
+    # Timestamps share the sentinel: numpy-backed pandas stores datetime NaT
+    # as INT64_MIN too, so the column boundary treats both temporal kinds the
+    # same way.
+
+    tbl = pa.table({"ts": pa.array([-(2**63), 10**18], pa.timestamp("ns"))})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(tbl))
+    got = (gdf["ts"] - gdf["ts"]).to_pandas()
+    assert pd.isna(got.tolist()[0])
+    assert got.tolist()[1] == pd.Timedelta(0)
+    kept = gdf[gdf["ts"] == gdf["ts"]].to_pandas()["ts"]
+    assert kept.tolist() == [pd.Timestamp(10**18)]
+
+
+def test_dissolve_temporal_keys_group_sentinels_as_missing():
+    # numpy-backed pandas delivers NaT group keys as sentinel ticks; the key
+    # column goes through the same normalization as column access, so dropna
+    # drops them like GeoPandas drops NaT keys, and dropna=False groups them
+    # together as one missing-key group.
+
+    tbl = pa.table({"k": pa.array([-(2**63), 5, 5], pa.duration("ns"))})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(tbl))
+    gdf["geometry"] = Point(0, 0)
+    assert len(gdf.dissolve(by="k").to_geopandas()) == 1
+    kept = gdf.dissolve(by="k", dropna=False).to_geopandas()
+    assert len(kept) == 2
+    assert kept["k"].isna().sum() == 1
+
+    stamped = GeoDataFrame(
+        sgpd.default_context().sql(
+            "SELECT TIMESTAMP '2026-01-01' AS ts, ST_Point(0.0, 0.0) AS geometry"
+        )
+    )
+    assert len(stamped.dissolve(by="ts").to_geopandas()) == 1
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        np.timedelta64(3, "us"),
+        pd.Timedelta(microseconds=3),
+        pa.scalar(3, pa.duration("us")),
+        pa.scalar(3000, pa.duration("ns")),
+    ],
+    ids=["numpy-us", "pandas", "arrow-us", "arrow-ns"],
+)
+def test_duration_scalar_representations_are_unit_coerced(value):
+    # Every representation of the same 3µs must behave identically against a
+    # nanosecond column. The engine's own mixed-unit answer widens to its
+    # interval type — materializing as DateOffset objects, not timedeltas —
+    # so duration scalars are rebuilt in the column's unit first.
+
+    gdf = GeoDataFrame(
+        sgpd.default_context().create_data_frame(
+            pd.DataFrame({"t": [pd.Timedelta(1000), pd.NaT]})
+        )
+    )
+    got = (gdf["t"] + value).to_pandas()
+    assert got.tolist()[0] == pd.Timedelta(microseconds=4)
+    assert pd.isna(got.tolist()[1])
+    got = (gdf["t"] - value).to_pandas()
+    assert got.tolist()[0] == pd.Timedelta(microseconds=-2)
+    assert pd.isna(got.tolist()[1])
+
+
+def test_duration_unit_coercion_is_exact_or_raises():
+    # Coercing into a coarser column unit must divide exactly: the column
+    # cannot hold a fraction of a tick, and silently rounding would corrupt.
+
+    tbl = pa.table({"t": pa.array([5], pa.duration("us"))})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(tbl))
+    got = (gdf["t"] + pa.scalar(2000, pa.duration("ns"))).to_pandas()
+    assert got.tolist()[0] == pd.Timedelta(microseconds=7)
+    with pytest.raises(ValueError, match="exactly"):
+        gdf["t"] + pa.scalar(1500, pa.duration("ns"))
+
+
+def test_duration_comparisons_do_not_require_exact_units():
+    # Unit coercion exists for arithmetic, where mixed units widen to the
+    # engine's interval type; comparisons across units are already correct,
+    # and requiring an exact conversion rejected valid ones.
+    tbl = pa.table({"t": pa.array([1, 2], pa.duration("us"))})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(tbl))
+    value = pd.Timedelta(1500, "ns")
+    assert (gdf["t"] < value).to_pandas().tolist() == [True, False]
+    assert (gdf["t"] > value).to_pandas().tolist() == [False, True]
+    assert (gdf["t"] == value).to_pandas().tolist() == [False, False]
+    # Arithmetic still requires the exact conversion.
+    with pytest.raises(ValueError, match="exactly"):
+        gdf["t"] + value
+
+
+def test_derived_sentinel_is_missing_in_duration_arithmetic():
+    # Nulling the sentinel where columns are read does not cover a derived
+    # expression that lands on it: Timedelta.min - 1ns is INT64_MIN, which
+    # multiplied to zero, divided into a real-looking duration, and aborted
+    # the query on / -1.
+    pdf = pd.DataFrame({"t": [pd.Timedelta.min, pd.Timedelta(10)]})
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pdf))
+    derived = gdf["t"] - pd.Timedelta(1)
+    for got in (derived * 0, derived / 2, derived / -1):
+        values = got.to_pandas().tolist()
+        assert pd.isna(values[0])
+        assert not pd.isna(values[1])
+
+
+def test_dictionary_duration_columns_treat_sentinel_as_missing():
+    # Dictionary-encoded duration columns bypassed read-time sentinel
+    # normalization, so the sentinel aborted / -1 and survived an equality
+    # filter.
+    column = pa.array([-(2**63), 10], pa.duration("ns")).dictionary_encode()
+    gdf = GeoDataFrame(
+        sgpd.default_context().create_data_frame(pa.table({"t": column}))
+    )
+    got = (gdf["t"] / -1).to_pandas().tolist()
+    assert pd.isna(got[0])
+    assert got[1] == pd.Timedelta(-10)
+    assert gdf[gdf["t"] == gdf["t"]]["t"].to_pandas().tolist() == [pd.Timedelta(10)]
+
+
+@pytest.mark.parametrize("type", [pa.duration("ns"), pa.timestamp("ns")])
+def test_sliced_run_end_encoded_temporal_columns_read_correctly(type):
+    # Sentinel normalization decodes run-end-encoded temporal columns, so a
+    # sliced one must come back from the right offset: [10, 20, 30].slice(1, 1)
+    # is [20], read directly and when copied into another column.
+    ree = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2, 3], pa.int32()), pa.array([10, 20, 30], type)
+    ).slice(1, 1)
+    expected = ree.to_pylist()
+    gdf = GeoDataFrame(sgpd.default_context().create_data_frame(pa.table({"t": ree})))
+    assert pa.array(gdf["t"].to_pandas()).to_pylist() == expected
+    gdf["copy"] = gdf["t"]
+    assert pa.array(gdf["copy"].to_pandas()).to_pylist() == expected

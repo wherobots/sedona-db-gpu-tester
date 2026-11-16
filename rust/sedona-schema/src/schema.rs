@@ -62,7 +62,7 @@ pub trait SedonaSchema {
 /// `List<Struct<path, geom>>` produced by `ST_Dump`) is detected.
 pub fn sedona_type_contains_geometry(sedona_type: &SedonaType) -> Result<bool> {
     match sedona_type {
-        SedonaType::Wkb(_, _) | SedonaType::WkbView(_, _) => Ok(true),
+        SedonaType::Wkb(_, _) | SedonaType::WkbLarge(_, _) | SedonaType::WkbView(_, _) => Ok(true),
         SedonaType::Arrow(data_type) => data_type_contains_geometry(data_type),
         _ => Ok(false),
     }
@@ -223,9 +223,11 @@ mod test {
         assert_eq!(schema.primary_geometry_column_index().unwrap(), Some(1));
 
         // ...but should still detect a column without a special name
-        let schema = Schema::new(vec![WKB_GEOMETRY
-            .to_storage_field("name_not_special_cased", true)
-            .unwrap()]);
+        let schema = Schema::new(vec![
+            WKB_GEOMETRY
+                .to_storage_field("name_not_special_cased", true)
+                .unwrap(),
+        ]);
         assert_eq!(schema.geometry_column_indices().unwrap(), vec![0]);
         assert_eq!(schema.primary_geometry_column_index().unwrap(), Some(0));
     }
@@ -261,9 +263,9 @@ mod test {
         );
 
         // A plain top-level geometry column is still reported.
-        let schema = Schema::new(vec![WKB_GEOMETRY
-            .to_storage_field("geometry", true)
-            .unwrap()]);
+        let schema = Schema::new(vec![
+            WKB_GEOMETRY.to_storage_field("geometry", true).unwrap(),
+        ]);
         assert_eq!(schema.geometry_column_indices_recursive().unwrap(), vec![0]);
     }
 }

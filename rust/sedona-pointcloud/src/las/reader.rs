@@ -26,13 +26,13 @@ use bytes::Bytes;
 use datafusion_common::error::DataFusionError;
 use datafusion_datasource::PartitionedFile;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
-use futures::{future::BoxFuture, FutureExt};
-use las::{raw::Point as RawPoint, Header, Point};
+use futures::{FutureExt, future::BoxFuture};
+use las::{Header, Point, raw::Point as RawPoint};
 use laz::{
+    DecompressionSelection, LasZipError,
     record::{
         LayeredPointRecordDecompressor, RecordDecompressor, SequentialPointRecordDecompressor,
     },
-    DecompressionSelection, LasZipError,
 };
 use object_store::{ObjectStore, ObjectStoreExt};
 
@@ -46,14 +46,14 @@ use crate::las::{
 #[derive(Debug)]
 pub struct LasFileReaderFactory {
     store: Arc<dyn ObjectStore>,
-    metadata_cache: Option<Arc<dyn FileMetadataCache>>,
+    metadata_cache: Option<Arc<FileMetadataCache>>,
 }
 
 impl LasFileReaderFactory {
     /// Create a new `LasFileReaderFactory`.
     pub fn new(
         store: Arc<dyn ObjectStore>,
-        metadata_cache: Option<Arc<dyn FileMetadataCache>>,
+        metadata_cache: Option<Arc<FileMetadataCache>>,
     ) -> Self {
         Self {
             store,
@@ -79,7 +79,7 @@ impl LasFileReaderFactory {
 pub struct LasFileReader {
     partitioned_file: PartitionedFile,
     store: Arc<dyn ObjectStore>,
-    metadata_cache: Option<Arc<dyn FileMetadataCache>>,
+    metadata_cache: Option<Arc<FileMetadataCache>>,
     pub options: LasOptions,
 }
 
@@ -197,8 +197,8 @@ mod tests {
     use std::{fs::File, sync::Arc};
 
     use datafusion_datasource::PartitionedFile;
-    use las::{point::Format, Builder, Writer};
-    use object_store::{local::LocalFileSystem, path::Path, ObjectStoreExt};
+    use las::{Builder, Writer, point::Format};
+    use object_store::{ObjectStoreExt, local::LocalFileSystem, path::Path};
 
     use crate::las::reader::LasFileReaderFactory;
 

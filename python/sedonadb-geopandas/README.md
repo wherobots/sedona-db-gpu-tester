@@ -30,11 +30,17 @@ import geopandas
 import sedonadb_geopandas as sgpd
 
 gdf = sgpd.from_geopandas(geopandas.read_file("cities.geojson"))
+regions = sgpd.from_geopandas(geopandas.read_file("regions.geojson"))
 big = gdf[gdf["pop"] > 1_000_000]          # boolean-mask filter
-gdf["surveyed"] = True                     # broadcast a scalar column
-gdf["centers"] = gdf.geometry.centroid     # assign a computed column
+gdf["density"] = gdf["pop"] / gdf["area"]  # assign a computed column
+buffered = gdf.geometry.buffer(0.5)        # element-wise .geo operation
 web = gdf.to_crs("EPSG:3857")              # reproject (CRS tracked through)
-result = web.to_geopandas()                # back to a real GeoDataFrame
+
+joined = gdf.sjoin(regions, predicate="within")  # spatial join
+zones = joined.dissolve(by="region")              # group and union geometry
+parts = zones.explode()                           # one row per geometry part
+
+result = zones.to_geopandas()               # back to a real GeoDataFrame
 ```
 
 ## Intentional differences from GeoPandas
@@ -45,7 +51,9 @@ deliberately *not* identical to GeoPandas:
 - **Lazy, not eager**: operations build a query; data materializes on
   `to_geopandas()` / `to_pandas()` / display.
 - **No row index / alignment**: there is no pandas `Index`; joins and filters
-  are positional/relational, not index-aligned.
+  are positional/relational, not index-aligned. Consequently `sjoin()`
+  produces no `index_left`/`index_right` column, and `dissolve()` leaves the
+  group keys as ordinary columns instead of moving them into the index.
 - **Immutable under the hood**: "in-place" style operations return a new frame.
   A `Series` read from a frame stays usable across assignments that only *add*
   columns (so `g = gdf.geometry` can supply `g.area`, `g.length`, ... in turn),
@@ -54,13 +62,356 @@ deliberately *not* identical to GeoPandas:
   values.
 - **Columns cannot be mixed across frames**: without row alignment, combining
   columns from two different frames raises rather than guessing. Join first.
-- **Plotting and arbitrary `apply`**: use the `to_geopandas()` escape hatch and
-  operate on the materialized result.
+- **Arbitrary `apply`**: use the `to_geopandas()` escape hatch and operate on
+  the materialized result. (`plot()` and `explore()` compute the frame and draw
+  it with GeoPandas themselves.)
 - **Assignment takes a column or a scalar, not a bare expression**: a SedonaDB
   expression records no origin, so one built from another frame would resolve
   against the destination and silently write the wrong values. Assign a `Series`
   read from the same frame, or a scalar (a geometry included). For anything the
   wrapper does not cover, drop to the SedonaDB `DataFrame` API directly.
+
+Division follows pandas rather than SQL: `/` is true division, so integer
+columns do not silently truncate. `//` is not implemented, since SQL division
+truncates toward zero where Python floors. Duration arithmetic whose result
+overflows the 64-bit tick range raises when the result is computed, as in
+pandas 3 (pandas 2 silently wraps integer overflow, and pandas clamps finite
+positive float overflow to `Timedelta.max`; this layer raises for both). An
+integer operand that itself exceeds the 64-bit range raises `OverflowError`
+immediately, as in every pandas version. Mixed-unit duration
+operands are rebuilt in the column's own unit when exactly representable,
+rather than widening to the engine's interval type.
+
+`points_from_xy()`, `GeoSeries.from_xy()`, `from_wkt()`, and `from_wkb()` take
+columns of a frame (and numbers, for coordinates) rather than arrays, and build
+a lazy `GeoSeries` named `"geometry"` in that frame: load the data as a frame
+first. A missing coordinate gives a missing point, where GeoPandas reads it as
+NaN and gives a point with a NaN coordinate. Invalid WKT or WKB raises when the
+result is computed (only `on_invalid="raise"` is supported), and the engine's
+WKT parser refuses a few forms GEOS reads, such as `MULTIPOINT (EMPTY)`.
+`GeoDataFrame.to_wkt()` and `to_wkb()` convert every geometry column and leave
+no active geometry, as in GeoPandas.
+
+What GeoPandas gives as Python objects, text, or drawings is the computed
+frame's, by GeoPandas: `to_json()`, `to_geo_dict()` and `iterfeatures()` (each
+feature's id is its position, as for a default index), `plot()` (reading
+`gdf.plot` computes nothing; drawing does) and `explore()`. Likewise,
+`GeoDataFrame.from_features()` and `from_dict()` are read by GeoPandas into
+memory, keeping its active geometry column. `estimate_utm_crs()` computes only
+the bounds, and transforms them to longitude and latitude from any CRS, where
+GeoPandas takes a geographic CRS's coordinates as degrees east of Greenwich
+(wrong for one in grads, such as NTF (Paris)). The deprecated `unary_union` is
+`union_all()`, lazy, with GeoPandas' warning.
+
+`GeoSeries` properties and methods follow GeoPandas, with a few differences
+in form: `to_wkt()` writes equivalent but differently spaced WKT
+(`POINT(1 2)`), `to_wkb()` writes ISO WKB (GeoPandas' `flavor="iso"`),
+`is_simple` and `boundary` answer for geometry collections where GEOS leaves
+them undefined, and `x`/`y`/`z` on a non-point raise when the result is
+computed rather than when the property is read.
+
+As in GeoPandas, a `GeoDataFrame` has the geometry properties and methods it
+shares with `GeoSeries` (`gdf.area`, `gdf.buffer(1)`, `gdf.intersects(other)`,
+...), which act on its active geometry column and raise `AttributeError` on a
+frame without one. Those only a `GeoSeries` has (`x`, `y`, `from_xy()`, ...)
+are not on the frame.
+
+Binary geometry operations (`intersects`, `within`, `distance`,
+`intersection`, ...) take either a single Shapely geometry, which takes the
+column's CRS, or a `GeoSeries` from the same frame (or a `GeoDataFrame`, for
+its active geometry column), matched row by row as with
+GeoPandas' `align=False`; there is no index to align on. `touches` inherits
+an engine issue with geometry collections that mix dimensions
+(apache/sedona-db#1383).
+
+`cx[xmin:xmax, ymin:ymax]` keeps the geometries that intersect the box, as in
+GeoPandas (a box in coordinates, for geography too), but an open side has no
+bound: GeoPandas closes it at the bounds of all the geometries, so a range that
+starts past them reaches back to the geometries at their edge. `get_coordinates()` gives a frame of x and y with no
+index (`index_parts=True` is not supported), and raises when the result is
+computed for a geometry collection whose members differ in Z or M, an engine
+issue in `ST_Points` (apache/sedona-db#1513). `to_crs()` labels the result with the CRS as given, as
+GeoPandas does, rather than with the engine's canonical form of it.
+
+`clip()` (of a frame or a series, and `sedonadb_geopandas.clip()`) keeps the
+rows whose geometry intersects the mask and intersects them with it but for
+points, kept as they are, as in GeoPandas, lazily but for a frame or series
+mask, whose union is computed first. A rectangle `(minx, miny, maxx, maxy)` clips as the same box as a
+polygon: what only touches its edge is kept, where GeoPandas clips by a
+rectangle with GEOS's `clip_by_rect`, which leaves it out. The rows keep their
+order, whatever `sort` is. `keep_geom_type=True` computes the geometry types of
+the frame and of the result.
+
+`overlay()` (of a frame, and `sedonadb_geopandas.overlay()`) gives what
+GeoPandas gives for each `how`. Each frame is computed once, into memory, so
+that every part of the result comes from one result of it (even of a query
+whose result changes each time), and the result is lazy over them. Pairs of rows
+are matched by an indexed spatial join, and a difference takes away the union
+of the geometries a row intersects, so its geometries are those of GeoPandas up
+to where their rings start. GeoPandas takes them away one at a time, in their
+rows' order, and a new vertex where their edges cross can take an M that one
+taken away earlier left on an edge, so that order decides its M. Here those of
+each dimension are taken away together, in one order whatever the rows' (2D, Z,
+M, then ZM, as GeoPandas does where its rows come in that order): a vertex cut
+by a geometry without M takes no M another left, but one cut by a ZM geometry
+can take an M that an M geometry left. The rows
+come in no particular order. Both frames are in one CRS, as for
+`sjoin()` (GeoPandas warns and overlays the coordinates as they are), and hold
+geometry, not geography. `keep_geom_type=None` drops what `True` does without
+counting it for GeoPandas' warning, which would compute the result.
+
+The numeric parameters of geometry methods (`segmentize()`, `set_precision()`,
+`concave_hull()`, `force_3d()`, `snap()`, `get_geometry()`) take a number or a
+numeric `Series` of the same frame, applied row by row. `segmentize()` only
+adds vertices, where GEOS also repairs an invalid polygon and turns a one-part
+multi-line into a line; `force_3d()` keeps Z values and drops M, where Shapely
+leaves a geometry with M but no Z as it is and replaces the Z values of one
+with both; and `snap()` leaves an empty geometry as it is, where GEOS can turn
+it into a 3D empty, or one of another type (`POLYGON EMPTY` becomes
+`LINEARRING Z EMPTY`). `set_precision()` modes other than `"valid_output"` are
+not supported.
+
+The affine transformations (`affine_transform()`, `translate()`, `rotate()`,
+`scale()`, `skew()`) give Shapely's coordinates to the last bit, but keep M
+values, which Shapely drops (and overwrites, with Z, as NaN in a geometry
+with both). `interpolate()` and `project()` raise for a multi-line when the
+result is computed, as the engine works along single lines only, and
+`interpolate()` gives a 2D point on a 3D line.
+
+`explode()` takes parts one level deep and drops rows whose geometry has no
+parts, as GeoPandas does. Without an index it cannot number the parts
+(`index_parts=True`), and it explodes the active geometry column only:
+GeoPandas explodes the active geometry even when `column=` names another
+geometry column, and explodes non-geometry columns as lists.
+
+The aggregates over a whole column stay lazy, and each result belongs to a new
+frame: `union_all()` gives a `GeoSeries` of one row where GeoPandas gives the
+Shapely geometry, and `delaunay_triangles()`, `polygonize()`, and
+`build_area()` give one row per triangle or polygon, as GeoPandas does. The
+geometries are collected first, so 2D and 3D geometries together raise when
+the result is computed, where GeoPandas promotes them to 3D. `union_all()`
+supports neither `grid_size` nor a `method` other than `"unary"`, and
+`polygonize(full=True)` is not supported.
+
+`sjoin()` requires both geometry columns to share a CRS: GeoPandas warns on a
+mismatch and joins anyway, which is almost always a mistake, so this raises and
+points at `to_crs()`. `on_attribute` is not supported yet.
+
+`sjoin_nearest()` (of a frame, and `sedonadb_geopandas.sjoin_nearest()`)
+matches rows to the nearest rows of the other frame with the engine's indexed
+nearest-neighbour join, all of them when several are as near, as in GeoPandas,
+and with the same columns as `sjoin()`. It needs the same CRS on both sides.
+`max_distance` must be a number greater than 0 (GeoPandas takes NaN as no
+limit), and `distance_col` can't name the active geometry column, which
+GeoPandas would fill with the distances. `exclusive=True` is not supported, nor
+is geography, which the engine can't join by distance to the nearest yet
+(apache/sedona-db#1086).
+
+Without an index, `drop()` and `rename()` work on columns only, `rename()`
+raises rather than producing duplicate column names, and a sort from
+`sort_values()` holds until an operation that does not preserve row order (a
+join or an aggregation). `astype()` to a string keeps missing values missing,
+like pandas' `"string"` dtype rather than `str`, and formats floats the way
+Arrow does (`"1"`, `"NaN"`); `astype(object)` leaves the values as they are,
+since an Arrow-backed column has no object type. A geometry column cast to a
+string is its WKT, as in GeoPandas (with the spacing of `to_wkt()`). A frame's
+`astype()` takes `errors="raise"` only, since which values fail is known only
+when the result is computed.
+
+`dtypes` and a column's `dtype` are what `to_pandas()` gives for each column's
+type when no value is missing: whether one is isn't known before computing, so
+an integer column with a missing value reports an integer dtype, where pandas
+makes its values floats. A categorical column's categories are those of its
+values, so its dtype computes the column. `len()`, `shape`, `size` and `empty`
+compute the number of rows (or whether there is one). `tail()` gives the last
+rows of a sorted frame or column, computing the number of rows; like `head()`,
+it takes no negative count. A column's `name` is a string, and `rename()` of a
+column only names it, as there is no index to relabel.
+
+Reductions (`sum()`, `mean()`, `min()`, `max()`, `count()`, `median()`,
+`std()`, `var()`, `sem()`, `skew()`, `kurt()`, `any()`, `all()`, `quantile()`,
+`nunique()`) compute their result, skipping missing values (NaN included) as
+pandas does by default; an integer column keeps its integer type where pandas,
+having turned its missing values into NaN, would report a float. The arithmetic
+ones (`sum()`, `mean()`, `median()`, `std()`, `var()`, `sem()`, `skew()`,
+`kurt()`, `quantile()`) take numbers and booleans only: pandas' `sum()` of text
+concatenates it, in an order a lazy frame doesn't have, and pandas also gives
+the `sum()` of durations and the `mean()`, `median()`, `std()` and `quantile()`
+of durations and timestamps, which raise a TypeError here. A frame's
+reduce all its columns in one scan (three for `skew()` and `kurt()`, and one per
+column for `nunique()`), as pandas' do with `axis=0` (there is no `axis=1`), and
+take their options by keyword, as in pandas 3; `agg()` of a list of names takes
+the options of each method of those names, which selects the columns as it does
+(pandas hands `numeric_only` and `bool_only` to each column's method instead).
+`skew()` and `kurt()` of values that are all alike are NaN, as in pandas 3
+(pandas 2 says 0), and don't depend on the scale of the values (pandas gives 0
+or NaN for values near float64's limits); `any()` and `all()` refuse
+timestamps, as pandas 3 does, and read a geometry as true unless it is empty,
+as GeoPandas does, but skip a missing one (GeoPandas reads it as false whatever
+`skipna` is). Quantiles, and the percentiles of `describe()`,
+are interpolated as pandas interpolates them, not with the engine's
+`percentile_cont()`, which rounds its interpolation to millionths. `unique()`,
+`value_counts()` and `mode()` cannot follow the order of first appearance, since
+a lazy frame has no row order: `value_counts()` breaks ties by value, and so
+does the top value of `describe()` (of a categorical, by category, as in
+pandas); `nlargest()` and `nsmallest()` keep any of tied values. Geometries
+count as distinct by their WKB, as in GeoPandas, but `nunique(dropna=False)`
+counts a missing one, as pandas does (GeoPandas' `unique()` drops it); their
+`mode()` is in WKB order, a GeoSeries with the column's CRS, which GeoPandas'
+drops. A frame's
+`skew()` is GeoPandas' (an affine transformation of the active geometry) when it
+has an active geometry column, and pandas' otherwise; `info()` writes the dtypes
+of `dtypes` (int64 for integers with a missing value, which `to_pandas()` makes
+floats) and no memory usage, which a lazy frame doesn't know.
+
+`where()`, `mask()`, and `clip()` keep a column to one kind of value: a
+replacement or bound of another kind (text in a number column, say) raises,
+where pandas would turn the column into Python objects. `round()` rounds half to
+even as pandas (NumPy) does, and raises for a non-numeric column, as pandas 2
+does (pandas 3 returns it unchanged); a frame's `round()` leaves a column of no
+numbers as it is, as pandas does. A frame's `where()` and `mask()` take a
+condition per row, a boolean column of the frame (pandas' `axis=0`): a frame of
+conditions would need row alignment. `dropna()`, `head()`, `tail()`,
+`sort_values()` and `drop_duplicates()` on a column return a column of a new
+frame, which, like any column of another frame, can't be combined with the
+original's; `head()` takes no negative count, since there is no row order to
+count back from.
+
+`replace()` takes values, lists and dicts as pandas does, but no regular
+expressions, and replaces a value with one of its column's kind, raising for
+another kind where pandas would turn the column into Python objects. A value
+replaced in every column of a frame is replaced in those that hold its kind, but
+a missing value only in those that hold its replacement's kind, as `fillna()`
+fills them. A replacement of a wider type (a float in an integer column) widens
+the column whether or not a value matches, as the result's types can't depend on
+its rows. A frame's `isin()` takes a list or a dict of lists, as pandas does,
+but no Series or frame (a pandas one included), alone or in the dict, which
+would need row alignment; a value that is not a geometry matches no geometry, as
+in GeoPandas.
+
+The `.str` and `.dt` accessors compute in the engine. Their regular expressions
+are the engine's (Rust's `regex` crate, close to the RE2 that pandas 3's
+pyarrow-backed strings use): no lookaround or backreferences, `$` matching only
+at the very end (Python's also matches before a final newline), and no empty
+match right after another. `find()` and `rfind()` take no `start` or `end`,
+`slice()` a step of 1 (or -1 over the whole value), `replace()` replaces all,
+the first, or none (`n` of -1, 1 or 0) and takes no callable, and `cat()` joins
+columns of the same frame: without `others` it would join values in row order,
+which a lazy frame does not have. `contains()` of text (`regex=False`) ignoring
+case compares the values in upper case, as pandas does for Python strings ("ß"
+contains "ss"; pandas 3's pyarrow-backed strings fold one character at a time).
+A boolean string method answers for a missing value as the installed pandas
+does (pandas 2 leaves it missing, pandas 3 makes it False). `.dt` reads the
+wall time of timestamps with a time zone, as pandas does; `floor()`, `ceil()`
+and `round()` take fixed frequencies, positive ones that are a multiple of the
+column's unit or divide it, as in pandas 3 (pandas 2 rounds to a whole number of
+units), and a wall time that is ambiguous or does not exist after rounding or
+localizing fails, as in pandas by default (`ambiguous` and `nonexistent` take
+`"raise"` only). `day_name()` and `month_name()` are in English, `date` and
+`time` give a missing value as None rather than NaT, and `time` is to the
+microsecond, as Python's times are. A timestamp past the years the engine
+reads dates of, -262143 to 262142 (which seconds, milliseconds and microseconds
+reach), raises an error for its fields, names, date and time, where pandas
+gives most of them.
+
+`merge()` joins on columns as pandas does, including in matching a missing key
+(NaN or None) with a missing key, unlike SQL; without an index, its rows don't
+keep the left frame's order (`sort=True` orders them by key), and
+`left_index`/`right_index` are not supported. A key both frames share keeps the
+left's type in an inner or left join and the right's in a right join; in an
+outer join it takes a type both sides fit, which pandas chooses by whether some
+row lacks the left's key, but a lazy frame's types can't depend on its rows.
+When both frames have a geometry column of the same name, the left's stays
+active under its suffixed name, where
+GeoPandas keeps naming the unsuffixed column. `concat()` stacks rows only
+(`axis=0`), matching columns by name; a column holds one kind of value, so
+values of different kinds (numbers and text, say) raise rather than make a
+column of Python objects, and geometry columns must share their CRS, as in
+GeoPandas: one without a CRS takes the others' only if it holds no geometry,
+which is checked as the result is computed (GeoPandas relabels its coordinates
+whatever they are).
+
+`groupby()` aggregates as pandas does, skipping missing values and treating
+NaN and None (and -0.0 and 0.0) as one key, but there is no index to hold the
+keys, so they are columns of the result whatever `as_index` says. Several
+aggregations of one column (`agg({"v": ["sum", "max"]})`) would make two-level
+column names, which aren't supported: name each aggregate instead
+(`agg(total=("v", "sum"), largest=("v", "max"))`). Without a row order,
+`first()` and `last()` give a value of each group that is not missing, the
+smallest and the largest, rather than the first and last rows'.
+
+`fillna()` follows the same rule: a scalar fills the columns that hold its kind
+of value and leaves the others as they are (pandas would turn them into Python
+objects, and GeoPandas refuses a non-geometry value for a geometry column), and
+a dict value of another kind raises. `drop_duplicates()` keeps one row of each
+group of duplicates, but with no row order, `keep="first"` and `keep="last"`
+cannot say which. `dropna()` drops rows only (`axis=0`), since choosing columns
+would take computing the data first. `assign()` evaluates a value that is not a
+callable on the frame as it was, even if an earlier keyword replaced a column it
+reads, as pandas does.
+
+`dissolve()` aggregates non-geometry columns with `"first"`, which is an
+unordered aggregate: it returns *some* value from the group rather than the one
+from the first row, and unlike GeoPandas it does not skip missing values, so a
+group containing a null or NaN may aggregate to that. Dissolving an empty frame
+without a group key returns one row — empty geometry collection, null attribute
+values — rather than zero rows, because that is what a grouping-free SQL
+aggregate produces, and a group mixing 2D and 3D geometries raises rather than
+being promoted to 3D. Grouping is observed-only: unused categories of a
+categorical key do not produce empty groups the way GeoPandas' default
+`observed=False` does, because the category domain does not survive a relational
+aggregation.
+
+`to_arrow()` and `from_arrow()` (of a `GeoDataFrame` or a `GeoSeries`),
+`to_feather()` and `read_feather()` follow GeoPandas, with geometry as GeoArrow
+WKB; the `"geoarrow"` encoding is not supported for output. `from_arrow()`
+reads WKB, WKT and native GeoArrow columns into memory and, as GeoPandas does,
+makes the first geometry column the active one. Spherical edges, in a GeoArrow
+type or in a Feather file's metadata, make a geography column, where GeoPandas
+ignores them. `to_feather()` computes the frame once, into memory, writes its
+rows in the order it gives them, and finds each geometry column's types and
+bounds for the file's metadata in what it writes; `read_feather()` reads the whole file into memory, since SedonaDB has
+no Arrow IPC reader.
+
+`read_parquet()`, `read_file()` and `to_parquet()` follow GeoPandas, with
+differences that come from SedonaDB's readers and GeoParquet writer:
+
+- The active geometry column of a file that is read, and the `primary_column`
+  written to one, follow SedonaDB's heuristic (a column named `geometry`,
+  `geography`, `geom` or `geog`, else the first geometry column) rather than the
+  file's metadata or the frame's active geometry. This matters only for files
+  with several geometry columns (apache/sedona-db#1404).
+- EPSG:4326 is written as OGC:CRS84.
+- The covering (bounding-box) columns a file's metadata declares are left out
+  on read, as in GeoPandas, for local files only: a remote file's metadata is
+  not read, so its coverings stay. A covering is written for every geometry
+  column, not only the active one, and exactly with `schema_version="1.1.0"`.
+- `read_file()` keeps the source's name for the geometry column (`geom` in a
+  GeoPackage) where GeoPandas renames it to `geometry`: renaming it would break
+  later column selections (apache/sedona-db#1405).
+- `to_parquet()` writes one local file and needs a file extension such as
+  `.parquet`, since SedonaDB writes a directory of files to a path without one.
+  It cannot write to a remote URL (`s3://`, `gs://`) yet
+  (apache/sedona-db#1440); reading one works, with the object store's options
+  passed as `storage_options` using SedonaDB's keys (for example
+  `{"aws.skip_signature": True, "aws.region": "us-west-2"}`), not fsspec's.
+
+`to_file()` (of a `GeoDataFrame` or a `GeoSeries`), `from_file()` and
+`list_layers()` follow GeoPandas with its pyogrio engine: the driver comes from
+the file's extension, the layer's geometry type from the data (with single
+geometries promoted to multi for GeoPackage and FlatGeobuf, as pyogrio does),
+NaN is written as null, and pyogrio's options (`layer`, `promote_to_multi`,
+creation options, ...) are taken; unsigned 64-bit integers are written as
+signed ones (one too large raises), and a time in a named time zone in UTC,
+as GeoPandas writes them. The frame is written through pyogrio's Arrow writer.
+It is computed once into memory first, so that what is written is what the
+layer's geometry types were found of, even for a query whose result changes
+each time (`random()`), and its rows are written in the order it gives them (a
+sort from `sort_values()` included).
+A file takes one geometry column, as in GeoPandas, and not a geography column,
+since GDAL/OGR formats have no spherical edges. A CRS without an EPSG code is
+written as WKT made from the frame's PROJJSON, which can name fewer authority
+codes than the WKT GeoPandas writes for the same CRS.
 
 See the SedonaDB "Migrating from GeoPandas" guide for the relational model that
 underlies each method.

@@ -15,9 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import math
+
 import numpy as np
 import pandas as pd
 import pytest
+import sedonadb
 from shapely import wkt
 
 from sedonadb.testing import SedonaDB
@@ -83,12 +86,14 @@ def test_rs_srid_from_wkt():
     )
 
 
-def test_rs_srid_from_authorityless_wkt_errors(con):
-    """A WKT with no authority code anywhere has no SRID to extract."""
-    with pytest.raises(Exception, match="SRID"):
-        con.sql(
-            f"SELECT RS_SRID(RS_SetCRS(RS_Example(), '{WKT_LCC_NO_AUTHORITY}'))"
-        ).to_arrow_table()
+def test_rs_srid_from_authorityless_wkt_is_zero(con):
+    """A WKT with no authority code anywhere is a valid, usable CRS but has no
+    integer SRID, so RS_SRID yields 0 (the same value as a missing CRS) rather
+    than erroring. RS_CRS still carries the full definition."""
+    result = con.sql(
+        f"SELECT RS_SRID(RS_SetCRS(RS_Example(), '{WKT_LCC_NO_AUTHORITY}')) AS srid"
+    ).to_arrow_table()
+    assert result["srid"][0].as_py() == 0
 
 
 def test_rs_ensureloaded(con, sedona_testing):
@@ -106,6 +111,47 @@ def test_rs_ensureloaded(con, sedona_testing):
     assert arr.shape == (512, 512)
     assert arr.dtype == "uint16"
     assert arr[0, 0] == 2324
+
+
+def test_rs_ensureloaded_many_files_in_one_batch(con, sedona_testing):
+    """A batch of OutDb rasters from many different files is read file by
+    file in parallel; every row must still get its own file's pixels.
+
+    Each fixture's mean is computed alone, then all of them are loaded
+    together, repeated and interleaved, in one batch and compared row by row.
+    """
+    names = ["test1.tiff", "test2.tif", "test3.tif", "test4.tiff", "test5.tiff"]
+    paths = [str(sedona_testing / "data/raster" / name) for name in names]
+
+    def mean_of(path):
+        return (
+            con.sql(
+                "SELECT RS_SummaryStats(RS_FromPath($1), 'mean', 1) AS m",
+                params=(path,),
+            )
+            .to_arrow_table()["m"][0]
+            .as_py()
+        )
+
+    expected = {path: mean_of(path) for path in paths}
+    assert len(set(expected.values())) > 1, "fixtures should be distinguishable"
+
+    rows = [paths[(i * 3) % len(paths)] for i in range(40)]
+    df = pd.DataFrame({"i": range(len(rows)), "path": rows})
+    con.create_data_frame(df).to_view("ensureloaded_many_files", overwrite=True)
+    result = (
+        con.sql(
+            """
+            SELECT i, path, RS_SummaryStats(RS_FromPath(path), 'mean', 1) AS m
+            FROM ensureloaded_many_files ORDER BY i
+            """
+        )
+        .to_arrow_table()
+        .to_pylist()
+    )
+    assert len(result) == len(rows)
+    for row in result:
+        assert row["m"] == expected[row["path"]], row
 
 
 # Point sampling. RS_Example fills band `b` with the constant value `b`, except
@@ -148,6 +194,40 @@ def test_rs_value_default_band_requires_single_band(con):
         con.sql(
             "SELECT RS_Value(RS_Example(), ST_Point(74.58, 110.57, 'OGC:CRS84'))"
         ).to_arrow_table()
+
+
+# RS_WorldToRasterCoord and its X/Y variants map a world coordinate into the
+# raster's pixel space. The two argument forms — a pair of ordinates, or a
+# single point geometry — are the same mapping, so both are exercised against
+# the same expectation. Pixel coordinates are 1-based, as in PostGIS
+# ST_WorldToRasterCoord. RS_Example is skewed (scale 2, skew 1), and (10, 20)
+# maps outside the grid: the mapping extrapolates rather than clamping.
+@pytest.mark.parametrize(
+    "coord",
+    [
+        pytest.param("10.0, 20.0", id="ordinates"),
+        pytest.param("ST_Point(10.0, 20.0)", id="point"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("fn", "expected"),
+    [
+        ("RS_WorldToRasterCoordX", -1),
+        ("RS_WorldToRasterCoordY", -27),
+        ("RS_WorldToRasterCoord", "POINT (-1 -27)"),
+    ],
+)
+def test_rs_worldtorastercoord(fn, expected, coord):
+    SedonaDB().assert_query_result(f"SELECT {fn}(RS_Example(), {coord})", expected)
+
+
+def test_rs_worldtorastercoord_empty_point_is_null():
+    # POINT EMPTY has no location to map, so it yields NULL rather than an
+    # error — matching how the two-ordinate form treats a null ordinate.
+    SedonaDB().assert_query_result(
+        "SELECT RS_WorldToRasterCoordX(RS_Example(), ST_GeomFromText('POINT EMPTY'))",
+        None,
+    )
 
 
 def test_rs_value_matches_rasterio(con):
@@ -205,7 +285,7 @@ def test_rs_value_matches_rasterio(con):
     )
 
     # Map pixel-space positions to world coordinates via the shared affine.
-    xs, ys = zip(*(affine * (u, v) for u, v in pixel_points))
+    xs, ys = zip(*(affine @ (u, v) for u, v in pixel_points))
 
     # rasterio reference: a real GDAL read of the same array (no CRS).
     with MemoryFile() as mem:
@@ -241,13 +321,62 @@ def test_rs_value_matches_rasterio(con):
     assert got == expected
 
 
-def test_rs_setgeoreference_roundtrips_with_getter():
-    # RS_GeoReference emits scaleX, skewY, skewX, scaleY, upperLeftX, upperLeftY;
-    # RS_SetGeoReference accepts the same six values back (GDAL order).
+def test_rs_geotransform():
+    # RS_Example's geotransform is scaleX=2, skewX=1, skewY=1, scaleY=2 with
+    # upper-left (43.08, 79.07). The expected struct follows Sedona Spark's
+    # RS_GeoTransform decomposition: magnitudes sqrt(scaleX^2 + skewY^2) and
+    # sqrt(scaleY^2 + skewX^2), thetaI = -acos(scaleX / magnitudeI) (negative
+    # because skewY > 0), and thetaIJ positive because its sign test stays
+    # under pi/2 for this south-up transform. The thetaIJ expression repeats
+    # the implementation's operation order: sqrt(5)**2 is 5.000000000000001,
+    # so this is acos(4 / that), not acos(0.8).
+    eng = SedonaDB()
+    magnitude = math.sqrt(5.0)
+    eng.assert_query_result(
+        "SELECT RS_GeoTransform(RS_Example())",
+        [
+            (
+                {
+                    "magnitudeI": magnitude,
+                    "magnitudeJ": magnitude,
+                    "thetaI": -math.acos(2.0 / magnitude),
+                    "thetaIJ": math.acos(4.0 / (magnitude * magnitude)),
+                    "offsetX": 43.08,
+                    "offsetY": 79.07,
+                },
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "georeference",
+    [
+        # The string form: scaleX, skewY, skewX, scaleY, upperLeftX, upperLeftY
+        # — the same order RS_GeoReference emits, so the pair round-trips.
+        pytest.param("'2 0 0 -3 100 200'", id="string"),
+        # The numeric form takes the components directly, in a different order:
+        # upperLeftX, upperLeftY, scaleX, scaleY, skewX, skewY.
+        pytest.param("100, 200, 2, -3, 0, 0", id="numeric"),
+    ],
+)
+def test_rs_setgeoreference_roundtrips_with_getter(georeference):
+    # Both argument forms set the same transform, and RS_GeoReference reads it
+    # back in world-file order.
     eng = SedonaDB()
     eng.assert_query_result(
-        "SELECT RS_GeoReference(RS_SetGeoReference(RS_Example(), '2 0 0 -3 100 200'))",
+        f"SELECT RS_GeoReference(RS_SetGeoReference(RS_Example(), {georeference}))",
         "2.0000000000\n0.0000000000\n0.0000000000\n-3.0000000000\n100.0000000000\n200.0000000000",
+    )
+
+
+def test_rs_setgeoreference_numeric_skew():
+    # The numeric form carries skew into the right slots: the getter emits
+    # scaleX, skewY, skewX, scaleY, upperLeftX, upperLeftY.
+    eng = SedonaDB()
+    eng.assert_query_result(
+        "SELECT RS_GeoReference(RS_SetGeoReference(RS_Example(), 100, 200, 2, -3, 0.25, 0.5))",
+        "2.0000000000\n0.5000000000\n0.2500000000\n-3.0000000000\n100.0000000000\n200.0000000000",
     )
 
 
@@ -452,7 +581,7 @@ def test_rs_values_matches_rasterio(con):
     )
 
     # Map pixel-space positions to world coordinates via the shared affine.
-    xs, ys = zip(*(affine * (u, v) for u, v in pixel_points))
+    xs, ys = zip(*(affine @ (u, v) for u, v in pixel_points))
 
     # rasterio reference: a real GDAL read of the same array (no CRS).
     with MemoryFile() as mem:
@@ -713,3 +842,247 @@ def test_rs_as_raster_sets_output_nodata(con, sedona_testing):
     expected = np.full((10, 10), 9, dtype="uint8")
     expected[0, 0] = 5
     np.testing.assert_array_equal(raster.bands[0].to_numpy(), expected)
+
+
+# RS_FromPath opens a batch's files concurrently. These run many rows through
+# one batch (interleaved files, repeats and NULLs) and check every row against
+# the same file read on its own.
+FROMPATH_FILES = ["test1.tiff", "test4.tiff", "test5.tiff", "sentinel2.tif"]
+
+
+def _frompath_rows(sedona_testing, n=40):
+    files = [str(sedona_testing / "data/raster" / f) for f in FROMPATH_FILES]
+    return [None if i % 7 == 3 else files[(i * 3) % len(files)] for i in range(n)]
+
+
+def _frompath_view(con, rows, name):
+    df = pd.DataFrame({"id": range(len(rows)), "path": pd.array(rows, dtype="string")})
+    con.create_data_frame(df).to_view(name, overwrite=True)
+
+
+def test_rs_frompath_many_files_in_one_batch(con, sedona_testing):
+    rows = _frompath_rows(sedona_testing)
+    _frompath_view(con, rows, "frompath_many")
+    metadata = """
+        RS_Width(r) AS width, RS_Height(r) AS height, RS_NumBands(r) AS bands,
+        RS_GeoReference(r) AS georef, RS_SRID(r) AS srid,
+        RS_BandPixelType(r, 1) AS dtype, RS_BandNoDataValue(r, 1) AS nodata
+    """
+    got = con.sql(
+        f"SELECT id, {metadata} FROM (SELECT id, RS_FromPath(path) AS r FROM frompath_many) ORDER BY id"
+    ).to_pandas()
+    assert len(got) == len(rows)
+
+    for i, path in enumerate(rows):
+        row = got.iloc[i]
+        if path is None:
+            assert pd.isna(row["width"])
+            continue
+        alone = (
+            con.sql(
+                f"SELECT {metadata} FROM (SELECT RS_FromPath($1) AS r)", params=(path,)
+            )
+            .to_pandas()
+            .iloc[0]
+        )
+        for col in alone.index:
+            if pd.isna(alone[col]):
+                assert pd.isna(row[col]), (i, col)
+            else:
+                assert row[col] == alone[col], (i, col)
+
+
+def test_rs_frompath_batch_reports_first_missing_file(con, sedona_testing):
+    rows = _frompath_rows(sedona_testing, 12)
+    rows[5] = "/definitely/missing/first.tif"
+    rows[9] = "/definitely/missing/second.tif"
+    _frompath_view(con, rows, "frompath_missing")
+    with pytest.raises(
+        Exception, match="Failed to open raster file '/definitely/missing/first.tif'"
+    ):
+        con.sql(
+            "SELECT RS_Width(RS_FromPath(path)) FROM frompath_missing"
+        ).to_arrow_table()
+
+
+def test_rs_summarystats_of_rs_frompath_many_rows(con, sedona_testing):
+    # A pixel-reading function directly over RS_FromPath: the planner wraps
+    # the argument in RS_EnsureLoaded, so this checks that shape still plans
+    # and loads every row.
+    rows = _frompath_rows(sedona_testing)
+    _frompath_view(con, rows, "frompath_stats")
+    got = con.sql(
+        """
+        SELECT id, RS_SummaryStats(RS_FromPath(path), 'mean', 1) AS m
+        FROM frompath_stats ORDER BY id
+        """
+    ).to_pandas()
+
+    means = {}
+    for path in set(p for p in rows if p is not None):
+        means[path] = (
+            con.sql(
+                "SELECT RS_SummaryStats(RS_FromPath($1), 'mean', 1) AS m",
+                params=(path,),
+            )
+            .to_pandas()["m"]
+            .iloc[0]
+        )
+    for i, path in enumerate(rows):
+        if path is None:
+            assert pd.isna(got["m"].iloc[i])
+        else:
+            assert got["m"].iloc[i] == means[path], i
+
+
+@pytest.mark.parametrize("io_concurrency", [1, 4])
+def test_rs_frompath_and_loads_under_a_small_io_budget(sedona_testing, io_concurrency):
+    # RS_FromPath's opens and the pixel loads after them share the session's
+    # I/O budget. At a budget of 1 they take turns; the results must match
+    # the default budget's. A connection of its own, so the setting does not
+    # outlive the test.
+    con = sedonadb.connect()
+    rows = _frompath_rows(sedona_testing)
+    _frompath_view(con, rows, "frompath_budget")
+    query = """
+        SELECT id, RS_Width(RS_FromPath(path)) AS w,
+               RS_SummaryStats(RS_FromPath(path), 'mean', 1) AS m
+        FROM frompath_budget ORDER BY id
+    """
+    expected = con.sql(query).to_pandas()
+    con.sql(f"SET sedona.raster.io_concurrency = {io_concurrency}").execute()
+    got = con.sql(query).to_pandas()
+    pd.testing.assert_frame_equal(got, expected)
+
+
+def test_rs_intersects_rs_frompath_in_join(con, sedona_testing):
+    # RS_FromPath as the raster side of a spatial join predicate. Each point
+    # is the centre of one file's footprint, so it matches that file (and
+    # any other file whose footprint covers it).
+    rows = [p for p in _frompath_rows(sedona_testing, 12) if p is not None]
+    _frompath_view(con, rows, "frompath_join_rasters")
+    # Points in one CRS (the files use three), so they fit one geometry column.
+    centres = con.sql(
+        """
+        SELECT path AS point_path,
+               ST_AsText(ST_Transform(
+                   ST_Centroid(RS_Envelope(RS_FromPath(path))), 'EPSG:4326'
+               )) AS wkt
+        FROM (SELECT DISTINCT path FROM frompath_join_rasters)
+        """
+    ).to_pandas()
+    con.create_data_frame(centres).to_view("frompath_join_centres", overwrite=True)
+    con.sql(
+        """
+        SELECT point_path, ST_SetSRID(ST_GeomFromText(wkt), 4326) AS geom
+        FROM frompath_join_centres
+        """
+    ).to_view("frompath_join_points", overwrite=True)
+
+    query = """
+        SELECT r.id, p.point_path
+        FROM frompath_join_rasters r
+        JOIN frompath_join_points p
+          ON RS_Intersects(RS_FromPath(r.path), p.geom)
+    """
+    plan = con.sql(f"EXPLAIN {query}").to_pandas().to_string()
+    assert "SpatialJoin" in plan, plan
+
+    got = con.sql(query).to_pandas()
+    matched = set(zip(got["id"], got["point_path"]))
+    for i, path in enumerate(rows):
+        assert (i, path) in matched, (i, path)
+
+
+# Pixel functions over an OutDb raster (RS_FromPath) whose raster argument
+# already has a loader somewhere below it. The planner wraps the argument in
+# RS_EnsureLoaded regardless; the inner loader materialises the pixels and
+# the outer call passes them through. These shapes used to fail with
+# 'async functions should not be called directly'.
+
+
+@pytest.fixture()
+def grid_tiff(tmp_path):
+    """A 3x3 single-band GeoTIFF holding 1..9 row by row."""
+    pytest.importorskip("rasterio")
+    from sedonadb.raster_testing import write_geotiff
+
+    path = tmp_path / "grid.tif"
+    pixels = np.arange(1, 10, dtype="float64").reshape(1, 3, 3)
+    write_geotiff(path, pixels, bbox=(0.0, 0.0, 3.0, 3.0))
+    return str(path)
+
+
+def test_pixel_function_over_metadata_function_over_pixel_function(con, grid_tiff):
+    """RS_SetSRID neither reads pixels nor promises loaded output."""
+    sql = """
+        SELECT RS_Value(
+            RS_SetSRID(RS_SetValue(RS_FromPath($1), 1, 2, 2, 70), 4326), 2, 2, 1)
+    """
+    got = con.sql(sql, params=(grid_tiff,)).to_arrow_table().column(0)
+    assert got.to_pylist() == [70.0]
+
+
+def test_summary_stats_over_nodata_change_over_clip(con, grid_tiff):
+    """Pixels 2..9 remain once 1 is the nodata value."""
+    sql = """
+        SELECT RS_SummaryStats(
+            RS_SetBandNoDataValue(
+                RS_Clip(RS_FromPath($1), 1,
+                        ST_GeomFromText('POLYGON ((0 0, 3 0, 3 3, 0 3, 0 0))')),
+                1, 1),
+            'mean', 1)
+    """
+    got = con.sql(sql, params=(grid_tiff,)).to_arrow_table().column(0)
+    assert got.to_pylist() == [44.0 / 8.0]
+
+
+def test_pixel_function_with_loader_in_a_non_raster_argument(con, grid_tiff):
+    """The loader feeds only the nodata value (the width, 3); the raster that
+    reaches RS_Value is the unloaded RS_FromPath and still needs loading."""
+    sql = """
+        SELECT RS_Value(
+            RS_SetBandNoDataValue(
+                RS_FromPath($1), 1, RS_Width(RS_EnsureLoaded(RS_FromPath($1)))),
+            2, 2, 1)
+    """
+    got = con.sql(sql, params=(grid_tiff,)).to_arrow_table().column(0)
+    assert got.to_pylist() == [5.0]
+
+
+def test_pixel_function_in_a_case_branch_loads_only_its_rows(con, grid_tiff):
+    """A pixel function in a CASE branch is evaluated only for the rows that
+    reach it. The other row names a GeoTIFF that does not exist, so loading
+    it would fail: the CASE must stay lazy around the loader."""
+    got = con.sql(
+        """
+        SELECT CASE WHEN ok THEN RS_Value(RS_FromPath(path), 2, 2, 1) ELSE -1 END AS v
+        FROM (VALUES (true, $1), (false, '/nonexistent/missing.tif')) AS t(ok, path)
+        ORDER BY v
+        """,
+        params=(grid_tiff,),
+    ).to_arrow_table()
+    assert got["v"].to_pylist() == [-1.0, 5.0]
+
+
+def test_aggregate_over_pixel_function_across_partitions(con, grid_tiff):
+    """With several partitions the planner builds a partial and a final
+    aggregate stage carrying the same expressions. Only the partial stage
+    reads rows and loads rasters; the final stage reads partial state, where
+    the raster column does not exist."""
+    con.sql("SET datafusion.execution.target_partitions TO 4").execute()
+    sql = """
+        SELECT id, SUM(RS_Value(RS_FromPath(path), 2, 2, 1)) AS s
+        FROM (VALUES (1, $1), (1, $1), (2, $1)) AS t(id, path)
+        GROUP BY id
+        ORDER BY id
+    """
+    plan = con.sql("EXPLAIN " + sql, params=(grid_tiff,)).to_arrow_table()
+    physical = plan.column("plan").to_pylist()[1]
+    assert "mode=Partial" in physical, physical
+    assert "mode=Final" in physical, physical
+    assert physical.count("RasterBatchSplitExec") == 1, physical
+
+    got = con.sql(sql, params=(grid_tiff,)).to_arrow_table()
+    assert got["id"].to_pylist() == [1, 2]
+    assert got["s"].to_pylist() == [10.0, 5.0]

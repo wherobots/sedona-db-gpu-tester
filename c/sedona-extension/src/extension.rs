@@ -25,6 +25,104 @@ use arrow_array::{
     ffi::{FFI_ArrowArray, FFI_ArrowSchema},
     ffi_stream::FFI_ArrowArrayStream,
 };
+use arrow_schema::ArrowError;
+
+/// CPU device identifier from the Arrow C Device Data Interface.
+pub const ARROW_DEVICE_CPU: i32 = 1;
+
+/// Rust representation of `ArrowDeviceArray` used by the experimental Arrow
+/// asynchronous device stream interface.
+#[repr(C)]
+pub struct FFI_ArrowDeviceArray {
+    pub array: FFI_ArrowArray,
+    pub device_id: i64,
+    pub device_type: i32,
+    pub sync_event: *mut c_void,
+    pub reserved: [i64; 3],
+}
+
+impl TryFrom<FFI_ArrowDeviceArray> for FFI_ArrowArray {
+    type Error = ArrowError;
+
+    fn try_from(value: FFI_ArrowDeviceArray) -> Result<Self, Self::Error> {
+        if value.device_type != ARROW_DEVICE_CPU {
+            return Err(ArrowError::CDataInterface(format!(
+                "Unsupported Arrow device type: {}",
+                value.device_type
+            )));
+        }
+        if !value.sync_event.is_null() {
+            return Err(ArrowError::CDataInterface(
+                "CPU ArrowDeviceArray has a non-null sync event".to_string(),
+            ));
+        }
+        Ok(value.array)
+    }
+}
+
+impl From<FFI_ArrowArray> for FFI_ArrowDeviceArray {
+    fn from(array: FFI_ArrowArray) -> Self {
+        Self {
+            array,
+            device_id: -1,
+            device_type: ARROW_DEVICE_CPU,
+            sync_event: null_mut(),
+            reserved: [0; 3],
+        }
+    }
+}
+
+/// Rust representation of `ArrowAsyncProducer`.
+#[repr(C)]
+pub struct FFI_ArrowAsyncProducer {
+    pub device_type: i32,
+    pub request: Option<unsafe extern "C" fn(*mut FFI_ArrowAsyncProducer, i64)>,
+    pub cancel: Option<unsafe extern "C" fn(*mut FFI_ArrowAsyncProducer)>,
+    pub additional_metadata: *const c_char,
+    pub private_data: *mut c_void,
+}
+
+/// Rust representation of `ArrowAsyncDeviceStreamHandler`.
+#[repr(C)]
+pub struct FFI_ArrowAsyncDeviceStreamHandler {
+    pub on_schema: Option<
+        unsafe extern "C" fn(*mut FFI_ArrowAsyncDeviceStreamHandler, *mut FFI_ArrowSchema) -> c_int,
+    >,
+    pub on_next_task: Option<
+        unsafe extern "C" fn(
+            *mut FFI_ArrowAsyncDeviceStreamHandler,
+            *mut FFI_ArrowAsyncTask,
+            *const c_char,
+        ) -> c_int,
+    >,
+    pub on_error: Option<
+        unsafe extern "C" fn(
+            *mut FFI_ArrowAsyncDeviceStreamHandler,
+            c_int,
+            *const c_char,
+            *const c_char,
+        ),
+    >,
+    pub release: Option<unsafe extern "C" fn(*mut FFI_ArrowAsyncDeviceStreamHandler)>,
+    pub producer: *mut FFI_ArrowAsyncProducer,
+    pub private_data: *mut c_void,
+}
+
+impl Drop for FFI_ArrowAsyncDeviceStreamHandler {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            unsafe { release(self) };
+        }
+    }
+}
+
+/// Rust representation of `ArrowAsyncTask`.
+#[repr(C)]
+pub struct FFI_ArrowAsyncTask {
+    pub extract_data:
+        Option<unsafe extern "C" fn(*mut FFI_ArrowAsyncTask, *mut FFI_ArrowDeviceArray) -> c_int>,
+    pub private_data: *mut c_void,
+}
 
 /// Raw FFI representation of the SedonaCScalarKernel
 ///
@@ -377,6 +475,88 @@ impl Drop for SedonaCExecutionPlan {
     }
 }
 
+/// Raw FFI representation of [`sedona_catalog::SedonaCatalogList`].
+///
+/// Callbacks may block; Rust imports run them on a blocking worker. Property names
+/// are UTF-8; identifiers and arguments are UTF-8 JSON. Strings are borrowed for
+/// the duration of the call. Implementations must support concurrent calls.
+/// Outputs transfer ownership to the caller.
+#[derive(Default)]
+#[repr(C)]
+pub struct SedonaCCatalogProviderList {
+    /// Get the schema of a property. `name` and `list_identifiers` are non-null Utf8.
+    pub get_property_schema: Option<
+        unsafe extern "C" fn(
+            self_: *const Self,
+            property: *const c_char,
+            out: *mut FFI_ArrowSchema,
+            err: *mut SedonaCError,
+        ) -> c_int,
+    >,
+    /// Get a JSON-encoded property. `name` returns the implementation name as a
+    /// JSON string and takes no arguments. It must be available without catalog
+    /// I/O and is cached on import. `list_identifiers` accepts
+    /// {"prefix": [...], "depth": null|integer} in `args`.
+    /// Its output is one non-null Utf8 Arrow value containing a CatalogObject array.
+    pub get_property: Option<
+        unsafe extern "C" fn(
+            self_: *const Self,
+            property: *const c_char,
+            args: *const c_char,
+            out: *mut FFI_ArrowArray,
+            err: *mut SedonaCError,
+        ) -> c_int,
+    >,
+    /// `identifier`: JSON array of literal components. A missing table has NULL release.
+    pub table: Option<
+        unsafe extern "C" fn(
+            self_: *const Self,
+            identifier: *const c_char,
+            out: *mut SedonaCTableProvider,
+            err: *mut SedonaCError,
+        ) -> c_int,
+    >,
+    /// `args`: {"identifier": [...], "options": CreateObjectOptions}.
+    /// A NULL input means no plan. Otherwise the callback takes ownership by
+    /// moving the plan and clearing its release callback. The output is required
+    /// on success and performs the mutation only when executed.
+    pub create_object: Option<
+        unsafe extern "C" fn(
+            self_: *const Self,
+            args: *const c_char,
+            input: *mut SedonaCExecutionPlan,
+            out: *mut SedonaCExecutionPlan,
+            err: *mut SedonaCError,
+        ) -> c_int,
+    >,
+    /// `args`: {"identifier": [...], "options": DropObjectOptions}.
+    /// Output is required on success, including for DROP IF EXISTS.
+    pub drop_object: Option<
+        unsafe extern "C" fn(
+            self_: *const Self,
+            args: *const c_char,
+            out: *mut SedonaCExecutionPlan,
+            err: *mut SedonaCError,
+        ) -> c_int,
+    >,
+    pub reserved: *mut c_void,
+    pub release: Option<unsafe extern "C" fn(self_: *mut Self)>,
+    pub private_data: *mut c_void,
+}
+
+unsafe impl Send for SedonaCCatalogProviderList {}
+unsafe impl Sync for SedonaCCatalogProviderList {}
+
+impl Drop for SedonaCCatalogProviderList {
+    fn drop(&mut self) {
+        if let Some(releaser) = self.release {
+            unsafe { releaser(self) }
+            self.release = None;
+            self.private_data = null_mut();
+        }
+    }
+}
+
 /// Raw FFI representation of a TableProvider.
 ///
 /// This provides a minimal interface for importing a TableProvider
@@ -487,4 +667,74 @@ impl Drop for SedonaCTableProvider {
             self.private_data = null_mut();
         }
     }
+}
+
+/// Version two scalar kernel factory. See sedona_extension.h for the ABI contract.
+#[derive(Default)]
+#[repr(C)]
+pub struct SedonaCScalarKernelV2 {
+    pub get_property_schema: Option<
+        unsafe extern "C" fn(
+            *const Self,
+            *const c_char,
+            *mut FFI_ArrowSchema,
+            *mut SedonaCError,
+        ) -> c_int,
+    >,
+    pub get_property: Option<
+        unsafe extern "C" fn(
+            *const Self,
+            *const c_char,
+            *const c_char,
+            *mut FFI_ArrowArray,
+            *mut SedonaCError,
+        ) -> c_int,
+    >,
+    pub new_impl: Option<
+        unsafe extern "C" fn(
+            *const Self,
+            *const SedonaCConfigOptionsView,
+            *mut SedonaCScalarKernelImpl,
+            *mut SedonaCError,
+        ) -> c_int,
+    >,
+    pub reserved: *mut c_void,
+    pub release: Option<unsafe extern "C" fn(*mut Self)>,
+    pub private_data: *mut c_void,
+}
+unsafe impl Send for SedonaCScalarKernelV2 {}
+unsafe impl Sync for SedonaCScalarKernelV2 {}
+impl Drop for SedonaCScalarKernelV2 {
+    fn drop(&mut self) {
+        if let Some(release) = self.release {
+            unsafe { release(self) };
+        }
+    }
+}
+
+/// Borrowed configuration, valid for the lifetime of the implementation using it.
+#[derive(Default)]
+#[repr(C)]
+pub struct SedonaCConfigOptionsView {
+    pub get_option: Option<
+        unsafe extern "C" fn(
+            *const Self,
+            *const c_char,
+            *mut FFI_ArrowSchema,
+            *mut FFI_ArrowArray,
+            *mut SedonaCError,
+        ) -> c_int,
+    >,
+    pub get_option_object: Option<
+        unsafe extern "C" fn(
+            *const Self,
+            *const c_char,
+            c_int,
+            *mut c_void,
+            usize,
+            *mut SedonaCError,
+        ) -> c_int,
+    >,
+    pub reserved: *mut c_void,
+    pub private_data: *const c_void,
 }

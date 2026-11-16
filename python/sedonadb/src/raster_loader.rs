@@ -22,9 +22,8 @@ use arrow_schema::ArrowError;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pyo3::{
-    buffer::PyBuffer,
     pyclass, pyfunction, pymethods,
-    types::{PyAnyMethods, PyList, PyListMethods},
+    types::{PyAnyMethods, PyBytes, PyBytesMethods, PyList, PyListMethods},
     Py, PyAny, Python,
 };
 use sedona_raster::{
@@ -133,10 +132,22 @@ impl AsyncRasterLoader for PyRasterLoader {
                 for item in result_list.iter() {
                     let bytes_obj = item.getattr("bytes").map_err(py_err)?;
 
-                    // Zero-copy: wrap the Python buffer with a wrapper that keeps it alive
-                    // Accepts any object implementing the buffer protocol (bytes, memoryview, numpy array, etc.)
-                    let py_buffer = PyBufferWrapper::new(&bytes_obj)?;
-                    let bytes = Bytes::from_owner(py_buffer);
+                    // The buffer protocol did not join Python's Limited API
+                    // until 3.11. Convert through the built-in bytes type so
+                    // this extension can use abi3 while retaining Python 3.10
+                    // support. `Bytes` takes ownership of the resulting Vec,
+                    // so this performs one copy at the Python/Rust boundary.
+                    let py_bytes = py
+                        .get_type::<PyBytes>()
+                        .call1((bytes_obj,))
+                        .map_err(py_err)?;
+                    let bytes = Bytes::from(
+                        py_bytes
+                            .cast::<PyBytes>()
+                            .map_err(py_err)?
+                            .as_bytes()
+                            .to_vec(),
+                    );
 
                     let source_shape: Vec<i64> = item
                         .getattr("source_shape")
@@ -221,71 +232,11 @@ struct OwnedPyLoadRequest {
     data_type: BandDataType,
 }
 
-/// Intermediate result data extracted from Python (zero-copy for bytes)
+/// Intermediate result data extracted from Python.
 struct PyRasterLoadResultData {
     bytes: Bytes,
     source_shape: Vec<i64>,
     view: Vec<ViewEntry>,
-}
-
-/// Zero-copy wrapper around Python buffer protocol objects.
-///
-/// This struct keeps the Python buffer alive and provides access to its
-/// memory without copying. The pointer and length are cached at construction
-/// time so that `AsRef<[u8]>` doesn't require the GIL.
-///
-/// # Safety
-/// - Only accepts read-only buffers to ensure the memory won't be mutated
-/// - The pointer remains valid as long as the `PyBuffer<u8>` is alive
-/// - `PyBuffer<u8>` is already Send + Sync and handles GIL acquisition on Drop
-struct PyBufferWrapper {
-    /// The Python buffer handle - keeps the source object alive
-    _buffer: PyBuffer<u8>,
-    /// Cached pointer to the buffer data
-    ptr: *const u8,
-    /// Cached length of the buffer data
-    len: usize,
-}
-
-impl PyBufferWrapper {
-    /// Create a new PyBufferWrapper from any Python object implementing the buffer protocol.
-    ///
-    /// The Python GIL must be held when calling this function.
-    /// Returns an error if the buffer is not C-contiguous.
-    fn new(obj: &pyo3::Bound<'_, pyo3::types::PyAny>) -> Result<Self, ArrowError> {
-        let buffer: PyBuffer<u8> = PyBuffer::get(obj).map_err(|e| {
-            ArrowError::InvalidArgumentError(format!(
-                "Failed to get buffer from Python object: {e}"
-            ))
-        })?;
-
-        if !buffer.is_c_contiguous() {
-            return Err(ArrowError::InvalidArgumentError(
-                "Buffer must be C-contiguous".to_string(),
-            ));
-        }
-
-        // Cache the pointer and length while we have the GIL
-        let ptr = buffer.buf_ptr() as *const u8;
-        let len = buffer.len_bytes();
-
-        Ok(Self {
-            _buffer: buffer,
-            ptr,
-            len,
-        })
-    }
-}
-
-// Safety: PyBuffer<u8> is already Send + Sync, and we only read from immutable data
-unsafe impl Send for PyBufferWrapper {}
-unsafe impl Sync for PyBufferWrapper {}
-
-impl AsRef<[u8]> for PyBufferWrapper {
-    fn as_ref(&self) -> &[u8] {
-        // Safety: ptr and len are valid as long as self.buffer is alive
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
 }
 
 /// Python-visible raster load request
@@ -314,8 +265,10 @@ impl PyRasterLoadRequest {
 }
 
 /// Python-visible view entry
+// Clone only: from_py_object clones the entry, which clippy flags as
+// clone_on_copy if the type is also Copy.
 #[pyclass(from_py_object)]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct PyViewEntry {
     #[pyo3(get)]
     pub source_axis: i64,
@@ -370,7 +323,7 @@ impl From<PyViewEntry> for ViewEntry {
 }
 
 /// Python-visible band data type wrapper
-#[pyclass(skip_from_py_object)]
+#[pyclass]
 #[derive(Clone, Copy)]
 pub struct PyBandDataType(pub BandDataType);
 

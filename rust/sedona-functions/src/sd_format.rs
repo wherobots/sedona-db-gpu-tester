@@ -18,13 +18,14 @@ use std::{fmt::Write, sync::Arc, vec};
 
 use crate::executor::WkbExecutor;
 use arrow_array::{
-    builder::StringBuilder, cast::AsArray, Array, GenericListArray, GenericListViewArray,
-    OffsetSizeTrait, StructArray,
+    Array, GenericListArray, GenericListViewArray, OffsetSizeTrait, StructArray,
+    builder::StringBuilder, cast::AsArray,
 };
 use arrow_schema::{DataType, Field, Fields};
 use datafusion_common::{
+    ScalarValue,
     error::{DataFusionError, Result},
-    internal_err, ScalarValue,
+    internal_err,
 };
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
@@ -71,22 +72,21 @@ impl SedonaScalarKernel for SDFormatDefault {
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
         let mut maybe_width_hint: Option<usize> = None;
-        if args.len() >= 2 {
-            if let ColumnarValue::Scalar(ScalarValue::Utf8(Some(options_value))) =
+        if args.len() >= 2
+            && let ColumnarValue::Scalar(ScalarValue::Utf8(Some(options_value))) =
                 args[1].cast_to(&DataType::Utf8, None)?
+        {
+            let options: serde_json::Value = options_value
+                .parse()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            if let Some(width_hint_value) = options.get("width_hint")
+                && let Some(width_hint_i64) = width_hint_value.as_i64()
             {
-                let options: serde_json::Value = options_value
-                    .parse()
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                if let Some(width_hint_value) = options.get("width_hint") {
-                    if let Some(width_hint_i64) = width_hint_value.as_i64() {
-                        maybe_width_hint = Some(
-                            width_hint_i64
-                                .try_into()
-                                .map_err(|e| DataFusionError::External(Box::new(e)))?,
-                        );
-                    }
-                }
+                maybe_width_hint = Some(
+                    width_hint_i64
+                        .try_into()
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                );
             }
         }
 
@@ -103,7 +103,9 @@ impl SedonaScalarKernel for SDFormatDefault {
 
 fn sedona_type_to_formatted_type(sedona_type: &SedonaType) -> Result<SedonaType> {
     match sedona_type {
-        SedonaType::Wkb(_, _) | SedonaType::WkbView(_, _) => Ok(SedonaType::Arrow(DataType::Utf8)),
+        SedonaType::Wkb(_, _) | SedonaType::WkbLarge(_, _) | SedonaType::WkbView(_, _) => {
+            Ok(SedonaType::Arrow(DataType::Utf8))
+        }
         SedonaType::Arrow(arrow_type) => {
             // dive into the arrow type and translate geospatial types into Utf8
             match arrow_type {
@@ -146,7 +148,7 @@ fn columnar_value_to_formatted_value(
     maybe_width_hint: Option<usize>,
 ) -> Result<ColumnarValue> {
     match sedona_type {
-        SedonaType::Wkb(_, _) | SedonaType::WkbView(_, _) => {
+        SedonaType::Wkb(_, _) | SedonaType::WkbLarge(_, _) | SedonaType::WkbView(_, _) => {
             geospatial_value_to_formatted_value(sedona_type, columnar_value, maybe_width_hint)
         }
         SedonaType::Raster => raster_value_to_formatted_value(columnar_value, maybe_width_hint),
@@ -418,8 +420,8 @@ impl<'a, T: std::fmt::Write> std::fmt::Write for LimitedSizeOutput<'a, T> {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        create_array, ArrayRef, Float64Array, Int32Array, ListArray, ListViewArray, StringArray,
-        StructArray,
+        ArrayRef, Float64Array, Int32Array, ListArray, ListViewArray, StringArray, StructArray,
+        create_array,
     };
     use arrow_schema::{DataType, Field};
     use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -481,9 +483,11 @@ mod tests {
         let err = binary_tester
             .invoke_array_scalar(wkt_array.clone(), r#"{"width_hint": -1}"#)
             .unwrap_err();
+        // The message is the standard library's, whose wording changes between
+        // Rust releases, so compare with it rather than a copy of its text.
         assert_eq!(
             err.message(),
-            "out of range integral type conversion attempted"
+            usize::try_from(-1i64).unwrap_err().to_string()
         );
 
         // For a very small width hint, we should get truncated values
@@ -598,13 +602,13 @@ mod tests {
         let formatted = result.as_string::<i32>();
 
         // Index 0: valid raster (no skew)
-        assert_eq!(formatted.value(0), "[1x2/1] @ [1 1.6 1.1 2] / OGC:CRS84");
+        assert_eq!(formatted.value(0), "[1x2/1] @ [1 1.6 1.1 2] / ogc:crs84");
         // Index 1: null raster should produce null output
         assert!(formatted.is_null(1));
         // Index 2: valid raster (with skew)
         assert_eq!(
             formatted.value(2),
-            "[3x4/1] @ [3 2.4 3.84 4.24] skew=(0.06, 0.08) / OGC:CRS84"
+            "[3x4/1] @ [3 2.4 3.84 4.24] skew=(0.06, 0.08) / ogc:crs84"
         );
     }
 
@@ -639,7 +643,7 @@ mod tests {
         let formatted = result.as_string::<i32>();
 
         // With a small width_hint, output should be truncated
-        let full_output = "[1x2/1] @ [1 1.6 1.1 2] / OGC:CRS84";
+        let full_output = "[1x2/1] @ [1 1.6 1.1 2] / ogc:crs84";
         assert!(formatted.value(0).starts_with("["));
         assert!(formatted.value(0).len() < full_output.len());
     }

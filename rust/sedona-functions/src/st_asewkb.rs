@@ -19,9 +19,10 @@ use std::{sync::Arc, vec};
 use arrow_array::builder::BinaryBuilder;
 use arrow_schema::DataType;
 use datafusion_common::{
+    ScalarValue,
     cast::{as_string_view_array, as_struct_array},
     error::Result,
-    exec_datafusion_err, exec_err, ScalarValue,
+    exec_datafusion_err, exec_err,
 };
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_common::sedona_internal_err;
@@ -67,7 +68,9 @@ impl SedonaScalarKernel for STAsEWKB {
         );
 
         let maybe_srid = match &arg_types[0] {
-            SedonaType::Wkb(_, crs) | SedonaType::WkbView(_, crs) => match crs {
+            SedonaType::Wkb(_, crs)
+            | SedonaType::WkbLarge(_, crs)
+            | SedonaType::WkbView(_, crs) => match crs {
                 Some(crs) => match crs.srid()? {
                     Some(0) => None,
                     Some(srid) => Some(srid),

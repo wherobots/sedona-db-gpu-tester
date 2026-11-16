@@ -82,7 +82,9 @@ impl<F: Fn((f64, f64)) -> u64 + Send + Sync> SedonaScalarKernel for OrderLngLat<
         // a transformation. If the CRS is missing we also skip any particular
         // transform (although the resulting sort may not be effective).
         let maybe_src_crs = match &arg_types[0] {
-            SedonaType::Wkb(_, maybe_crs) | SedonaType::WkbView(_, maybe_crs)
+            SedonaType::Wkb(_, maybe_crs)
+            | SedonaType::WkbLarge(_, maybe_crs)
+            | SedonaType::WkbView(_, maybe_crs)
                 if maybe_crs != &lnglat() =>
             {
                 maybe_crs.as_ref().map(|crs| crs.to_crs_string())
@@ -148,7 +150,7 @@ impl<F: Fn((f64, f64)) -> u64 + Send + Sync> SedonaScalarKernel for OrderLngLat<
 #[cfg(test)]
 mod test {
 
-    use arrow_array::{create_array, ArrayRef};
+    use arrow_array::{ArrayRef, create_array};
     use sedona_expr::scalar_udf::SedonaScalarUDF;
     use sedona_geometry::types::Edges;
     use sedona_schema::datatypes::WKB_GEOMETRY;

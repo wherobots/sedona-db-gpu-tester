@@ -24,10 +24,10 @@ use datafusion::{
         file_format::parquet::ParquetFormat,
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
     },
-    execution::{options::ReadOptions, SessionState},
+    execution::{SessionState, options::ReadOptions},
     prelude::{ParquetReadOptions, SessionConfig, SessionContext},
 };
-use datafusion_common::{exec_err, plan_err, Result};
+use datafusion_common::{Result, exec_err, plan_err};
 
 use crate::{
     format::GeoParquetFormat, metadata::GeoParquetColumnMetadata, options::TableGeoParquetOptions,
@@ -60,8 +60,8 @@ pub async fn geoparquet_listing_table(
         if !path_without_query.ends_with(option_extension.clone().as_str()) && !path.is_collection()
         {
             return exec_err!(
-                    "File path '{file_path}' does not match the expected extension '{option_extension}'"
-                );
+                "File path '{file_path}' does not match the expected extension '{option_extension}'"
+            );
         }
     }
 
@@ -355,7 +355,7 @@ mod test {
     use datafusion::prelude::{col, lit};
     use datafusion_expr::LogicalPlanBuilder;
     use sedona_geometry::types::Edges;
-    use sedona_schema::{crs::lnglat, datatypes::SedonaType};
+    use sedona_schema::datatypes::SedonaType;
     use sedona_testing::data::{geoarrow_data_dir, test_geoparquet};
     use tempfile::tempdir;
 
@@ -431,10 +431,7 @@ mod test {
         let sedona_types = sedona_types.unwrap();
         assert_eq!(sedona_types.len(), 2);
         assert_eq!(sedona_types[0], SedonaType::Arrow(DataType::Utf8View));
-        assert_eq!(
-            sedona_types[1],
-            SedonaType::WkbView(Edges::Planar, lnglat())
-        );
+        assert_eq!(sedona_types[1], SedonaType::WkbView(Edges::Planar, None));
 
         // Make sure all the rows show up!
         let batches = df.collect().await.unwrap();
@@ -464,9 +461,10 @@ mod test {
         )
         .await
         .unwrap_err();
-        assert!(err
-            .message()
-            .ends_with("does not match the expected extension '.parquet'"));
+        assert!(
+            err.message()
+                .ends_with("does not match the expected extension '.parquet'")
+        );
 
         let err = geoparquet_listing_table(
             &ctx,

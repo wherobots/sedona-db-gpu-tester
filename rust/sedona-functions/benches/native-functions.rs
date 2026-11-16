@@ -14,9 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion_expr::ScalarUDF;
-use sedona_testing::benchmark_util::{benchmark, BenchmarkArgSpec::*, BenchmarkArgs};
+use sedona_testing::benchmark_util::{BenchmarkArgSpec::*, BenchmarkArgs, benchmark};
 
 fn criterion_benchmark(c: &mut Criterion) {
     let f = sedona_functions::register::default_function_set();
@@ -49,6 +49,35 @@ fn criterion_benchmark(c: &mut Criterion) {
         "native",
         "st_translate",
         BenchmarkArgs::ArrayScalarScalar(LineString(10), Float64(0.0, 1.0), Float64(2.0, 3.0)),
+    );
+
+    benchmark::scalar(
+        c,
+        &f,
+        "native",
+        "st_lineinterpolatepoint",
+        BenchmarkArgs::ArrayScalar(LineString(10), Float64(0.0, 1.0)),
+    );
+    benchmark::scalar(
+        c,
+        &f,
+        "native",
+        "st_lineinterpolatepoint",
+        BenchmarkArgs::ArrayScalar(LineString(500), Float64(0.0, 1.0)),
+    );
+    benchmark::scalar(
+        c,
+        &f,
+        "native",
+        "st_lineinterpolatepoint",
+        BenchmarkArgs::ScalarArray(LineString(10), Float64(0.0, 1.0)),
+    );
+    benchmark::scalar(
+        c,
+        &f,
+        "native",
+        "st_lineinterpolatepoint",
+        BenchmarkArgs::ScalarArray(LineString(500), Float64(0.0, 1.0)),
     );
 
     benchmark::scalar(c, &f, "native", "st_geometrytype", Point);

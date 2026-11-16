@@ -20,8 +20,8 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow::array::{
-    downcast_array, new_null_array, Array, BooleanBufferBuilder, RecordBatch, RecordBatchOptions,
-    UInt32Builder, UInt64Builder,
+    Array, BooleanBufferBuilder, RecordBatch, RecordBatchOptions, UInt32Builder, UInt64Builder,
+    downcast_array, new_null_array,
 };
 use arrow::buffer::NullBuffer;
 use arrow::compute::{self, take};
@@ -34,16 +34,16 @@ use datafusion_expr::JoinType;
 use datafusion_physical_expr::Partitioning;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::joins::utils::{
-    adjust_right_output_partitioning, ColumnIndex, JoinFilter,
+    ColumnIndex, JoinFilter, adjust_right_output_partitioning,
 };
 use datafusion_physical_plan::projection::{
-    join_allows_pushdown, join_table_borders, new_join_children, physical_to_column_exprs,
-    update_join_filter, ProjectionExec,
+    ProjectionExec, join_allows_pushdown, join_table_borders, new_join_children,
+    physical_to_column_exprs, update_join_filter,
 };
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
-use crate::spatial_predicate::SpatialPredicateTrait;
 use crate::SpatialPredicate;
+use crate::spatial_predicate::SpatialPredicateTrait;
 
 /// Some type `join_type` of join need to maintain the matched indices bit map for the left side, and
 /// use the bit map to generate the part of result of the join.
@@ -59,6 +59,32 @@ pub fn need_produce_result_in_final(join_type: JoinType) -> bool {
             | JoinType::LeftMark
             | JoinType::Full
     )
+}
+
+/// Which side of the SpatialJoinExec children is the build (indexed) side.
+///
+/// Regular spatial joins always build on the left child. KNN joins build on the
+/// candidate/object side, which is the opposite of [`KNNPredicate::probe_side`].
+pub(crate) fn build_side_for_predicate(predicate: &SpatialPredicate) -> JoinSide {
+    match predicate {
+        SpatialPredicate::KNearestNeighbors(knn) => knn.probe_side.negate(),
+        _ => JoinSide::Left,
+    }
+}
+
+/// Join type as interpreted by build/probe emission helpers.
+///
+/// Unmatched-build finalization, `adjust_indices_*`, and visited-bitmap setup all
+/// assume the build side corresponds to the "left" in Left/LeftSemi/... naming
+/// (DataFusion hash-join convention). When KNN builds on the SQL right
+/// (`build_side == Right`), swap the join type so those helpers keep the correct
+/// SQL outer-join semantics for unmatched probe vs build rows.
+pub(crate) fn emission_join_type(join_type: JoinType, build_side: JoinSide) -> JoinType {
+    if build_side == JoinSide::Right {
+        join_type.swap()
+    } else {
+        join_type
+    }
 }
 
 /// Determines if a bitmap is needed to track matched rows in the probe side's "Multi" partition.
@@ -758,7 +784,7 @@ pub(crate) fn boundedness_from_children<'a>(
             } => {
                 return Boundedness::Unbounded {
                     requires_infinite_memory: true,
-                }
+                };
             }
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
@@ -916,18 +942,19 @@ mod tests {
     use arrow_schema::Field;
     use arrow_schema::SchemaRef;
     use datafusion_common::ScalarValue;
+    use datafusion_common::tree_node::TreeNodeRecursion;
     use datafusion_expr::JoinType;
     use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
     use datafusion_physical_expr::EquivalenceProperties;
     use datafusion_physical_expr::Partitioning;
     use datafusion_physical_expr::PhysicalExpr;
-    use datafusion_physical_plan::empty::EmptyExec;
-    use datafusion_physical_plan::projection::ProjectionExpr;
-    use datafusion_physical_plan::repartition::RepartitionExec;
+    use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
     use datafusion_physical_plan::DisplayAs;
     use datafusion_physical_plan::DisplayFormatType;
     use datafusion_physical_plan::PlanProperties;
+    use datafusion_physical_plan::empty::EmptyExec;
+    use datafusion_physical_plan::projection::ProjectionExpr;
+    use datafusion_physical_plan::repartition::RepartitionExec;
     use rstest::rstest;
 
     fn setup_and_run(
@@ -1192,6 +1219,13 @@ mod tests {
             vec![]
         }
 
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
         fn with_new_children(
             self: Arc<Self>,
             _children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1207,9 +1241,10 @@ mod tests {
             unimplemented!("PropertiesOnlyExec is for properties tests only")
         }
 
-        fn partition_statistics(
+        fn statistics_from_inputs(
             &self,
-            _partition: Option<usize>,
+            _input_stats: &[Arc<datafusion_common::Statistics>],
+            _args: &datafusion_physical_plan::StatisticsArgs,
         ) -> Result<Arc<datafusion_common::Statistics>> {
             Ok(Arc::new(datafusion_common::Statistics::new_unknown(
                 self.schema().as_ref(),
@@ -1724,5 +1759,29 @@ mod tests {
         )?;
         assert!(result.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn test_emission_join_type_swaps_when_build_is_right() {
+        assert_eq!(
+            emission_join_type(JoinType::Left, JoinSide::Left),
+            JoinType::Left
+        );
+        assert_eq!(
+            emission_join_type(JoinType::Left, JoinSide::Right),
+            JoinType::Right
+        );
+        assert_eq!(
+            emission_join_type(JoinType::Right, JoinSide::Right),
+            JoinType::Left
+        );
+        assert_eq!(
+            emission_join_type(JoinType::Full, JoinSide::Right),
+            JoinType::Full
+        );
+        assert_eq!(
+            emission_join_type(JoinType::LeftSemi, JoinSide::Right),
+            JoinType::RightSemi
+        );
     }
 }

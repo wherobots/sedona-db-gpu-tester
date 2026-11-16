@@ -85,6 +85,31 @@ NULL
 }
 
 
+`configure_gdal_prefix_native` <- function(`prefix`) {
+  invisible(.Call(savvy_configure_gdal_prefix_native__impl, `prefix`))
+}
+
+
+`configure_gdal_shared` <- function(`shared_library_path` = NULL) {
+  invisible(.Call(savvy_configure_gdal_shared__impl, `shared_library_path`))
+}
+
+
+`configure_gdal_system_native` <- function() {
+  invisible(.Call(savvy_configure_gdal_system_native__impl))
+}
+
+
+`configure_proj_prefix_native` <- function(`prefix`) {
+  invisible(.Call(savvy_configure_proj_prefix_native__impl, `prefix`))
+}
+
+
+`configure_proj_system_native` <- function() {
+  invisible(.Call(savvy_configure_proj_system_native__impl))
+}
+
+
 `init_r_runtime_interrupts` <- function(`interrupts_call`, `pkg_env`) {
   invisible(.Call(savvy_init_r_runtime_interrupts__impl, `interrupts_call`, `pkg_env`))
 }
@@ -129,12 +154,48 @@ NULL
   }
 }
 
+`InternalContext_read` <- function(self) {
+  function(
+    `paths`,
+    `option_keys`,
+    `option_values`,
+    `partitioning`,
+    `partitioning_set`,
+    `check_extension`,
+    `format` = NULL
+  ) {
+    .savvy_wrap_InternalDataFrame(.Call(
+      savvy_InternalContext_read__impl,
+      `self`,
+      `paths`,
+      `option_keys`,
+      `option_values`,
+      `partitioning`,
+      `partitioning_set`,
+      `check_extension`,
+      `format`
+    ))
+  }
+}
+
 `InternalContext_read_parquet` <- function(self) {
-  function(`paths`) {
+  function(
+    `paths`,
+    `option_keys`,
+    `option_values`,
+    `geometry_columns`,
+    `validate`,
+    `partitioning`
+  ) {
     .savvy_wrap_InternalDataFrame(.Call(
       savvy_InternalContext_read_parquet__impl,
       `self`,
-      `paths`
+      `paths`,
+      `option_keys`,
+      `option_values`,
+      `geometry_columns`,
+      `validate`,
+      `partitioning`
     ))
   }
 }
@@ -180,6 +241,7 @@ NULL
   )
   e$`deregister_table` <- `InternalContext_deregister_table`(ptr)
   e$`list_functions` <- `InternalContext_list_functions`(ptr)
+  e$`read` <- `InternalContext_read`(ptr)
   e$`read_parquet` <- `InternalContext_read_parquet`(ptr)
   e$`register_scalar_udf` <- `InternalContext_register_scalar_udf`(ptr)
   e$`scalar_udf_xptr` <- `InternalContext_scalar_udf_xptr`(ptr)

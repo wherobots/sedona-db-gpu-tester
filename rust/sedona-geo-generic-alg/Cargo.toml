@@ -24,7 +24,7 @@ homepage.workspace = true
 repository.workspace = true
 description.workspace = true
 readme.workspace = true
-edition.workspace = true
+edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
@@ -35,8 +35,8 @@ sedona-geo-traits-ext = { workspace = true }
 log = { workspace = true }
 num-traits = { workspace = true }
 robust = "1.1.0"
-rstar = "0.13.0"
-i_overlay = { version = "8.0.0", default-features = false }
+rstar = "0.14.0"
+i_overlay = { version = "9.0.0", default-features = false }
 
 [dev-dependencies]
 sedona-testing = { workspace = true }

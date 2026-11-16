@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import re
 import sys
 
 import numpy as np
@@ -99,7 +100,7 @@ def test_zarr_url_as_table(tmp_path):
 
     url = zarr_path.as_uri()
 
-    # Ground truth: the working explicit-format read of the same `.zarr` group.
+    # Ground truth: the explicit-format read of the same `.zarr` group.
     expected = con.read(url, format="zarr").to_arrow_table()
 
     def assert_matches_expected(table):
@@ -111,6 +112,10 @@ def test_zarr_url_as_table(tmp_path):
 
     # The `file://` URL form is the primary SQL-text feature under test.
     assert_matches_expected(con.sql(f"SELECT * FROM '{url}'").to_arrow_table())
+
+    # The generic Python read uses the same extension lookup and single-object
+    # scan as SQL.
+    assert_matches_expected(con.read(url).to_arrow_table())
 
     # A bare filesystem path (no `file://` scheme) resolves the same way.
     assert_matches_expected(con.sql(f"SELECT * FROM '{zarr_path}'").to_arrow_table())
@@ -242,6 +247,37 @@ def test_format_spec_with_arrays_option(zarr_group):
     assert df.to_arrow_table().num_rows == 2
 
 
+def test_arrays_option_order_is_band_order(tmp_path):
+    """With `arrays`, band i is arrays[i]; without it, bands are sorted by path."""
+    root = zarr.open_group(str(tmp_path), mode="w")
+    for name, value in [("a0", 10), ("a1", 20), ("b2", 30)]:
+        arr = root.create_array(
+            name, shape=(2, 2), chunks=(2, 2), dtype="uint8", dimension_names=["y", "x"]
+        )
+        arr[:] = value
+
+    con = sedonadb.connect()
+    con.register(sedonadb_zarr.ZarrExtension())
+
+    def band_arrays(names):
+        fmt = sedonadb_zarr.Zarr({"arrays": names}) if names else sedonadb_zarr.Zarr()
+        tab = con.read(f"file://{tmp_path}", format=fmt).to_arrow_table()
+        raster = Raster(tab["raster"], 0)
+        return [b.outdb_uri.split("#array=")[1].split("&")[0] for b in raster.bands]
+
+    assert band_arrays(["a1", "a0"]) == ["a1", "a0"]
+    assert band_arrays(["b2", "a0", "a1"]) == ["b2", "a0", "a1"]
+    assert band_arrays(["b2", "a1"]) == ["b2", "a1"]
+    assert band_arrays(None) == ["a0", "a1", "b2"]
+
+    # The loaded pixels follow the same order.
+    fmt = sedonadb_zarr.Zarr({"arrays": ["b2", "a0"]})
+    df = con.read(f"file://{tmp_path}", format=fmt)
+    tab = df.select(r=df.raster.funcs.rs_ensureloaded()).to_arrow_table()
+    bands = Raster(tab["r"], 0).bands
+    assert [int(b.to_numpy()[0, 0]) for b in bands] == [30, 10]
+
+
 def test_format_spec_class_invariants():
     spec = sedonadb_zarr.Zarr()
     assert spec.extension == "zarr"
@@ -256,6 +292,56 @@ def test_zarr_loader_supports_format():
     assert loader.supports_format(None) is False
     assert loader.supports_format("gdal") is False
     assert "ZarrRasterLoader" in repr(loader)
+
+
+def test_zarr_loader_io_concurrency_is_configurable():
+    assert sedonadb_zarr.ZarrRasterLoader().io_concurrency() > 0
+    assert sedonadb_zarr.ZarrRasterLoader(io_concurrency=3).io_concurrency() == 3
+
+    sd = sedonadb.connect()
+    ext = sedonadb_zarr.ZarrExtension(io_concurrency=5)
+    sd.register(ext)
+    assert ext.loader.io_concurrency() == 5
+
+
+def test_zarr_loader_handle_stats_start_at_zero():
+    loader = sedonadb_zarr.ZarrRasterLoader()
+    assert loader.handle_stats() == {
+        "store_hits": 0,
+        "store_misses": 0,
+        "array_hits": 0,
+        "array_misses": 0,
+    }
+
+
+def test_zarr_extension_reports_handle_reuse_across_calls(zarr_group):
+    sd = sedonadb.connect()
+    ext = sedonadb_zarr.ZarrExtension()
+    assert ext.loader is None
+    sd.register(ext)
+    assert isinstance(ext.loader, sedonadb_zarr.ZarrRasterLoader)
+
+    # This test counts loader calls, so the host's chunk cache must not
+    # serve the second query: with it on, the loader is never called again.
+    sd.sql("SET sedona.raster.cache_max_bytes = 0").execute()
+    t = sd.read(f"file://{zarr_group}", format="zarr")
+
+    def load_all():
+        tab = t.select(raster=t.raster.funcs.rs_ensureloaded()).to_arrow_table()
+        assert tab.num_rows == 2
+
+    load_all()
+    first = ext.loader.handle_stats()
+    # The one array in the group is opened once and its client built once.
+    assert first["array_misses"] == 1
+    assert first["store_misses"] == 1
+
+    load_all()
+    second = ext.loader.handle_stats()
+    # The second query reuses the opened array and builds no new client.
+    assert second["array_hits"] > first["array_hits"]
+    assert second["array_misses"] == first["array_misses"]
+    assert second["store_misses"] == 1
 
 
 @pytest.mark.parametrize(
@@ -327,6 +413,49 @@ def test_rs_ensure_loaded_with_zarr(tmp_path, numpy_dtype):
         total_pixels += chunk_data.size
 
     assert total_pixels == width * height
+
+
+def test_sharded_array_reads_one_row_per_inner_chunk(tmp_path):
+    """A sharded array yields one row per inner chunk, not one per shard.
+
+    Shape (3, 5) with 2x2 inner chunks in 4x4 shards: a 2x3 inner-chunk
+    grid inside a 1x2 shard grid. The reader must emit six 2x2 rows with
+    the pixels of each inner chunk (fill value past the array edge). Reading
+    per shard would give two 4x4 rows instead. The rows come back in no
+    particular order once the loads are spread over partitions, so each is
+    matched to its inner chunk by its chunk anchor.
+    """
+    values = np.arange(15, dtype=np.uint8).reshape(3, 5) + 1
+    root = zarr.open_group(str(tmp_path), mode="w")
+    arr = root.create_array(
+        "temperature",
+        shape=values.shape,
+        chunks=(2, 2),
+        shards=(4, 4),
+        dtype="uint8",
+        dimension_names=["y", "x"],
+    )
+    arr[:] = values
+
+    sd = sedonadb.connect()
+    sd.register(sedonadb_zarr.ZarrExtension())
+    t = sd.read(f"file://{tmp_path}", format="zarr")
+    tab = t.select(raster=t.raster.funcs.rs_ensureloaded()).to_arrow_table()
+    assert tab.num_rows == 6
+
+    padded = np.zeros((4, 6), dtype=np.uint8)
+    padded[:3, :5] = values
+    chunks = {}
+    for i in range(tab.num_rows):
+        band = tab["raster"][i].as_py().bands[0]
+        anchor = re.search(r"&chunk=(\d+),(\d+)$", band.outdb_uri)
+        assert anchor, band.outdb_uri
+        chunks[(int(anchor.group(1)), int(anchor.group(2)))] = band.to_numpy()
+    assert sorted(chunks) == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+    for (cy, cx), chunk in chunks.items():
+        assert chunk.shape == (2, 2)
+        expected = padded[2 * cy : 2 * cy + 2, 2 * cx : 2 * cx + 2]
+        np.testing.assert_array_equal(chunk, expected, err_msg=f"chunk {(cy, cx)}")
 
 
 # Each numpy dtype below maps to a different `BandDataType` arm in

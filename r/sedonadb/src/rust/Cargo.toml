@@ -24,6 +24,12 @@ edition = "2021"
 [lib]
 crate-type = ["staticlib", "lib"]
 
+[features]
+s2geography = ["sedona/s2geography"]
+gdal = ["sedona/gdal"]
+bindgen = ["sedona/bindgen"]
+proj = ["sedona/proj"]
+
 [dependencies]
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
@@ -40,6 +46,7 @@ sedona-expr = { workspace = true }
 sedona-extension = { workspace = true }
 sedona-geometry = { workspace = true }
 sedona-geoparquet = { workspace = true }
+sedona-gdal = { workspace = true }
 sedona-proj = { workspace = true }
 sedona-schema = { workspace = true }
 thiserror = { workspace = true }

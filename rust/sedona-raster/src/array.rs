@@ -16,8 +16,8 @@
 // under the License.
 
 use arrow_array::{
-    new_null_array, Array, ArrayRef, BinaryArray, BinaryViewArray, Float64Array, Int64Array,
-    ListArray, StringArray, StringViewArray, StructArray, UInt32Array,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, Float64Array, Int64Array, ListArray,
+    StringArray, StringViewArray, StructArray, UInt32Array, new_null_array,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
@@ -31,7 +31,7 @@ use crate::error::RasterError;
 use crate::traits::{BandRef, NdBuffer, Override, RasterRef};
 use crate::view_entries::{ViewEntries, ViewEntry};
 use sedona_schema::raster::{
-    band_indices, band_view_indices, raster_indices, BandDataType, RasterSchema,
+    BandDataType, RasterSchema, band_indices, band_view_indices, raster_indices,
 };
 
 /// Arrow-backed implementation of BandRef for a single band within a raster.
@@ -147,8 +147,10 @@ impl<'a> BandRef for BandRefImpl<'a> {
     fn nd_buffer(&self) -> Result<NdBuffer<'_>, RasterError> {
         if !self.is_indb() {
             return Err(RasterError::Invalid(
-                "OutDb byte access via nd_buffer() is not yet implemented; \
-                 backend-specific OutDb resolvers are tracked separately"
+                "band is stored out-of-database and its bytes are not loaded; \
+                 load the raster with RS_EnsureLoaded(raster) first (the planner \
+                 inserts this for functions that read pixels, so reaching this \
+                 from one means it missed the call)"
                     .to_string(),
             ));
         }
@@ -472,7 +474,7 @@ pub fn with_column_overrides(
             return Err(RasterError::Invalid(format!(
                 "with_column_overrides: input nulls have {} rows, expected {num_rows} or 1",
                 nulls.len()
-            )))
+            )));
         }
         None => None,
     };
@@ -917,6 +919,43 @@ impl<'a> RasterStructArray<'a> {
         self.raster_array.is_null(index)
     }
 
+    /// The `outdb_uri` of the first band of raster `raster_idx` whose bytes
+    /// still have to be loaded, borrowed from the array rather than from a
+    /// [`RasterRefImpl`], so it can outlive the per-row accessor (e.g. to
+    /// compare consecutive rows). `None` for a null raster, a raster whose
+    /// bands are all InDb, or an OutDb band without a URI. InDb is decided as
+    /// in [`BandRef::is_indb`], by `data` and the visible shape: a loaded band
+    /// keeps its `outdb_uri` as provenance, so the URI alone does not say
+    /// whether a load is needed.
+    pub fn first_outdb_band_uri(&self, raster_idx: usize) -> Option<&'a str> {
+        if raster_idx >= self.len() || self.is_null(raster_idx) {
+            return None;
+        }
+        let band_row = self
+            .band_rows(raster_idx)
+            .find(|&band_row| !self.band_row_is_indb(band_row))?;
+        if self.band_outdb_uri_array.is_null(band_row) {
+            return None;
+        }
+        Some(self.band_outdb_uri_array.value(band_row))
+    }
+
+    /// [`BandRef::is_indb`] for flattened band row `band_row`, without
+    /// building the band's view: the visible shape is the view's `steps`, or
+    /// the source shape when the view is null (identity).
+    fn band_row_is_indb(&self, band_row: usize) -> bool {
+        if !self.band_data_array.value(band_row).is_empty() {
+            return true;
+        }
+        let (list, values) = if self.band_view_list.is_null(band_row) {
+            (self.band_source_shape_list, self.band_source_shape_values)
+        } else {
+            (self.band_view_list, self.band_view_steps)
+        };
+        let offsets = list.value_offsets();
+        values.values()[offsets[band_row] as usize..offsets[band_row + 1] as usize].contains(&0)
+    }
+
     /// The flattened band `data` column (BinaryView) shared by every raster
     /// in this array. Pair with [`Self::band_data_row`] to address a single
     /// band's bytes — e.g. for zero-copy passthrough into a
@@ -932,6 +971,31 @@ impl<'a> RasterStructArray<'a> {
     pub fn band_data_row(&self, raster_idx: usize, band_idx: usize) -> usize {
         self.bands_list.value_offsets()[raster_idx] as usize + band_idx
     }
+
+    /// Rows of `raster_idx`'s bands in the flattened band columns. Lets
+    /// metadata-only passes (e.g. `crate::size`) walk every band without
+    /// constructing a `RasterRef` / boxed `BandRef` per row.
+    pub(crate) fn band_rows(&self, raster_idx: usize) -> std::ops::Range<usize> {
+        let offsets = self.bands_list.value_offsets();
+        offsets[raster_idx] as usize..offsets[raster_idx + 1] as usize
+    }
+
+    /// Raw source shape of the band at flattened row `band_row`.
+    pub(crate) fn band_source_shape_at(&self, band_row: usize) -> &[i64] {
+        let offsets = self.band_source_shape_list.value_offsets();
+        &self.band_source_shape_values.values()
+            [offsets[band_row] as usize..offsets[band_row + 1] as usize]
+    }
+
+    /// Pixel type of the band at flattened row `band_row`.
+    pub(crate) fn band_data_type_at(&self, band_row: usize) -> Result<BandDataType, RasterError> {
+        let code = self.band_datatype_array.value(band_row);
+        BandDataType::try_from_u32(code).ok_or_else(|| {
+            RasterError::Invalid(format!(
+                "invalid band data type code {code} at band row {band_row}"
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -942,7 +1006,7 @@ mod tests {
     use arrow_array::{ArrayRef, ListArray, StructArray, UInt32Array};
     use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
-    use sedona_schema::raster::{band_indices, raster_indices, BandDataType, RasterSchema};
+    use sedona_schema::raster::{BandDataType, RasterSchema, band_indices, raster_indices};
     use sedona_testing::rasters::generate_test_rasters;
     use std::sync::Arc;
 
@@ -1262,13 +1326,14 @@ mod tests {
         for i in 0..3 {
             let band = raster.band(i).unwrap();
             let expected_value = i as u8;
-            assert!(band
-                .nd_buffer()
-                .unwrap()
-                .as_contiguous()
-                .unwrap()
-                .iter()
-                .all(|&x| x == expected_value));
+            assert!(
+                band.nd_buffer()
+                    .unwrap()
+                    .as_contiguous()
+                    .unwrap()
+                    .iter()
+                    .all(|&x| x == expected_value)
+            );
         }
 
         // Test array
@@ -1676,6 +1741,11 @@ mod tests {
         assert!(r.band_outdb_format(1).is_none());
         assert!(r.band_nodata(1).is_none());
 
+        // Both bands hold bytes, so nothing is left to load: band 0's URI is
+        // provenance, and the array-level accessor does not report it.
+        assert!(rasters.first_outdb_band_uri(0).is_none());
+        assert!(rasters.first_outdb_band_uri(1).is_none());
+
         // Cross-check against the BandRef slow path.
         let band0 = r.band(0).unwrap();
         assert_eq!(band0.data_type(), BandDataType::UInt16);
@@ -1899,6 +1969,83 @@ mod tests {
     }
 
     #[test]
+    fn first_outdb_band_uri_skips_bands_that_need_no_load() {
+        let transform = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+        let empty_view = ViewEntries::new(vec![ViewEntry {
+            source_axis: 0,
+            start: 0,
+            step: 1,
+            steps: 0,
+        }]);
+        let mut builder = RasterBuilder::new(6);
+
+        // A loaded band keeps its URI as provenance; the next band is OutDb.
+        builder
+            .start_raster_nd(&transform, &["x"], &[4], None)
+            .unwrap();
+        for (uri, data) in [("s3://b/a.tif#band=1", 4), ("s3://b/a.tif#band=2", 0)] {
+            builder
+                .start_band(StartBandArgs {
+                    outdb_uri: Some(uri),
+                    ..StartBandArgs::new(&["x"], &[4], BandDataType::UInt8)
+                })
+                .unwrap();
+            builder.band_data_writer().append_value(vec![0u8; data]);
+            builder.finish_band().unwrap();
+        }
+        builder.finish_raster().unwrap();
+
+        // OutDb with a URI; empty `data` over an empty visible region, through
+        // a view and through the source shape (InDb, nothing to load); OutDb
+        // without a URI.
+        for (spatial, source, view, uri) in [
+            (4, 4, None, Some("s3://b/b.tif")),
+            (0, 4, Some(&empty_view), Some("s3://b/c.tif")),
+            (0, 0, None, Some("s3://b/d.tif")),
+            (4, 4, None, None),
+        ] {
+            builder
+                .start_raster_nd(&transform, &["x"], &[spatial], None)
+                .unwrap();
+            builder
+                .start_band(StartBandArgs {
+                    view,
+                    outdb_uri: uri,
+                    ..StartBandArgs::new(&["x"], &[source], BandDataType::UInt8)
+                })
+                .unwrap();
+            builder.band_data_writer().append_value([0u8; 0]);
+            builder.finish_band().unwrap();
+            builder.finish_raster().unwrap();
+        }
+        builder.append_null().unwrap();
+        let array = builder.finish().unwrap();
+        let rasters = RasterStructArray::try_new(&array).unwrap();
+
+        let uris: Vec<_> = (0..6).map(|i| rasters.first_outdb_band_uri(i)).collect();
+        assert_eq!(
+            uris,
+            [
+                Some("s3://b/a.tif#band=2"),
+                Some("s3://b/b.tif"),
+                None,
+                None,
+                None,
+                None
+            ]
+        );
+        // The same verdict as the per-band accessor.
+        for (i, uri) in uris.iter().enumerate().take(5) {
+            let raster = rasters.get(i).unwrap();
+            let first_outdb = (0..raster.num_bands())
+                .map(|b| raster.band(b).unwrap())
+                .find(|band| !band.is_indb())
+                .and_then(|band| band.outdb_uri().map(str::to_string));
+            assert_eq!(first_outdb.as_deref(), *uri, "raster {i}");
+        }
+    }
+
+    #[test]
     fn is_indb_does_not_overflow_on_broadcast_axis_exceeding_i64_max() {
         // A broadcast axis with huge `steps` can push the visible element count
         // past i64::MAX. `is_indb()` must classify by buffer presence without
@@ -2040,8 +2187,8 @@ mod tests {
         // the data buffer so the NdBuffer.offset invariant holds — a view whose
         // offset runs past the buffer end must error even though it's empty.
         let array = build_explicit_view_raster(); // source_shape [8], 8 data bytes
-                                                  // start=100 with steps=0: validate skips the start bound for empty axes,
-                                                  // so this composes byte_offset=100 over the 8-byte buffer.
+        // start=100 with steps=0: validate skips the start bound for empty axes,
+        // so this composes byte_offset=100 over the 8-byte buffer.
         let escaping_view = make_band_view_list(vec![vec![(0, 100, 1, 0)]], None);
         let mutated = replace_band_column(&array, band_indices::VIEW, escaping_view);
         let rasters = RasterStructArray::try_new(&mutated).unwrap();

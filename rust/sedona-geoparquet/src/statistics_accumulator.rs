@@ -21,8 +21,8 @@ use datafusion_common::Result;
 use parquet::{
     basic::LogicalType,
     geospatial::accumulator::{
-        init_geo_stats_accumulator_factory, GeoStatsAccumulator, GeoStatsAccumulatorFactory,
-        ParquetGeoStatsAccumulator, VoidGeoStatsAccumulator,
+        GeoStatsAccumulator, GeoStatsAccumulatorFactory, ParquetGeoStatsAccumulator,
+        VoidGeoStatsAccumulator, init_geo_stats_accumulator_factory,
     },
     schema::types::ColumnDescPtr,
 };
@@ -64,20 +64,20 @@ impl SedonaGeoStatsAccumulatorFactory {
 
 impl GeoStatsAccumulatorFactory for SedonaGeoStatsAccumulatorFactory {
     fn new_accumulator(&self, descr: &ColumnDescPtr) -> Box<dyn GeoStatsAccumulator> {
-        if let Some(LogicalType::Geometry { .. }) = descr.logical_type_ref() {
+        if let Some(LogicalType::Geometry(_)) = descr.logical_type_ref() {
             return Box::new(ParquetGeoStatsAccumulator::default());
         }
 
         // Handle Geography with either no algorithm specified (defaults to spherical)
         // or explicit SPHERICAL algorithm
-        if let Some(LogicalType::Geography {
-            crs: _,
-            algorithm: None | Some(parquet::basic::EdgeInterpolationAlgorithm::SPHERICAL),
-        }) = descr.logical_type_ref()
+        if let Some(LogicalType::Geography(geography)) = descr.logical_type_ref()
+            && matches!(
+                geography.algorithm,
+                None | Some(parquet::basic::EdgeInterpolationAlgorithm::SPHERICAL)
+            )
+            && let Some(bounder) = self.bounder_factory.bounder_for_edge_type(Edges::Spherical)
         {
-            if let Some(bounder) = self.bounder_factory.bounder_for_edge_type(Edges::Spherical) {
-                return Box::new(GeographyGeoStatsAccumulator::new(bounder));
-            }
+            return Box::new(GeographyGeoStatsAccumulator::new(bounder));
         }
 
         Box::new(VoidGeoStatsAccumulator::default())
@@ -179,7 +179,11 @@ impl GeoStatsAccumulator for GeographyGeoStatsAccumulator {
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    #[cfg(feature = "s2geography_tests")]
+    use super::GeographyGeoStatsAccumulator;
+
+    #[cfg(feature = "s2geography_tests")]
+    use parquet::geospatial::accumulator::GeoStatsAccumulator;
 
     #[cfg(feature = "s2geography_tests")]
     use parquet::geospatial::bounding_box::BoundingBox;

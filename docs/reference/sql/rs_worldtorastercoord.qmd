@@ -26,10 +26,31 @@ kernels:
       type: double
     - name: "y"
       type: double
+  - returns: geometry
+    args:
+    - raster
+    - name: point
+      type: geometry
+      description: >
+        The world coordinate is read from this point. Its coordinates are used
+        as given, in the raster's own space — this form does not reproject.
 ---
+
+## Description
+
+The result is a 1-based pixel coordinate, as in PostGIS
+`ST_WorldToRasterCoord`: a world coordinate inside the upper-left pixel maps to
+`(1, 1)`. A world coordinate outside the raster extrapolates along the
+geotransform, so it can map to `0` or a negative coordinate.
 
 ## Examples
 
 ```sql
 SELECT RS_WorldToRasterCoord(RS_Example(), 10.0, 20.0);
+```
+
+The world coordinate can also be given as a point:
+
+```sql
+SELECT RS_WorldToRasterCoord(RS_Example(), ST_Point(10.0, 20.0));
 ```

@@ -17,8 +17,8 @@
 
 use once_cell::sync::OnceCell;
 
-use geo_index::rtree::distance::{EuclideanDistance, GeometryAccessor, HaversineDistance};
-use geo_types::Geometry;
+use geo::{Centroid, Distance, Euclidean, Haversine};
+use geo_types::{Geometry, Point, Polygon};
 use sedona_expr::statistics::GeoStatistics;
 use sedona_geo::to_geo::item_to_geometry;
 
@@ -26,13 +26,21 @@ use crate::evaluated_batch::EvaluatedBatch;
 
 /// Shared KNN components that can be reused across queries
 pub(crate) struct KnnComponents {
-    pub euclidean_metric: EuclideanDistance,
-    pub haversine_metric: HaversineDistance,
     /// Pre-allocated vector for geometry cache - lock-free access
     /// Indexed by rtree data index for O(1) access
     geometry_cache: Vec<OnceCell<Geometry<f64>>>,
     /// Estimated memory usage for decoded geometries
     estimated_memory_usage: usize,
+}
+
+/// Heap bytes of the eagerly-allocated `geometry_cache` backbone: one `OnceCell`
+/// slot per indexed geometry, allocated up front in [`KnnComponents::new`]. Each
+/// slot reserves inline space for the decoded `Geometry`, so this term is exact
+/// and independent of how many geometries are later decoded on demand. The
+/// nested coordinate buffers of decoded geometries are allocated lazily and are
+/// not counted here.
+fn cache_backbone_bytes(cache_size: usize) -> usize {
+    cache_size * std::mem::size_of::<OnceCell<Geometry<f64>>>()
 }
 
 impl KnnComponents {
@@ -50,16 +58,15 @@ impl KnnComponents {
         }
 
         Ok(Self {
-            euclidean_metric: EuclideanDistance,
-            haversine_metric: HaversineDistance::default(),
             geometry_cache,
-            estimated_memory_usage: total_wkb_size,
+            estimated_memory_usage: total_wkb_size + cache_backbone_bytes(cache_size),
         })
     }
 
     /// Estimate the maximum memory usage for decoded geometries based on statistics
     pub fn estimate_max_memory_usage(build_stats: &GeoStatistics) -> usize {
-        build_stats.total_size_bytes().unwrap_or(0) as usize
+        let geom_count = build_stats.total_geometries().unwrap_or(0) as usize;
+        build_stats.total_size_bytes().unwrap_or(0) as usize + cache_backbone_bytes(geom_count)
     }
 
     pub fn estimated_memory_usage(&self) -> usize {
@@ -90,11 +97,9 @@ impl<'a> SedonaKnnAdapter<'a> {
             knn_components,
         }
     }
-}
 
-impl<'a> GeometryAccessor for SedonaKnnAdapter<'a> {
     /// Get geometry for the given item index with lock-free caching
-    fn get_geometry(&self, item_index: usize) -> Option<&Geometry<f64>> {
+    pub fn get_geometry(&self, item_index: usize) -> Option<&Geometry<f64>> {
         let geometry_cache = &self.knn_components.geometry_cache;
 
         // Bounds check
@@ -111,16 +116,436 @@ impl<'a> GeometryAccessor for SedonaKnnAdapter<'a> {
         let (batch_idx, row_idx) = self.data_id_to_batch_pos[item_index];
         let indexed_batch = &self.indexed_batches[batch_idx as usize];
 
-        if let Some(wkb) = indexed_batch.geom_array.wkb(row_idx as usize) {
-            if let Ok(geom) = item_to_geometry(wkb) {
-                // Try to store in cache - if another thread got there first, we just use theirs
-                let _ = geometry_cache[item_index].set(geom);
-                // Return reference to the cached geometry
-                return geometry_cache[item_index].get();
-            }
+        if let Some(wkb) = indexed_batch.geom_array.wkb(row_idx as usize)
+            && let Ok(geom) = item_to_geometry(wkb)
+        {
+            // Try to store in cache - if another thread got there first, we just use theirs
+            let _ = geometry_cache[item_index].set(geom);
+            // Return reference to the cached geometry
+            return geometry_cache[item_index].get();
         }
 
         // Failed to decode - don't cache invalid results
         None
+    }
+
+    pub fn distance(
+        &self,
+        probe: &Geometry<f64>,
+        item_index: usize,
+        use_spheroid: bool,
+    ) -> Option<f64> {
+        let item = self.get_geometry(item_index)?;
+        if use_spheroid {
+            let probe_centroid = probe.centroid()?;
+            let item_centroid = item.centroid()?;
+            Some(Haversine.distance(probe_centroid, item_centroid))
+        } else {
+            Some(Euclidean.distance(probe, item))
+        }
+    }
+
+    /// [`Self::distance`] to an item whose index box is `item_bbox`
+    ///
+    /// The box must contain the whole item, which holds unless the index splits items
+    /// at the antimeridian. A point probe outside the box can't be inside the item, so
+    /// its planar distance skips the point-in-polygon test.
+    pub fn distance_to_indexed_item(
+        &self,
+        probe: &Geometry<f64>,
+        item_index: usize,
+        item_bbox: [f32; 4],
+        use_spheroid: bool,
+    ) -> Option<f64> {
+        if !use_spheroid
+            && let Geometry::Point(p) = probe
+            && is_outside_box(*p, item_bbox)
+        {
+            let item = self.get_geometry(item_index)?;
+            return Some(euclidean_distance_outside_bbox(*p, item));
+        }
+        self.distance(probe, item_index, use_spheroid)
+    }
+}
+
+/// Whether `p` is outside `bbox` (`[min_x, min_y, max_x, max_y]`). A NaN coordinate
+/// isn't outside.
+pub(crate) fn is_outside_box(p: Point<f64>, bbox: [f32; 4]) -> bool {
+    let [min_x, min_y, max_x, max_y] = bbox.map(f64::from);
+    p.x() < min_x || p.x() > max_x || p.y() < min_y || p.y() > max_y
+}
+
+/// `Euclidean.distance` from `p` to `geom`, where `p` is outside the bounding box of `geom`
+///
+/// The point can't be in a polygon, so the distance to a polygon is the distance to its
+/// rings, without the point-in-polygon test that `Euclidean.distance` starts with. Every
+/// other geometry gets `Euclidean.distance`, which doesn't test containment.
+pub(crate) fn euclidean_distance_outside_bbox(p: Point<f64>, geom: &Geometry<f64>) -> f64 {
+    match geom {
+        Geometry::Polygon(polygon) => point_to_polygon_rings_distance(p, polygon),
+        Geometry::MultiPolygon(multi_polygon) => {
+            multi_polygon.iter().fold(f64::MAX, |accum, polygon| {
+                accum.min(point_to_polygon_rings_distance(p, polygon))
+            })
+        }
+        _ => Euclidean.distance(&Geometry::Point(p), geom),
+    }
+}
+
+/// `Euclidean.distance` from a point outside `polygon` to `polygon`, computed as geo does
+/// once its point-in-polygon test has found the point outside
+fn point_to_polygon_rings_distance(p: Point<f64>, polygon: &Polygon<f64>) -> f64 {
+    if polygon.exterior().0.is_empty() {
+        return 0.0;
+    }
+    polygon
+        .interiors()
+        .iter()
+        .fold(f64::MAX, |accum, ring| {
+            accum.min(Euclidean.distance(&p, ring))
+        })
+        .min(polygon.exterior().lines().fold(f64::MAX, |accum, line| {
+            accum.min(Euclidean.distance(&p, &line))
+        }))
+}
+
+/// Euclidean distance from a point to an axis-aligned box. This is the exact distance and
+/// much cheaper than wrapping the box as a [`Geometry::Rect`] and using the generic
+/// geometry distance.
+pub(crate) fn euclidean_point_to_box_distance(p: Point<f64>, bbox: [f64; 4]) -> f64 {
+    let [min_x, min_y, max_x, max_y] = bbox;
+    let dx = axis_dist(p.x(), min_x, max_x);
+    let dy = axis_dist(p.y(), min_y, max_y);
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn axis_dist(v: f64, min: f64, max: f64) -> f64 {
+    if v < min {
+        min - v
+    } else if v > max {
+        v - max
+    } else {
+        0.0
+    }
+}
+
+/// Lower bound of the Haversine distance from a longitude/latitude point to any point inside
+/// a longitude/latitude box, in the same units as [`Haversine`].
+///
+/// If the point's longitude (modulo 360) is within the box's longitude range, the closest
+/// point is on the same meridian and the distance is the latitude gap. Otherwise the closest
+/// point lies on one of the box's two meridian edges. On a meridian edge, the distance is
+/// minimized at the latitude closest to the great-circle foot of the perpendicular from the
+/// point, or at one of the edge's endpoints. This handles boxes adjacent to the antimeridian,
+/// boxes touching a pole and longitudes outside [-180, 180]. Invalid latitudes or non-finite
+/// coordinates give a bound of zero.
+pub(crate) fn haversine_point_to_box_lower_bound(p: Point<f64>, bbox: [f64; 4]) -> f64 {
+    let [min_lon, min_lat, max_lon, max_lat] = bbox;
+    let (lon, lat) = (p.x(), p.y());
+
+    // Longitudes are not required to be normalized, but latitudes outside [-90, 90] or
+    // non-finite coordinates have no meaningful spherical bound, so don't prune those
+    let lat_range = -90.0..=90.0;
+    if !(lat_range.contains(&lat) && lat_range.contains(&min_lat) && lat_range.contains(&max_lat))
+        || !(lon.is_finite() && min_lon.is_finite() && max_lon.is_finite())
+    {
+        return 0.0;
+    }
+
+    // Haversine distance is periodic in longitude, so test containment modulo 360
+    if (lon - min_lon).rem_euclid(360.0) <= max_lon - min_lon {
+        let closest_lat = lat.clamp(min_lat, max_lat);
+        return Haversine.distance(p, Point::new(lon, closest_lat));
+    }
+
+    let (sin_lat, cos_lat) = lat.to_radians().sin_cos();
+    [min_lon, max_lon]
+        .into_iter()
+        .map(|edge_lon| {
+            // Latitude on the edge's meridian closest to the point. When it is within
+            // [-90, 90], the distance along the meridian is unimodal around it, so the clamped
+            // latitude is the closest point on the edge. Otherwise (the meridian is more than
+            // 90 degrees away), the closest point is one of the edge's endpoints.
+            let d_lon = (edge_lon - lon).to_radians();
+            let foot_lat = sin_lat.atan2(cos_lat * d_lon.cos()).to_degrees();
+            let dist_at = |edge_lat: f64| Haversine.distance(p, Point::new(edge_lon, edge_lat));
+            if (-90.0..=90.0).contains(&foot_lat) {
+                dist_at(foot_lat.clamp(min_lat, max_lat))
+            } else {
+                dist_at(min_lat).min(dist_at(max_lat))
+            }
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimated_memory_usage_includes_cache_backbone() {
+        let slot = std::mem::size_of::<OnceCell<Geometry<f64>>>();
+
+        // Empty cache: no slots and no decoded geometries.
+        let empty = KnnComponents::new(0, &[]).unwrap();
+        assert_eq!(empty.estimated_memory_usage(), 0);
+
+        // With N slots and no build batches, the estimate is exactly the eager
+        // backbone (one OnceCell slot per indexed geometry), with no WKB bytes.
+        let n = 1000;
+        let components = KnnComponents::new(n, &[]).unwrap();
+        assert_eq!(components.estimated_memory_usage(), n * slot);
+    }
+
+    #[test]
+    fn estimate_max_memory_usage_includes_cache_backbone() {
+        let slot = std::mem::size_of::<OnceCell<Geometry<f64>>>();
+        let stats = GeoStatistics::empty()
+            .with_total_geometries(1000)
+            .with_total_size_bytes(4096);
+        assert_eq!(
+            KnnComponents::estimate_max_memory_usage(&stats),
+            4096 + 1000 * slot
+        );
+    }
+
+    /// Minimum distance from `p` to a dense grid of points covering `bbox`, including its
+    /// boundary, along with the distance between neighbouring grid points
+    fn sampled_min_distance(
+        p: Point<f64>,
+        bbox: [f64; 4],
+        distance: impl Fn(Point<f64>, Point<f64>) -> f64,
+    ) -> (f64, f64) {
+        let [min_x, min_y, max_x, max_y] = bbox;
+        let n = 40;
+        let (step_x, step_y) = ((max_x - min_x) / n as f64, (max_y - min_y) / n as f64);
+        let mut min_dist = f64::INFINITY;
+        for i in 0..=n {
+            for j in 0..=n {
+                let q = Point::new(min_x + step_x * i as f64, min_y + step_y * j as f64);
+                min_dist = min_dist.min(distance(p, q));
+            }
+        }
+        let corner = Point::new(min_x, min_y);
+        let grid_step = distance(corner, Point::new(min_x + step_x, min_y + step_y)).max(distance(
+            Point::new(min_x, max_y),
+            Point::new(min_x + step_x, max_y - step_y),
+        ));
+        (min_dist, grid_step)
+    }
+
+    fn random_box(rng: &mut fastrand::Rng) -> [f64; 4] {
+        let (lon0, lon1) = (rng.f64() * 360.0 - 180.0, rng.f64() * 360.0 - 180.0);
+        let (lat0, lat1) = (rng.f64() * 180.0 - 90.0, rng.f64() * 180.0 - 90.0);
+        [
+            lon0.min(lon1),
+            lat0.min(lat1),
+            lon0.max(lon1),
+            lat0.max(lat1),
+        ]
+    }
+
+    /// A star-shaped ring of `n` points around `center`, at radii between `min_r` and
+    /// `max_r`
+    fn random_ring(
+        rng: &mut fastrand::Rng,
+        center: (f64, f64),
+        n: usize,
+        min_r: f64,
+        max_r: f64,
+    ) -> geo::LineString<f64> {
+        let mut coords: Vec<geo::Coord<f64>> = (0..n)
+            .map(|i| {
+                let angle = std::f64::consts::TAU * (i as f64 + rng.f64() * 0.5) / n as f64;
+                let r = min_r + rng.f64() * (max_r - min_r);
+                geo::coord! { x: center.0 + r * angle.cos(), y: center.1 + r * angle.sin() }
+            })
+            .collect();
+        coords.push(coords[0]);
+        geo::LineString::new(coords)
+    }
+
+    /// A polygon with a hole half of the time
+    fn random_polygon(rng: &mut fastrand::Rng) -> geo::Polygon<f64> {
+        let center = (rng.f64() * 100.0 - 50.0, rng.f64() * 100.0 - 50.0);
+        let n = rng.usize(6..40);
+        let exterior = random_ring(rng, center, n, 2.0, 10.0);
+        let interiors = if rng.bool() {
+            let n = rng.usize(3..10);
+            vec![random_ring(rng, center, n, 0.2, 0.8)]
+        } else {
+            vec![]
+        };
+        geo::Polygon::new(exterior, interiors)
+    }
+
+    /// A polygon, or a third of the time a multipolygon of up to three of them
+    fn random_polygonal(rng: &mut fastrand::Rng) -> Geometry<f64> {
+        if rng.usize(0..3) == 0 {
+            let n = rng.usize(1..4);
+            let polygons = (0..n).map(|_| random_polygon(rng)).collect();
+            Geometry::MultiPolygon(geo::MultiPolygon::new(polygons))
+        } else {
+            Geometry::Polygon(random_polygon(rng))
+        }
+    }
+
+    #[test]
+    fn euclidean_distance_outside_bbox_matches_geo() {
+        use geo::BoundingRect;
+
+        let mut rng = fastrand::Rng::with_seed(11);
+        let others = [
+            "POINT (1 2)",
+            "MULTIPOINT ((1 2), (3 4))",
+            "LINESTRING (0 0, 1 1, 2 0)",
+            "MULTILINESTRING ((0 0, 1 1), (2 2, 3 1))",
+            "GEOMETRYCOLLECTION (POINT (1 2), POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0)))",
+        ]
+        .map(|wkt| wkt::TryFromWkt::try_from_wkt_str(wkt).unwrap());
+        let geoms: Vec<Geometry<f64>> = (0..500)
+            .map(|_| random_polygonal(&mut rng))
+            .chain(others)
+            .collect();
+
+        for geom in geoms {
+            let rect = geom.bounding_rect().unwrap();
+            for _ in 0..20 {
+                // A point beyond one or two sides of the box
+                let (min, max) = (rect.min(), rect.max());
+                let x = match rng.usize(0..3) {
+                    0 => min.x - rng.f64() * 20.0 - 1e-9,
+                    1 => max.x + rng.f64() * 20.0 + 1e-9,
+                    _ => min.x + rng.f64() * (max.x - min.x),
+                };
+                let y = if x < min.x || x > max.x {
+                    min.y - 20.0 + rng.f64() * (max.y - min.y + 40.0)
+                } else if rng.bool() {
+                    min.y - rng.f64() * 20.0 - 1e-9
+                } else {
+                    max.y + rng.f64() * 20.0 + 1e-9
+                };
+                let p = Point::new(x, y);
+                assert_eq!(
+                    euclidean_distance_outside_bbox(p, &geom),
+                    Euclidean.distance(&Geometry::Point(p), &geom),
+                    "{p:?} {geom:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn point_outside_box() {
+        let bbox = [0.0f32, 1.0, 2.0, 3.0];
+        assert!(!is_outside_box(Point::new(1.0, 2.0), bbox));
+        assert!(!is_outside_box(Point::new(0.0, 1.0), bbox));
+        assert!(!is_outside_box(Point::new(2.0, 3.0), bbox));
+        assert!(!is_outside_box(Point::new(f64::NAN, 2.0), bbox));
+        assert!(is_outside_box(Point::new(-0.1, 2.0), bbox));
+        assert!(is_outside_box(Point::new(2.1, 2.0), bbox));
+        assert!(is_outside_box(Point::new(1.0, 0.9), bbox));
+        assert!(is_outside_box(Point::new(1.0, 3.1), bbox));
+    }
+
+    #[test]
+    fn euclidean_point_to_box_distance_matches_geo() {
+        let mut rng = fastrand::Rng::with_seed(7);
+        for _ in 0..1000 {
+            let bbox = random_box(&mut rng);
+            let p = Point::new(rng.f64() * 400.0 - 200.0, rng.f64() * 200.0 - 100.0);
+            let rect = Geometry::Rect(geo::Rect::new(
+                geo::coord! { x: bbox[0], y: bbox[1] },
+                geo::coord! { x: bbox[2], y: bbox[3] },
+            ));
+            let expected = Euclidean.distance(&Geometry::Point(p), &rect);
+            let actual = euclidean_point_to_box_distance(p, bbox);
+            assert!((actual - expected).abs() <= 1e-9, "{p:?} {bbox:?}");
+        }
+    }
+
+    #[test]
+    fn haversine_point_to_box_lower_bound_is_tight_lower_bound() {
+        let mut rng = fastrand::Rng::with_seed(11);
+        let mut boxes: Vec<[f64; 4]> = (0..60).map(|_| random_box(&mut rng)).collect();
+        // Small boxes, boxes touching the antimeridian and boxes containing a pole
+        for _ in 0..30 {
+            let (lon, lat) = (rng.f64() * 350.0 - 180.0, rng.f64() * 170.0 - 90.0);
+            boxes.push([lon, lat, lon + rng.f64() * 10.0, lat + rng.f64() * 10.0]);
+        }
+        boxes.push([-180.0, -10.0, -179.0, 10.0]);
+        boxes.push([179.0, -10.0, 180.0, 10.0]);
+        boxes.push([-30.0, 80.0, 30.0, 90.0]);
+        boxes.push([100.0, -90.0, 170.0, -75.0]);
+        boxes.push([-180.0, -90.0, 180.0, 90.0]);
+        // Longitudes outside [-180, 180]
+        boxes.push([370.0, 10.0, 380.0, 20.0]);
+        boxes.push([-725.0, -5.0, -700.0, 5.0]);
+
+        let mut points: Vec<Point<f64>> = (0..8)
+            .map(|_| Point::new(rng.f64() * 360.0 - 180.0, rng.f64() * 180.0 - 90.0))
+            .collect();
+        points.extend([
+            Point::new(179.9, 0.0),
+            Point::new(-179.9, 0.0),
+            Point::new(0.0, 89.9),
+            Point::new(-150.0, -89.9),
+            Point::new(0.0, 0.0),
+            Point::new(1095.0, 0.0),
+            Point::new(-345.0, 15.0),
+        ]);
+
+        for bbox in &boxes {
+            for &p in &points {
+                let bound = haversine_point_to_box_lower_bound(p, *bbox);
+                let (sampled, grid_step) =
+                    sampled_min_distance(p, *bbox, |a, b| Haversine.distance(a, b));
+                assert!(
+                    bound <= sampled + 1e-6,
+                    "bound {bound} > sampled {sampled} for {p:?} {bbox:?}"
+                );
+                assert!(
+                    bound >= sampled - grid_step,
+                    "bound {bound} not tight vs sampled {sampled} for {p:?} {bbox:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn haversine_point_to_box_lower_bound_wraps_antimeridian() {
+        // Planar clamping would put this box ~359 degrees away
+        let p = Point::new(179.5, 0.0);
+        let bound = haversine_point_to_box_lower_bound(p, [-180.0, -1.0, -179.0, 1.0]);
+        let expected = Haversine.distance(p, Point::new(180.0, 0.0));
+        assert!((bound - expected).abs() < 1e-6, "{bound} vs {expected}");
+    }
+
+    #[test]
+    fn haversine_point_to_box_lower_bound_unnormalized_longitude() {
+        // 1095 degrees is 15 degrees, which is inside the box
+        let bound =
+            haversine_point_to_box_lower_bound(Point::new(1095.0, 0.0), [10.0, -1.0, 20.0, 1.0]);
+        assert_eq!(bound, 0.0);
+        let bound =
+            haversine_point_to_box_lower_bound(Point::new(15.0, 0.0), [370.0, -1.0, 380.0, 1.0]);
+        assert_eq!(bound, 0.0);
+    }
+
+    #[test]
+    fn haversine_point_to_box_lower_bound_invalid_coordinates() {
+        let bbox = [10.0, -1.0, 20.0, 1.0];
+        assert_eq!(
+            haversine_point_to_box_lower_bound(Point::new(100.0, 95.0), bbox),
+            0.0
+        );
+        assert_eq!(
+            haversine_point_to_box_lower_bound(Point::new(f64::NAN, 0.0), bbox),
+            0.0
+        );
+        assert_eq!(
+            haversine_point_to_box_lower_bound(Point::new(100.0, 0.0), [10.0, -1.0, 20.0, 91.0]),
+            0.0
+        );
     }
 }

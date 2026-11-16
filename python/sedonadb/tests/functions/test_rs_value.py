@@ -17,8 +17,8 @@
 
 """RS_Value / RS_Values / RS_BandNoDataValue parity.
 
-Every test defines the raster once (numpy array + GDAL geotransform, written
-to a CRS-less GeoTIFF) and samples it through SedonaDB and a rasterio
+Every test defines the raster once (numpy array + bbox, written to a
+CRS-less GeoTIFF) and samples it through SedonaDB and a rasterio
 reference. The fixture bakes a band nodata into the GeoTIFF *and* plants a
 pixel valued at that nodata, so one sweep pins all three None rules together:
 nodata-valued pixels sample as None, out-of-extent points sample as None,
@@ -27,8 +27,11 @@ discriminate flooring from int-truncation in the world-to-pixel math (they
 differ only for negative fractional indices).
 """
 
+import re
+
 import pyarrow as pa
 import pytest
+import sedonadb
 
 from sedonadb.raster_testing import (
     _is_nodata,
@@ -38,9 +41,9 @@ from sedonadb.raster_testing import (
 
 pytest.importorskip("rasterio")
 
-# GDAL-order geotransform: origin (100, 500), 2-wide by 3-tall north-up
-# pixels; with a 7x6 raster the extent is x in [100, 114], y in [482, 500].
-GDAL_TRANSFORM = (100.0, 2.0, 0.0, 500.0, 0.0, -3.0)
+# The extent (minx, miny, maxx, maxy): a 7x6 raster over it has north-up
+# pixels 2 wide by 3 tall with the origin at (100, 500).
+BBOX = (100.0, 482.0, 114.0, 500.0)
 BANDS, HEIGHT, WIDTH = 2, 6, 7
 
 # The pixel planted with the band's own nodata value; sampling it is None.
@@ -75,7 +78,7 @@ def _write_fixture(tmp_path, dtype, *, nodata):
         random_raster_data(
             dtype, bands=BANDS, height=HEIGHT, width=WIDTH, plants=plants
         ),
-        gdal_transform=GDAL_TRANSFORM,
+        bbox=BBOX,
         nodata=nodata,
     )
     return tiff
@@ -148,6 +151,38 @@ def _sedonadb_band_nodata(con, path, *, band=1):
     return result[0].as_py()
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("rs_value_scan", id="table"),
+        pytest.param(
+            "(SELECT RS_EnsureLoaded(r) AS r FROM rs_value_scan)", id="user_loaded"
+        ),
+    ],
+)
+def test_two_reads_sharing_a_raster_column_over_a_scan(con, tmp_path, source):
+    """Two RS_Value calls on one raster column of a table, and a read over a
+    subquery that already called RS_EnsureLoaded. The planner wraps each
+    call's raster in RS_EnsureLoaded; once DataFusion has turned that wrap
+    into a plain column (common-subexpression elimination hoists the shared
+    loader into a projection below; the user's subquery is such a projection
+    already) the next optimizer pass must not wrap the column again, which
+    would load it twice. Both reads are cross-checked against rasterio."""
+    path = _write_fixture(tmp_path, "int32", nodata=BAND_NODATA["int32"])
+    con.create_data_frame(
+        con.sql("SELECT RS_FromPath($1) AS r", params=(str(path),)).to_arrow_table()
+    ).to_view("rs_value_scan", overwrite=True)
+    (x1, y1), (x2, y2) = pixel_center(0, 1), pixel_center(3, 4)
+
+    got = con.sql(
+        f"SELECT RS_Value(r, ST_Point({x1}, {y1}), 1) AS a, "
+        f"RS_Value(r, ST_Point({x2}, {y2}), 1) AS b FROM {source}"
+    ).to_arrow_table()
+
+    assert got["a"][0].as_py() == _rasterio_value(path, x1, y1)
+    assert got["b"][0].as_py() == _rasterio_value(path, x2, y2)
+
+
 def _rasterio_value(path, x, y, *, band=1):
     return _rasterio_values(path, [(x, y)], band=band)[0]
 
@@ -209,6 +244,29 @@ def test_rs_values_matches_comparators(con, tmp_path, dtype):
         assert got == expected, f"band {band}"
 
 
+def test_out_of_range_band_error_names_the_band(con, tmp_path):
+    """An out-of-range band is reported by the 1-based number the query
+    passed, not the 0-based index it maps to (band 3 of 2 used to read
+    "Band index 2"), and names the file the raster was read from."""
+    tiff = _write_fixture(tmp_path, "uint8", nodata=None)
+    x, y = pixel_center(0, 0)
+    message = f"Band 3 is out of range: {re.escape(str(tiff))} has 2 bands"
+    with pytest.raises(sedonadb._lib.SedonaError, match=message):
+        _sedonadb_value(con, tiff, x, y, band=3)
+    with pytest.raises(sedonadb._lib.SedonaError, match=message):
+        _sedonadb_values(con, tiff, [(x, y)], band=3)
+
+
+def test_out_of_range_band_error_without_a_file(con):
+    """A raster with no source file (built in memory) is "this raster"."""
+    sql = "SELECT RS_Value(RS_Example(), ST_Point(74.58, 110.57, 'OGC:CRS84'), 4)"
+    with pytest.raises(
+        sedonadb._lib.SedonaError,
+        match="Band 4 is out of range: this raster has 3 bands",
+    ):
+        con.sql(sql).to_arrow_table()
+
+
 @pytest.mark.parametrize("dtype", ["uint8", "float64"])
 def test_rs_band_nodata_matches_comparators(con, tmp_path, dtype):
     """The band nodata reads back exactly on every band, and a band without
@@ -218,7 +276,7 @@ def test_rs_band_nodata_matches_comparators(con, tmp_path, dtype):
     write_geotiff(
         without_nodata,
         random_raster_data(dtype, bands=BANDS, height=HEIGHT, width=WIDTH),
-        gdal_transform=GDAL_TRANSFORM,
+        bbox=BBOX,
     )
 
     for band in (1, 2):
@@ -229,3 +287,45 @@ def test_rs_band_nodata_matches_comparators(con, tmp_path, dtype):
         )
         assert _sedonadb_band_nodata(con, without_nodata, band=band) is None
         assert _rasterio_band_nodata(without_nodata, band=band) is None
+
+
+# A nodata a GeoTIFF can declare but the band dtype cannot hold exactly, and
+# the real pixel value a saturating cast into the dtype would turn it into.
+UNREPRESENTABLE_NODATA = [
+    pytest.param("uint8", -9999.0, 0, id="below_range"),
+    pytest.param("uint8", 256.0, 255, id="above_range"),
+    pytest.param("int16", float("nan"), 0, id="nan"),
+    pytest.param("int32", 0.5, 0, id="fraction"),
+]
+
+
+@pytest.mark.parametrize("loader", ["RS_FromPath(path)", "RS_FromGDALRaster(content)"])
+@pytest.mark.parametrize(("dtype", "nodata", "saturated"), UNREPRESENTABLE_NODATA)
+def test_unrepresentable_file_nodata_is_dropped(
+    con, tmp_path, loader, dtype, nodata, saturated
+):
+    """A file nodata the band dtype cannot hold exactly matches no pixel, so
+    the band reads as having none: RS_BandNoDataValue is NULL and every pixel
+    samples verbatim, including the planted one a saturating cast would have
+    matched (-9999 on uint8 used to turn every 0 pixel into nodata). Covers
+    both the out-db (RS_FromPath) and in-db (RS_FromGDALRaster) loaders."""
+    data = random_raster_data(
+        dtype, bands=1, height=HEIGHT, width=WIDTH, plants={NODATA_PLANT: saturated}
+    )
+    tiff = tmp_path / "unrepresentable.tif"
+    write_geotiff(tiff, data, bbox=BBOX, nodata=nodata)
+    points = [pixel_center(row, col) for row in range(HEIGHT) for col in range(WIDTH)]
+    wkt = "MULTIPOINT (" + ", ".join(f"{x!r} {y!r}" for x, y in points) + ")"
+    con.create_data_frame(
+        pa.table({"path": [str(tiff)], "content": [tiff.read_bytes()], "wkt": [wkt]})
+    ).to_view("unrepresentable_src", overwrite=True)
+
+    got = con.sql(
+        "SELECT RS_BandNoDataValue(r, 1) AS nodata, "
+        "RS_Values(r, ST_GeomFromText(wkt), 1) AS pixels "
+        f"FROM (SELECT {loader} AS r, wkt FROM unrepresentable_src)"
+    ).to_arrow_table()
+
+    expected = [float(v) for v in data[0].ravel()]
+    assert _rasterio_values(tiff, points) == expected
+    assert got.to_pylist() == [{"nodata": None, "pixels": expected}]

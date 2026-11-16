@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, OnceLock,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use datafusion_common::{DataFusionError, Result};
 use geos::{Geom, PreparedGeometry};
 use parking_lot::Mutex;
-use sedona_common::{sedona_internal_err, ExecutionMode, SpatialJoinOptions};
+use sedona_common::{ExecutionMode, SpatialJoinOptions, sedona_internal_err};
 use sedona_expr::statistics::GeoStatistics;
 use sedona_geos::wkb_to_geos::GEOSWkbFactory;
 use wkb::reader::Wkb;
@@ -30,8 +30,8 @@ use wkb::reader::Wkb;
 use crate::{
     index::IndexQueryResult,
     refine::{
-        exec_mode_selector::{get_or_update_execution_mode, ExecModeSelector, SelectOptimalMode},
         IndexQueryResultRefiner,
+        exec_mode_selector::{ExecModeSelector, SelectOptimalMode, get_or_update_execution_mode},
     },
     spatial_predicate::{RelationPredicate, SpatialPredicate, SpatialRelationType},
     utils::init_once_array::InitOnceArray,
@@ -507,7 +507,7 @@ impl GeosPredicateEvaluator for GeosEquals {
 
 /// Macro to generate relation evaluators that use GEOS methods
 macro_rules! impl_geos_evaluator {
-    ($struct_name:ident, $geos_method:ident $(,)?) => {
+    ($struct_name:ident, $geos_method:ident, $probe_geos_method:ident $(,)?) => {
         #[derive(Debug)]
         struct $struct_name;
 
@@ -547,7 +547,7 @@ macro_rules! impl_geos_evaluator {
                 let build_geom = wkb_to_geos_geometry(build)?;
                 let prepared = probe.prepared().lock();
                 prepared
-                    .$geos_method(&build_geom)
+                    .$probe_geos_method(&build_geom)
                     .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))
             }
         }
@@ -555,14 +555,14 @@ macro_rules! impl_geos_evaluator {
 }
 
 // Generate GEOS-based evaluators using the macro
-impl_geos_evaluator!(GeosIntersects, intersects);
-impl_geos_evaluator!(GeosContains, contains);
-impl_geos_evaluator!(GeosWithin, within);
-impl_geos_evaluator!(GeosTouches, touches);
-impl_geos_evaluator!(GeosCrosses, crosses);
-impl_geos_evaluator!(GeosOverlaps, overlaps);
-impl_geos_evaluator!(GeosCovers, covers);
-impl_geos_evaluator!(GeosCoveredBy, covered_by);
+impl_geos_evaluator!(GeosIntersects, intersects, intersects);
+impl_geos_evaluator!(GeosContains, contains, within);
+impl_geos_evaluator!(GeosWithin, within, contains);
+impl_geos_evaluator!(GeosTouches, touches, touches);
+impl_geos_evaluator!(GeosCrosses, crosses, crosses);
+impl_geos_evaluator!(GeosOverlaps, overlaps, overlaps);
+impl_geos_evaluator!(GeosCovers, covers, covered_by);
+impl_geos_evaluator!(GeosCoveredBy, covered_by, covers);
 
 #[cfg(test)]
 mod tests {
@@ -588,8 +588,8 @@ mod tests {
     use crate::spatial_predicate::{DistancePredicate, RelationPredicate, SpatialRelationType};
     use datafusion_common::JoinSide;
     use datafusion_common::ScalarValue;
-    use datafusion_physical_expr::expressions::{Column, Literal};
     use datafusion_physical_expr::PhysicalExpr;
+    use datafusion_physical_expr::expressions::{Column, Literal};
     use sedona_common::DEFAULT_SPECULATIVE_THRESHOLD;
     use std::sync::Arc;
 
@@ -612,6 +612,44 @@ mod tests {
             create_dummy_column("right_geom", 1),
             relation_type,
         ))
+    }
+
+    #[rstest]
+    #[case(SpatialRelationType::Intersects)]
+    #[case(SpatialRelationType::Contains)]
+    #[case(SpatialRelationType::Within)]
+    #[case(SpatialRelationType::Touches)]
+    #[case(SpatialRelationType::Crosses)]
+    #[case(SpatialRelationType::Overlaps)]
+    #[case(SpatialRelationType::Covers)]
+    #[case(SpatialRelationType::CoveredBy)]
+    #[case(SpatialRelationType::Equals)]
+    fn test_geos_evaluator_execution_modes_are_consistent(
+        #[case] relation_type: SpatialRelationType,
+    ) {
+        let predicate = create_relation_predicate(relation_type);
+        let evaluator = create_evaluator(&predicate);
+
+        let build_buf = make_wkb("POLYGON((0 0, 0 10, 10 10, 10 0, 0 0))");
+        let build = wkb::reader::read_wkb(&build_buf).unwrap();
+        let prepared_build = OwnedPreparedGeometry::try_from_wkb(&build).unwrap();
+
+        let probe_buf = make_wkb("POINT(5 5)");
+        let probe = wkb::reader::read_wkb(&probe_buf).unwrap();
+        let prepared_probe = OwnedPreparedGeometry::try_from_wkb(&probe).unwrap();
+
+        let expected = evaluator
+            .evaluate(&build, prepared_probe.geometry(), None)
+            .unwrap();
+        let prepare_build_result = evaluator
+            .evaluate_prepare_build(&prepared_build, prepared_probe.geometry(), None)
+            .unwrap();
+        let prepare_probe_result = evaluator
+            .evaluate_prepare_probe(&build, &prepared_probe, None)
+            .unwrap();
+
+        assert_eq!(prepare_build_result, expected);
+        assert_eq!(prepare_probe_result, expected);
     }
 
     /// Helper function to create a distance predicate
